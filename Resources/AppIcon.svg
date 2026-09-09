@@ -1,0 +1,729 @@
+<svg
+  width="1024"
+  height="1024"
+  viewBox="0 0 1024 1024"
+  xmlns="http://www.w3.org/2000/svg"
+>
+  <defs>
+    <!-- ============================== -->
+    <!-- 背景渐变 -->
+    <!-- ============================== -->
+    <linearGradient
+      id="bgGradient"
+      x1="120"
+      y1="80"
+      x2="900"
+      y2="950"
+      gradientUnits="userSpaceOnUse"
+    >
+      <stop offset="0" stop-color="#8ED0FF"/>
+      <stop offset="0.38" stop-color="#6C93FF"/>
+      <stop offset="0.72" stop-color="#6C6AF7"/>
+      <stop offset="1" stop-color="#5A54E7"/>
+    </linearGradient>
+
+    <radialGradient
+      id="bgGlowA"
+      cx="0"
+      cy="0"
+      r="1"
+      gradientUnits="userSpaceOnUse"
+      gradientTransform="translate(250 220) rotate(90) scale(300)"
+    >
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient
+      id="bgGlowB"
+      cx="0"
+      cy="0"
+      r="1"
+      gradientUnits="userSpaceOnUse"
+      gradientTransform="translate(810 800) rotate(90) scale(320)"
+    >
+      <stop offset="0" stop-color="#2F2EBE" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#2F2EBE" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- ============================== -->
+    <!-- 麦克风本体 -->
+    <!-- ============================== -->
+    <linearGradient
+      id="micGradient"
+      x1="410"
+      y1="235"
+      x2="620"
+      y2="625"
+      gradientUnits="userSpaceOnUse"
+    >
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.55" stop-color="#F9FBFF"/>
+      <stop offset="1" stop-color="#DCE7FF"/>
+    </linearGradient>
+
+    <linearGradient
+      id="standGradient"
+      x1="320"
+      y1="500"
+      x2="700"
+      y2="800"
+      gradientUnits="userSpaceOnUse"
+    >
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#DDE8FF"/>
+    </linearGradient>
+
+    <!-- ============================== -->
+    <!-- 锁徽章 -->
+    <!-- ============================== -->
+    <linearGradient id="lockGradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFF19A"/>
+      <stop offset="1" stop-color="#FFBB4C"/>
+    </linearGradient>
+
+    <!-- ============================== -->
+    <!-- 阴影 -->
+    <!-- ============================== -->
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow
+        dx="0"
+        dy="22"
+        stdDeviation="24"
+        flood-color="#173079"
+        flood-opacity="0.28"
+      />
+    </filter>
+
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow
+        dx="0"
+        dy="10"
+        stdDeviation="12"
+        flood-color="#233A96"
+        flood-opacity="0.22"
+      />
+    </filter>
+
+    <!-- ============================== -->
+    <!-- 圆角裁剪 -->
+    <!-- 确保四角区域完全透明 -->
+    <!-- ============================== -->
+    <clipPath id="iconClip">
+      <rect width="1024" height="1024" rx="229"/>
+    </clipPath>
+  </defs>
+
+  <!-- 所有内容裁剪在 App Icon 圆角区域内 -->
+  <g clip-path="url(#iconClip)">
+
+    <!-- ============================== -->
+    <!-- 背景 -->
+    <!-- ============================== -->
+    <rect
+      width="1024"
+      height="1024"
+      rx="229"
+      fill="url(#bgGradient)"
+    />
+
+    <circle
+      cx="250"
+      cy="220"
+      r="300"
+      fill="url(#bgGlowA)"
+    />
+
+    <circle
+      cx="810"
+      cy="800"
+      r="320"
+      fill="url(#bgGlowB)"
+    />
+
+    <!-- ============================== -->
+    <!-- 装饰：星星 / 爱心 / 气泡 -->
+    <!-- ============================== -->
+
+    <!-- 左上星星 -->
+    <path
+      d="
+        M 242 201
+        C 247 229 257 239 286 244
+        C 257 249 247 259 242 287
+        C 237 259 227 249 198 244
+        C 227 239 237 229 242 201
+        Z
+      "
+      fill="#FFFFFF"
+      opacity="0.92"
+    />
+
+    <!-- 右上小星 -->
+    <path
+      d="
+        M 765 172
+        C 769 193 777 201 798 205
+        C 777 209 769 217 765 238
+        C 761 217 753 209 732 205
+        C 753 201 761 193 765 172
+        Z
+      "
+      fill="#E6F0FF"
+      opacity="0.92"
+    />
+
+    <!-- 右中小闪光 -->
+    <path
+      d="
+        M 708 274
+        C 711 292 718 299 736 302
+        C 718 305 711 312 708 330
+        C 705 312 698 305 680 302
+        C 698 299 705 292 708 274
+        Z
+      "
+      fill="#FFFFFF"
+      opacity="0.82"
+    />
+
+    <!-- 左下小爱心 -->
+    <path
+      d="
+        M 220 700
+        C 220 678 248 670 260 690
+        C 272 670 300 678 300 700
+        C 300 725 278 740 260 756
+        C 242 740 220 725 220 700
+        Z
+      "
+      fill="#FFD4E7"
+      opacity="0.92"
+    />
+
+    <!-- 右下小爱心 -->
+    <path
+      d="
+        M 815 675
+        C 815 659 834 652 844 666
+        C 854 652 873 659 873 675
+        C 873 694 858 706 844 718
+        C 830 706 815 694 815 675
+        Z
+      "
+      fill="#FFE0F0"
+      opacity="0.88"
+    />
+
+    <!-- 左侧气泡 -->
+    <circle
+      cx="196"
+      cy="402"
+      r="18"
+      fill="#FFFFFF"
+      opacity="0.28"
+    />
+
+    <circle
+      cx="231"
+      cy="365"
+      r="9"
+      fill="#FFFFFF"
+      opacity="0.42"
+    />
+
+    <circle
+      cx="180"
+      cy="760"
+      r="12"
+      fill="#FFFFFF"
+      opacity="0.26"
+    />
+
+    <!-- 右侧气泡 -->
+    <circle
+      cx="827"
+      cy="425"
+      r="23"
+      fill="#FFFFFF"
+      opacity="0.20"
+    />
+
+    <circle
+      cx="856"
+      cy="383"
+      r="11"
+      fill="#FFFFFF"
+      opacity="0.35"
+    />
+
+    <circle
+      cx="848"
+      cy="724"
+      r="14"
+      fill="#FFFFFF"
+      opacity="0.22"
+    />
+
+    <!-- ============================== -->
+    <!-- 麦克风主体 -->
+    <!-- ============================== -->
+    <g filter="url(#shadow)">
+
+      <!-- 麦克风身体 -->
+      <rect
+        x="389"
+        y="205"
+        width="246"
+        height="410"
+        rx="123"
+        fill="url(#micGradient)"
+        stroke="#293C94"
+        stroke-width="18"
+      />
+
+      <!-- 左上大高光 -->
+      <ellipse
+        cx="454"
+        cy="286"
+        rx="34"
+        ry="60"
+        transform="rotate(-25 454 286)"
+        fill="#FFFFFF"
+        opacity="0.80"
+      />
+
+      <!-- 小高光 -->
+      <ellipse
+        cx="478"
+        cy="235"
+        rx="15"
+        ry="21"
+        transform="rotate(-25 478 235)"
+        fill="#FFFFFF"
+        opacity="0.95"
+      />
+
+      <!-- 右上柔光 -->
+      <ellipse
+        cx="560"
+        cy="265"
+        rx="24"
+        ry="42"
+        transform="rotate(18 560 265)"
+        fill="#FFFFFF"
+        opacity="0.35"
+      />
+
+      <!-- ========================== -->
+      <!-- 眼睛 -->
+      <!-- ========================== -->
+
+      <!-- 左眼 -->
+      <ellipse
+        cx="460"
+        cy="402"
+        rx="34"
+        ry="44"
+        fill="#263985"
+      />
+
+      <ellipse
+        cx="451"
+        cy="387"
+        rx="13"
+        ry="16"
+        fill="#FFFFFF"
+      />
+
+      <ellipse
+        cx="470"
+        cy="415"
+        rx="8"
+        ry="10"
+        fill="#8AD8FF"
+      />
+
+      <circle
+        cx="478"
+        cy="386"
+        r="5"
+        fill="#FFFFFF"
+        opacity="0.92"
+      />
+
+      <!-- 右眼 -->
+      <ellipse
+        cx="564"
+        cy="402"
+        rx="34"
+        ry="44"
+        fill="#263985"
+      />
+
+      <ellipse
+        cx="555"
+        cy="387"
+        rx="13"
+        ry="16"
+        fill="#FFFFFF"
+      />
+
+      <ellipse
+        cx="574"
+        cy="415"
+        rx="8"
+        ry="10"
+        fill="#8AD8FF"
+      />
+
+      <circle
+        cx="582"
+        cy="386"
+        r="5"
+        fill="#FFFFFF"
+        opacity="0.92"
+      />
+
+      <!-- 可爱眉眼 -->
+      <path
+        d="M 431 355 Q 448 344 467 352"
+        fill="none"
+        stroke="#293C94"
+        stroke-width="8"
+        stroke-linecap="round"
+      />
+
+      <path
+        d="M 557 352 Q 576 344 593 355"
+        fill="none"
+        stroke="#293C94"
+        stroke-width="8"
+        stroke-linecap="round"
+      />
+
+      <!-- ========================== -->
+      <!-- 腮红 -->
+      <!-- ========================== -->
+
+      <ellipse
+        cx="416"
+        cy="470"
+        rx="37"
+        ry="19"
+        fill="#FF9CBF"
+        opacity="0.72"
+      />
+
+      <ellipse
+        cx="608"
+        cy="470"
+        rx="37"
+        ry="19"
+        fill="#FF9CBF"
+        opacity="0.72"
+      />
+
+      <!-- 腮红纹理 -->
+      <line
+        x1="398"
+        y1="468"
+        x2="410"
+        y2="474"
+        stroke="#FF84AF"
+        stroke-width="5"
+        stroke-linecap="round"
+        opacity="0.65"
+      />
+
+      <line
+        x1="412"
+        y1="464"
+        x2="424"
+        y2="470"
+        stroke="#FF84AF"
+        stroke-width="5"
+        stroke-linecap="round"
+        opacity="0.65"
+      />
+
+      <line
+        x1="600"
+        y1="470"
+        x2="612"
+        y2="476"
+        stroke="#FF84AF"
+        stroke-width="5"
+        stroke-linecap="round"
+        opacity="0.65"
+      />
+
+      <line
+        x1="586"
+        y1="464"
+        x2="598"
+        y2="470"
+        stroke="#FF84AF"
+        stroke-width="5"
+        stroke-linecap="round"
+        opacity="0.65"
+      />
+
+      <!-- ========================== -->
+      <!-- 张嘴笑 -->
+      <!-- 恢复最初版本，不吐舌头 -->
+      <!-- ========================== -->
+
+      <!-- 嘴巴主体 -->
+      <path
+        d="
+          M 480 465
+          Q 512 500 544 465
+          Q 535 516 512 519
+          Q 489 516 480 465
+          Z
+        "
+        fill="#33428D"
+      />
+
+      <!-- 嘴巴内部粉色 -->
+      <path
+        d="
+          M 493 495
+          Q 512 482 531 495
+          Q 523 512 512 513
+          Q 501 512 493 495
+          Z
+        "
+        fill="#FF88AD"
+      />
+
+      <!-- ========================== -->
+      <!-- U 型支架 -->
+      <!-- ========================== -->
+
+      <path
+        d="
+          M 323 464
+          L 323 530
+          C 323 675 407 731 512 731
+          C 617 731 701 675 701 530
+          L 701 464
+        "
+        fill="none"
+        stroke="#293C94"
+        stroke-width="82"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+
+      <path
+        d="
+          M 323 464
+          L 323 530
+          C 323 675 407 731 512 731
+          C 617 731 701 675 701 530
+          L 701 464
+        "
+        fill="none"
+        stroke="url(#standGradient)"
+        stroke-width="52"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      />
+
+      <!-- 立杆外描边 -->
+      <line
+        x1="512"
+        y1="724"
+        x2="512"
+        y2="805"
+        stroke="#293C94"
+        stroke-width="74"
+        stroke-linecap="round"
+      />
+
+      <!-- 立杆 -->
+      <line
+        x1="512"
+        y1="724"
+        x2="512"
+        y2="805"
+        stroke="#EDF3FF"
+        stroke-width="46"
+        stroke-linecap="round"
+      />
+
+      <!-- 底座外描边 -->
+      <line
+        x1="390"
+        y1="817"
+        x2="634"
+        y2="817"
+        stroke="#293C94"
+        stroke-width="78"
+        stroke-linecap="round"
+      />
+
+      <!-- 底座 -->
+      <line
+        x1="390"
+        y1="817"
+        x2="634"
+        y2="817"
+        stroke="#F5F8FF"
+        stroke-width="48"
+        stroke-linecap="round"
+      />
+    </g>
+
+    <!-- ============================== -->
+    <!-- MicLock 锁徽章 -->
+    <!-- ============================== -->
+
+    <g
+      transform="translate(636 575) rotate(9)"
+      filter="url(#softShadow)"
+    >
+      <!-- 锁梁外描边 -->
+      <path
+        d="
+          M 34 70
+          V 43
+          C 34 0 104 0 104 43
+          V 70
+        "
+        fill="none"
+        stroke="#293C94"
+        stroke-width="29"
+        stroke-linecap="round"
+      />
+
+      <!-- 锁梁 -->
+      <path
+        d="
+          M 34 70
+          V 43
+          C 34 0 104 0 104 43
+          V 70
+        "
+        fill="none"
+        stroke="#FFE789"
+        stroke-width="17"
+        stroke-linecap="round"
+      />
+
+      <!-- 锁体 -->
+      <rect
+        x="0"
+        y="59"
+        width="138"
+        height="118"
+        rx="35"
+        fill="url(#lockGradient)"
+        stroke="#293C94"
+        stroke-width="14"
+      />
+
+      <!-- 锁体高光 -->
+      <path
+        d="
+          M 24 88
+          Q 39 75 57 76
+        "
+        fill="none"
+        stroke="#FFF7C4"
+        stroke-width="11"
+        stroke-linecap="round"
+        opacity="0.9"
+      />
+
+      <!-- 锁孔 -->
+      <circle
+        cx="69"
+        cy="111"
+        r="14"
+        fill="#36428A"
+      />
+
+      <path
+        d="
+          M 61 119
+          L 57 146
+          H 81
+          L 77 119
+          Z
+        "
+        fill="#36428A"
+      />
+
+      <!-- 锁体小爱心 -->
+      <path
+        d="
+          M 102 98
+          C 102 90 111 87 116 93
+          C 121 87 130 90 130 98
+          C 130 107 123 113 116 119
+          C 109 113 102 107 102 98
+          Z
+        "
+        fill="#FFF4BF"
+        opacity="0.95"
+      />
+    </g>
+
+    <!-- ============================== -->
+    <!-- 顶部开心装饰 -->
+    <!-- ============================== -->
+
+    <path
+      d="M 373 202 Q 345 179 325 157"
+      fill="none"
+      stroke="#FFFFFF"
+      stroke-width="18"
+      stroke-linecap="round"
+      opacity="0.94"
+    />
+
+    <path
+      d="M 651 202 Q 679 179 699 157"
+      fill="none"
+      stroke="#FFFFFF"
+      stroke-width="18"
+      stroke-linecap="round"
+      opacity="0.94"
+    />
+
+    <!-- 顶部小爱心 -->
+    <path
+      d="
+        M 497 126
+        C 497 109 517 102 528 116
+        C 539 102 559 109 559 126
+        C 559 147 542 160 528 172
+        C 514 160 497 147 497 126
+        Z
+      "
+      fill="#FFFFFF"
+      opacity="0.92"
+    />
+
+    <!-- 顶部小气泡 -->
+    <circle
+      cx="335"
+      cy="176"
+      r="9"
+      fill="#FFFFFF"
+      opacity="0.46"
+    />
+
+    <circle
+      cx="690"
+      cy="176"
+      r="9"
+      fill="#FFFFFF"
+      opacity="0.46"
+    />
+
+  </g>
+</svg>

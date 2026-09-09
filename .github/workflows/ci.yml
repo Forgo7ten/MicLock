@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    name: Test and build
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Configure Xcode toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          toolchain="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain"
+          test -x "${toolchain}/usr/bin/swiftc"
+
+          echo "MICLOCK_TOOLCHAIN=${toolchain}" >> "${GITHUB_ENV}"
+
+      - name: Run tests
+        run: |
+          set -euo pipefail
+          make test
+
+      - name: Build and verify app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MICLOCK_ARCH=arm64 make build
+
+          app="build/MicLock.app"
+          binary="${app}/Contents/MacOS/MicLock"
+
+          test -d "${app}"
+          test -x "${binary}"
+
+          architectures="$(lipo -archs "${binary}")"
+          if [[ "${architectures}" != "arm64" ]]; then
+            echo "error: Expected arm64 binary, got: ${architectures}" >&2
+            exit 1
+          fi
+
+          codesign --verify --deep --strict "${app}"

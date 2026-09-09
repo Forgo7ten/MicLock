@@ -1,0 +1,8 @@
+# 构建产物
+build/
+
+# 生成的图标（设计源 Resources/AppIcon.svg 入库，icns 由构建自动生成）
+Resources/AppIcon.icns
+
+# macOS
+.DS_Store
