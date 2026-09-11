@@ -15,7 +15,7 @@ MicLock 不用 Xcode 工程与 SPM，构建链由 shell 脚本 + Makefile 组成
 | 脚本 | 职责 | 覆盖方式 |
 |---|---|---|
 | `Scripts/select-toolchain.sh` | 从 `/Library/Developer/Toolchains/` 与 `~/Library/Developer/Toolchains/` 中选版本号最新的 `.xctoolchain`（剔除 `swift-latest` 符号链接防排序误选） | `MICLOCK_TOOLCHAIN=/path/to.xctoolchain` |
-| `Scripts/select-sdk.sh` | 用所选工具链对候选 SDK 跑覆盖真实依赖面的 `-typecheck` 探针（`@Observable` 宏展开、`didSet`、NSStatusItem/NSPopover、CoreAudio 监听块、OSLog 结构化日志插值），顺序：默认 SDK → 15.4 → 15 | 无（探测全自动） |
+| `Scripts/select-sdk.sh` | 用所选工具链对候选 SDK 跑覆盖真实依赖面的 `-typecheck` 探针（`@Observable` 宏展开、`didSet`、`MenuBarExtra(.window)`、Settings Scene / `openSettings`、Activation Policy、CoreAudio 监听块、UserNotifications、ServiceManagement、OSLog 结构化日志插值），顺序：默认 SDK → 15.4 → 15 | 无（探测全自动） |
 
 ### 为什么需要 Swift 6 工具链
 
@@ -64,7 +64,7 @@ plutil -lint Info.plist            ← 校验 plist 语法
 
 设计源为 `Resources/AppIcon.svg`（入库）；`Resources/AppIcon.icns` 是**生成产物，不入库**（.gitignore 忽略）。`Scripts/genicon.swift` 用 NSImage 直载 SVG（AppKit 内建 CoreSVG 渲染，macOS 11+）输出标准 iconset 的全部 10 个尺寸，`iconutil -c icns` 打包。qlmanage 也能渲染 SVG 但四角无透明，不能替代。
 
-**构建自举**：`build.sh` 检测到 icns 缺失时自动编译 genicon 并从 SVG 现生成——全新 clone 直接 `make build` 即可，无需手动步骤。改了 SVG 后想强制再生：`rm Resources/AppIcon.icns && make build`，或单独执行 `make icon` 后重新构建。Finder 显示旧图标是 LaunchServices 缓存，`killall Finder` 或注销重登刷新。
+**构建自举**：`build.sh` 检测到 icns 缺失时自动编译 genicon 并从 SVG 现生成——全新 clone 直接 `make build` 即可，无需手动步骤。改了 SVG 后想强制再生：`rm Resources/AppIcon.icns && make build`，或单独执行 `make icon` 后重新构建；`make icon` 会自行创建所需的 `build/` 目录，因此在 `make clean` 后也可直接运行。Finder 显示旧图标是 LaunchServices 缓存，`killall Finder` 或注销重登刷新。
 
 `Resources/MenuBarIconTemplate.svg` 作为原始矢量资源直接复制到 App bundle。运行时以 `NSImage` 加载并设置 `isTemplate = true`，由 macOS 自动适配浅色、深色和选中状态；保护关闭时图标透明度降低。
 
@@ -75,7 +75,7 @@ plutil -lint Info.plist            ← 校验 plist 语法
 | `make` | 测试 + 构建（等价于 `make all`） |
 | `make build` | 构建 `build/MicLock.app` |
 | `make test` | 编译并运行单元测试 |
-| `make icon` | 从 SVG 重新生成 `Resources/AppIcon.icns` |
+| `make icon` | 从 SVG 重新生成 `Resources/AppIcon.icns`（可独立执行） |
 | `make run` | 构建并启动（`open`） |
 | `make debug` | `MICLOCK_DEBUG=1` 前台运行，决策日志到终端 |
 | `make install` | 停止运行中的实例 → ditto 到 `/Applications` → 启动 |

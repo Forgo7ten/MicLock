@@ -8,8 +8,8 @@
 # 旧版编译器同时代（macOS 13.x）的 SDK 又没有 Observation 模块。
 # 安装 Swift 6+ 工具链后（见 select-toolchain.sh）即可使用新版 SDK。
 # 判定方式：用覆盖真实依赖的最小文件做 -typecheck 探针
-# （含 @Observable 宏展开、didSet、NSStatusItem/NSPopover、CoreAudio 监听块、
-# OSLog 结构化日志插值）。
+# （含 @Observable 宏展开、didSet、MenuBarExtra/Settings Scene、AppKit 激活策略、
+# ServiceManagement 登录项、CoreAudio 监听块、通知中心与 OSLog 结构化日志插值）。
 
 set -euo pipefail
 
@@ -59,27 +59,39 @@ final class ProbeModel {
             "OSLog probe value=\(self.value, privacy: .public)"
         )
     }
+
+    func probeFrameworkAPIs() {
+        _ = NSApp.setActivationPolicy(.accessory)
+        _ = SMAppService.mainApp.status
+        _ = UNUserNotificationCenter.current()
+    }
 }
 
-@MainActor
-final class ProbeMenuBarController: NSObject {
-    private let statusItem = NSStatusBar.system.statusItem(
-        withLength: NSStatusItem.squareLength
-    )
-    private let popover = NSPopover()
+struct ProbeView: View {
+    @Environment(\.openSettings) private var openSettings
 
-    override init() {
-        super.init()
+    var body: some View {
+        Button("Settings") {
+            openSettings()
+        }
+    }
+}
 
-        let secondaryClick = NSClickGestureRecognizer()
-        secondaryClick.buttonMask = 0x2
-        statusItem.button?.addGestureRecognizer(secondaryClick)
+@main
+struct ProbeApp: App {
+    @State private var model = ProbeModel()
 
-        let hostingController = NSHostingController(
-            rootView: Text("probe")
-        )
-        hostingController.sizingOptions = [.preferredContentSize]
-        popover.contentViewController = hostingController
+    var body: some Scene {
+        MenuBarExtra("Probe", systemImage: "mic") {
+            ProbeView()
+                .environment(model)
+        }
+        .menuBarExtraStyle(.window)
+
+        Settings {
+            ProbeView()
+                .environment(model)
+        }
     }
 }
 

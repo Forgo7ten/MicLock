@@ -32,6 +32,7 @@ test:
 
 # 从 Resources/AppIcon.svg 重新生成 Resources/AppIcon.icns
 icon:
+	mkdir -p build
 	@TOOLCHAIN="$$( $(ROOT)Scripts/select-toolchain.sh )"; \
 	SDK="$$( $(ROOT)Scripts/select-sdk.sh )"; \
 	"$$TOOLCHAIN/usr/bin/swiftc" -O -swift-version 6 \
@@ -46,7 +47,7 @@ run: build
 	open "$(APP)"
 
 debug: build
-	MICLOCK_DEBUG=1 ./$(APP)/Contents/MacOS/MicLock
+	MICLOCK_DEBUG=1 "$(APP)/Contents/MacOS/MicLock"
 
 # 停止旧实例 → 注销 build/ 残留注册 → 覆盖安装到 /Applications → 启动
 # build/ 注册项残留会让通知系统解析到无图标的旧 bundle（同 bundle ID），故每次注销。

@@ -33,7 +33,7 @@ flowchart TD
     H -->|"否"| Z2["保留 UID 等重连，结束"]
     H -->|"是"| I{"模式"}
     I -->|"manual"| R["立即发起恢复 preferred"]
-    I -->|"auto"| J{"settle 窗口内<br/>或 current 是未稳定新设备？"}
+    I -->|"auto"| J{"settle 窗口内？"}
     J -->|"是"| R
     J -->|"否"| L
     R --> K{"真实 current 已确认？"}
@@ -48,25 +48,24 @@ flowchart TD
 - **保护关闭时不学习**：避免关闭期间系统的临时选择悄悄改掉 preferred
 - **preferred 离线不动**：系统 fallback 到什么设备都不跟，等重连（同 UID 复现）时才恢复
 
-## settle 窗口与未稳定设备名单
+## settle 窗口
 
-Auto 判定用两个信号，缺一不可：
+Auto 判定核心信号为 settle window 状态：
 
-- **settle 窗口**：设备列表发生真实 delta 后的 `settleSeconds`（默认 2s，可调 1–30s）内，拓扑视为不稳定。计时用 `ContinuousClock` 单调时钟，不受系统时间修改影响。burst 中无 delta 的重复列表事件不重开窗口（幂等）
-- **`unsettledNewUIDs`**：刚接入、尚未度过窗口的设备集合；settle 到期时清空
+- **窗口内**：设备列表发生真实 delta 后的 `settleSeconds`（默认 2s，可调 1–30s）内，拓扑视为不稳定；外部默认输入变化按设备拓扑变化处理并立即恢复
+- **窗口外**：系统无法可靠区分用户主动切换和系统延迟切换，因此接受当前输入并学习为新的 preferred
+
+计时使用 `ContinuousClock` 单调时钟，不受系统时间修改影响。burst 中无 delta 的重复列表事件不重开窗口（幂等）。
 
 ```mermaid
 stateDiagram-v2
     [*] --> settled
     settled --> unsettled: 设备列表出现真实变化（或恢复写入后重开窗口）
     unsettled --> unsettled: 窗口内再次变化，重开窗口
-    unsettled --> settled: settleSeconds 到期，清空未稳定名单
+    unsettled --> settled: settleSeconds 到期
 ```
 
-为什么需要两个条件：
-
-- 只看窗口会漏一种情况：设备接入很久之后系统才把默认输入切过去（部分蓝牙栈/驱动行为），`isNew` 兜住它
-- 只看 isNew 会误伤一种情况：设备稳定许久后用户主动切换到它，settle 到期把它移出名单后切换被正常接受
+settle 窗口是启发式判断边界。窗口内默认输入变化按设备拓扑变化处理；窗口结束后系统无法可靠区分用户主动切换和系统延迟切换，因此按用户行为接受。
 
 ## 时序示例：AirPods 接入
 
@@ -81,7 +80,7 @@ sequenceDiagram
     Note over ML: 恢复后重开窗口，系统反抢则继续恢复直至收敛
     ML->>ML: settle 到期（默认 2s），episode 结束
     SYS->>SYS: 10s 后用户在系统设置切到 USB 麦克风
-    ML->>ML: 已 settled 且 USB 非未稳定新设备
+    ML->>ML: settle 窗口外
     ML->>ML: 接受，学习 preferred = USB 麦克风
 ```
 
@@ -89,16 +88,16 @@ sequenceDiagram
 
 ```text
 t=0.0  DEVICE_LIST_CHANGED added={AirPods}
-       unsettledNewUIDs={AirPods}，settle 窗口开启
+       settle 窗口开启
 t=0.2  DEFAULT_INPUT_CHANGED → AirPods
        settled=false → 立即恢复（AirPods → 内置麦克风），重开窗口
 t=0.6  系统反抢 → AirPods
        仍在窗口内 → 再次恢复（同一 episode，不再发通知）
 t=0.8  DEFAULT_INPUT_CHANGED → 内置麦克风
        命中 expectedDefaultUID，self-induced 回声，吸收
-t=2.2  settleTask 到期 → 未稳定名单清空，episode 结束
+t=2.2  settleTask 到期 → episode 结束
 t=10   用户在系统设置切换到 USB 麦克风
-       settled=true 且 USB 非未稳定新设备 → 接受，学习
+       settled=true → 接受，学习
 ```
 
 ## 恢复后重开窗口

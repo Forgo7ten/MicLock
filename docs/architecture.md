@@ -4,7 +4,7 @@ MicLock 只做一件事：守住系统默认输入设备（CoreAudio 的 `kAudio
 
 ## 设计原则
 
-- **事件驱动**：所有决策由 CoreAudio 属性监听回调触发，无轮询、无定时 enforce。工程只有 settle 窗口、程序化切换确认超时和设置窗口展示诊断三类短时任务（见 [auto-mode.md](auto-mode.md)）
+- **事件驱动**：CoreAudio 决策没有轮询和周期性 enforce。工程仅在有限生命周期场景使用 Task，例如 settle 窗口、程序化切换确认、Settings 展示诊断、通知授权延迟以及系统服务状态收敛复核（见 [auto-mode.md](auto-mode.md)）
 - **分层可测**：CoreAudio 访问封装在 `AudioDeviceProviding` 协议后面，策略层（AudioMonitor）只依赖协议；单元测试注入内存 Fake
 - **单写入口**：所有恢复统一走 `restorePreferred(from:to:reason:)`，唯一的写入目标始终是 `DefaultInputDevice`，绝不触碰任何输出设备
 - **零依赖**：仅使用系统框架（SwiftUI / AppKit / CoreAudio / UserNotifications / ServiceManagement / OSLog / Observation）
@@ -83,7 +83,7 @@ CoreAudio 的 `AudioDeviceID` 是运行时数值，重启或重插后会变；`k
 
 | 属性 | 处理 |
 |---|---|
-| `kAudioHardwarePropertyDevices`（设备拓扑） | `handleDeviceListChanged()`：重新枚举并求差集；有真实 delta 时跟踪未稳定新设备、开 settle 窗口，preferred 重新出现则立即恢复 |
+| `kAudioHardwarePropertyDevices`（设备拓扑） | `handleDeviceListChanged()`：重新枚举并求差集；有真实 delta 时开 settle 窗口，preferred 重新出现则立即恢复 |
 | `kAudioHardwarePropertyDefaultInputDevice`（默认输入） | `handleDefaultInputChanged()`：重读真实状态后进入决策（详见 [auto-mode.md](auto-mode.md)） |
 
 burst 事件（CoreAudio 常在插拔瞬间连发多条）的处理保证幂等：列表事件无 delta 时只刷新当前设备、不重开窗口；默认输入事件未实际变化时直接返回。
@@ -122,7 +122,7 @@ sequenceDiagram
 1. 读取偏好 → 枚举设备 → 读取当前默认输入（`AudioMonitor.init`）
 2. 首次运行且无 preferred：默认选内置麦克风（否则当前设备）
 3. App 完成启动后安装监听并执行启动对齐（`start()` → `evaluateStartupPolicy()`）：保护开启且 preferred 在线且 current ≠ preferred → 恢复（不通知）
-4. 启动约 0.5 秒后检查（必要时请求）通知授权
+4. 通知已开启时，启动约 0.5 秒后检查（必要时请求）通知授权
 
 授权请求必须放在 App 完成启动之后——App 构造阶段调用 `requestAuthorization` 会被系统静默忽略，弹窗根本不出现。
 
@@ -139,7 +139,7 @@ Manual 抢麦恢复、Auto 抢麦恢复、重连恢复、启动对齐全部走 `
 
 ## 通知
 
-**授权**：`NotificationManager.ensureAuthorization()` 先读 `UNUserNotificationCenter.notificationSettings()`；`notDetermined` 才调 `requestAuthorization`（此时请求才会真正弹窗）；被拒时设置窗口（通用 → 通知）显示提示行并可一键跳转系统设置。请求时机：启动后 0.5s、或用户重新打开「显示通知」开关时。
+**授权**：`NotificationManager.ensureAuthorization()` 先读 `UNUserNotificationCenter.notificationSettings()`；`notDetermined` 才调 `requestAuthorization`（此时请求才会真正弹窗）；被拒时设置窗口（通用 → 通知）显示提示行并可一键跳转系统设置。请求时机：通知已开启时启动后 0.5s，或用户重新打开「显示通知」开关时。
 
 **投递**：按 `RestoreReason` 生成标题，正文 `旧设备 → 新设备`，无声音；App 处于前台时仍显示横幅（`willPresent` 返回 `.banner`——菜单栏应用没有前台窗口概念，不设此项横幅会被吞掉）。
 

@@ -5,7 +5,7 @@ import Observation
 
 /// 麦克风保护状态机（Auto / Manual）。
 ///
-/// 职责：settle window、新设备跟踪、self-induced 回调识别、
+/// 职责：设备拓扑 settle window、self-induced 回调识别、
 /// preferred 持久化、统一恢复入口、通知去重。
 /// CoreAudio 枚举与读写全部委托给注入的 `AudioDeviceProviding`。
 ///
@@ -57,6 +57,9 @@ final class AudioMonitor {
     private(set) var currentDevice: AudioInputDevice?
 
     private(set) var lastError: String?
+
+    /// CoreAudio 监听基础能力失败；独立于一次性设备操作错误。
+    private(set) var listenerError: String?
 
     /// 通知权限被系统拒绝时提示用户去系统设置开启。
     private(set) var notificationDenied = false
@@ -141,10 +144,6 @@ final class AudioMonitor {
     @ObservationIgnored private var settleTask: Task<Void, Never>?
 
     @ObservationIgnored private var connectedUIDs: Set<String> = []
-
-    /// 刚接入、尚未确认稳定的新设备。
-    /// 设备稳定后自动移出，之后用户主动切换到该设备会被接受。
-    @ObservationIgnored private var unsettledNewUIDs: Set<String> = []
 
     /// MicLock 自己最后一次 set 期望达到的设备 UID，用于识别 self-induced 回调。
     @ObservationIgnored private var expectedDefaultUID: String?
@@ -289,7 +288,14 @@ final class AudioMonitor {
         // App 构造阶段调用 requestAuthorization 会被系统静默忽略（不弹窗）。
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(0.5))
-            await self?.refreshNotificationAuthorization()
+
+            guard let self,
+                  self.notificationsEnabled
+            else {
+                return
+            }
+
+            await self.refreshNotificationAuthorization()
         }
 
         Self.logger.info("App start mode=\(self.protectionMode.rawValue, privacy: .public) preferred=\(self.preferredMicrophoneUID ?? "nil", privacy: .public)")
@@ -301,7 +307,10 @@ final class AudioMonitor {
 
     /// 安装 CoreAudio 监听并执行启动策略。
     func start() {
-        installListeners()
+        guard installListeners() else {
+            return
+        }
+
         evaluateStartupPolicy()
     }
 
@@ -395,8 +404,6 @@ final class AudioMonitor {
         }
 
         Self.trace("DEVICE_LIST_CHANGED added=\(added) removed=\(removed)")
-        unsettledNewUIDs.formUnion(added)
-        unsettledNewUIDs.formIntersection(newUIDs)
         connectedUIDs = newUIDs
 
         devices = Self.sortedDevices(newDevices)
@@ -484,18 +491,17 @@ final class AudioMonitor {
 
         case .auto:
             let settled = isTopologySettled()
-            let isNew = unsettledNewUIDs.contains(current.uid)
-            Self.trace("auto: settled=\(settled) isNew=\(isNew) unsettledNew=\(unsettledNewUIDs) lastTopologyChange=\(lastTopologyChange != nil)")
+            Self.trace("auto: settled=\(settled) lastTopologyChange=\(lastTopologyChange != nil)")
             Self.logger.info(
-                "mode=auto settled=\(settled, privacy: .public) newDevice=\(isNew, privacy: .public)"
+                "mode=auto settled=\(settled, privacy: .public)"
             )
 
-            if !settled || isNew {
+            if !settled {
                 // 设备接入/断开的不稳定窗口内的变化 → 系统抢麦，立即恢复。
-                Self.trace("decision=restore reason=\(!settled ? "topology-unsettled" : "new-device")")
+                Self.trace("decision=restore reason=topology-unsettled")
                 restorePreferred(from: current, to: preferred, reason: .automaticHijack)
             } else {
-                // 设备已稳定 + 非新设备 + 非 self-induced → 用户主动切换，接受。
+                // 设备已稳定 + 非 self-induced → 用户主动切换，接受。
                 preferredMicrophoneUID = current.uid
                 Self.trace("decision=accept reason=user-initiated → \(current.name)")
                 Self.logger.info(
@@ -663,10 +669,7 @@ final class AudioMonitor {
     private func markTopologySettled() {
         guard protectionEpisodeActive else { return }
 
-        // 窗口内没有再出现设备列表事件：所有在线设备视为稳定存在，
-        // 之后用户切到“刚接入的设备”应被接受而不是误判抢麦。
         Self.trace("TOPOLOGY_SETTLED")
-        unsettledNewUIDs.removeAll()
         protectionEpisodeActive = false
         protectionEpisodeNotified = false
         settleTask = nil
@@ -733,8 +736,9 @@ final class AudioMonitor {
 
     // MARK: - Listener Installation
 
-    private func installListeners() {
-        guard !listenersInstalled else { return }
+    @discardableResult
+    private func installListeners() -> Bool {
+        guard !listenersInstalled else { return true }
 
         let result = listenerBox.install(
             onDefaultInputChange: { [weak self] in
@@ -750,16 +754,18 @@ final class AudioMonitor {
         else {
             listenersInstalled = false
 
-            lastError = "Unable to install CoreAudio listeners "
+            listenerError = "Unable to install CoreAudio listeners "
                 + "(defaultInput: \(result.defaultInputStatus), "
                 + "devices: \(result.devicesStatus))"
 
             Self.logger.error(
                 "listener install failed defaultInput=\(result.defaultInputStatus, privacy: .public) devices=\(result.devicesStatus, privacy: .public)"
             )
-            return
+            return false
         }
 
         listenersInstalled = true
+        listenerError = nil
+        return true
     }
 }

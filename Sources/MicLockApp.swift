@@ -310,8 +310,8 @@ struct MenuBarView: View {
             }
 
             Group {
-                // 设备切换失败等高频操作的即时反馈，保留在菜单栏。
-                if let error = monitor.lastError {
+                // 监听基础能力失败优先于一次性设备操作错误。
+                if let error = monitor.listenerError ?? monitor.lastError {
                     Text(error)
                         .font(.caption)
                         .foregroundStyle(.red)

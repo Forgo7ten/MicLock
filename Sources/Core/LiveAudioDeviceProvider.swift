@@ -112,14 +112,16 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
             mElement: kAudioObjectPropertyElementMain
         )
 
-        var value: CFString = "" as CFString
-        var size = UInt32(MemoryLayout<CFString>.size)
+        var value: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<CFTypeRef?>.size)
 
-        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value)
+        let status = withUnsafeMutablePointer(to: &value) { pointer in
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, pointer)
+        }
 
         guard status == noErr else { return nil }
 
-        return value as String
+        return value?.takeUnretainedValue() as String?
     }
 
     private func deviceName(_ deviceID: AudioDeviceID) -> String? {
@@ -129,14 +131,16 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
             mElement: kAudioObjectPropertyElementMain
         )
 
-        var value: CFString = "" as CFString
-        var size = UInt32(MemoryLayout<CFString>.size)
+        var value: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<CFTypeRef?>.size)
 
-        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value)
+        let status = withUnsafeMutablePointer(to: &value) { pointer in
+            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, pointer)
+        }
 
         guard status == noErr else { return nil }
 
-        return value as String
+        return value?.takeUnretainedValue() as String?
     }
 
     private func transportType(_ deviceID: AudioDeviceID) -> UInt32? {
