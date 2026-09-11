@@ -111,8 +111,6 @@ final class ActivationPolicyManager {
     /// 时序竞态，故不做；5s 的 didBecomeKey 日志用于事后排查。
     @discardableResult
     func beginOpeningSettings() -> Bool {
-        // 每次打开请求开启新的窗口周期，也恢复一次 accessory 切换重试预算。
-        accessoryRetryCount = 0
         regularDemands.insert(.settings)
 
         settingsOpenGeneration &+= 1
@@ -175,6 +173,8 @@ final class ActivationPolicyManager {
             return
         }
 
+        let hadRegularDemand = !regularDemands.isEmpty
+
         for role in roles {
             // 只结束 demand，identity 保留：SwiftUI 可能复用同一 NSWindow。
             regularDemands.remove(role)
@@ -182,21 +182,25 @@ final class ActivationPolicyManager {
 
         Self.logger.debug("WINDOW_WILL_CLOSE")
 
+        // 只有 demand 真正从非空转为空，才开启一轮新的 leave cycle。
+        // 重复 / stale willClose 不应重复创建独立的 accessory 重试预算。
+        guard hadRegularDemand, regularDemands.isEmpty else {
+            return
+        }
+
         // willClose 发生在关闭流程中而非完全消失后；
         // 延迟一轮 main queue 让窗口先完成 close，减少
         // 关闭动画异常 / 焦点跳变 / Dock 切换过早的风险。
         // 用户若在间隙快速重开，重开路径会先 insert demand，
         // isEmpty 检查天然挡住这次 stale 降级。
         DispatchQueue.main.async { [weak self] in
-            self?.leaveWindowModeIfPossible()
+            self?.leaveWindowModeIfPossible(retriesRemaining: 1)
         }
     }
 
-    /// 剩余重试次数：setActivationPolicy(.accessory) 失败多为瞬态，
-    /// 下一轮 main queue 重试一次；不做无限重试。
-    private var accessoryRetryCount = 0
-
-    private func leaveWindowModeIfPossible() {
+    /// 一次 leave cycle 最多额外重试一次；预算作为本轮调用参数传递，
+    /// 不保存为跨窗口周期的共享状态，因此不会残留到下一轮。
+    private func leaveWindowModeIfPossible(retriesRemaining: Int) {
         guard regularDemands.isEmpty else {
             return
         }
@@ -208,19 +212,17 @@ final class ActivationPolicyManager {
         guard NSApp.setActivationPolicy(.accessory) else {
             Self.logger.error("Failed to enter accessory activation policy")
 
-            guard accessoryRetryCount < 1 else {
+            guard retriesRemaining > 0 else {
                 Self.logger.error("Give up retrying accessory policy; Dock stays visible until next window cycle")
                 return
             }
 
-            accessoryRetryCount += 1
             DispatchQueue.main.async { [weak self] in
-                self?.leaveWindowModeIfPossible()
+                self?.leaveWindowModeIfPossible(retriesRemaining: retriesRemaining - 1)
             }
             return
         }
 
-        accessoryRetryCount = 0
         Self.logger.debug("RETURN_ACCESSORY")
     }
 

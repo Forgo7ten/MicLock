@@ -320,11 +320,6 @@ final class AudioMonitor {
         currentDevice?.name ?? "Unknown"
     }
 
-    /// 供 UI 层上报非 CoreAudio 错误（如登录启动注册失败）。
-    func reportError(_ message: String) {
-        lastError = message
-    }
-
     /// 离线 preferred 的展示名（nil = preferred 在线或未选择）。
     var offlinePreferredName: String? {
         guard let uid = preferredMicrophoneUID,

@@ -80,19 +80,26 @@ private struct GeneralSettingsView: View {
     private var launchAtLoginOn = false
 
     @State
+    private var launchAtLoginError: String?
+
+    @State
     private var loginItemSyncTask: Task<Void, Never>?
 
     var body: some View {
         Form {
             Section("启动") {
-                Toggle("登录时启动", isOn: $launchAtLoginOn)
-                    .onChange(of: launchAtLoginOn) { enabled in
-                        handleLaunchAtLogin(enabled)
-                    }
+                Toggle("登录时启动", isOn: launchAtLoginBinding)
 
                 Text("登录 macOS 后自动启动 MicLock，并保持静默运行在菜单栏。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                if let launchAtLoginError {
+                    Label(launchAtLoginError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             Section("通知") {
@@ -107,6 +114,7 @@ private struct GeneralSettingsView: View {
         .padding(16)
         .onAppear {
             launchAtLoginOn = LaunchAtLoginManager.isEnabled
+            launchAtLoginError = nil
         }
         .onDisappear {
             loginItemSyncTask?.cancel()
@@ -114,6 +122,17 @@ private struct GeneralSettingsView: View {
     }
 
     // MARK: - Pieces
+
+    /// 显式区分“用户修改 Toggle”和“程序同步状态”：
+    /// onAppear / 延迟复核直接写 launchAtLoginOn，不会再次调用 SMAppService。
+    private var launchAtLoginBinding: Binding<Bool> {
+        Binding(
+            get: { launchAtLoginOn },
+            set: { enabled in
+                handleLaunchAtLogin(enabled)
+            }
+        )
+    }
 
     private var notificationDeniedRow: some View {
         Button {
@@ -141,16 +160,22 @@ private struct GeneralSettingsView: View {
     //
     // SMAppService 的 status 在 register/unregister 成功后仍会滞后数秒
     // （BTM 数据库异步更新），不能把复选框直接绑定在 status 上——
-    // 点击取消时 SwiftUI 立刻重读 status 拿到旧值，复选框会被弹回勾选。
-    // 改为本地状态乐观驱动 + 延迟复核真实状态。
+    // 用户操作经显式 Binding 触发一次服务写入；onAppear 和延迟复核
+    // 只同步本地状态，不产生 register/unregister 副作用。
 
     private func handleLaunchAtLogin(_ enabled: Bool) {
         loginItemSyncTask?.cancel()
 
-        guard LaunchAtLoginManager.setEnabled(enabled) else {
-            // 注册/注销失败：回滚 UI 状态。
-            launchAtLoginOn = !enabled
-            monitor.reportError("设置登录启动失败（App 需安装在稳定位置，如 ~/Applications）")
+        let previous = launchAtLoginOn
+        launchAtLoginOn = enabled
+        launchAtLoginError = nil
+
+        do {
+            try LaunchAtLoginManager.setEnabled(enabled)
+        } catch {
+            // 服务写入失败：只回滚本地 UI，不触发反向 unregister/register。
+            launchAtLoginOn = previous
+            launchAtLoginError = "设置登录启动失败：\(error.localizedDescription)。请确认 MicLock 已安装在 /Applications 或 ~/Applications。"
             return
         }
 
@@ -162,14 +187,25 @@ private struct GeneralSettingsView: View {
 
                 let status = LaunchAtLoginManager.status
 
-                // 已注册待批准：系统已弹出设置面板引导，保持勾选。
-                if status == .pendingApproval { return }
-
-                if (status == .enabled) == enabled { return }
+                if enabled {
+                    // 待批准仍属于“已经请求开启”，保持勾选等待用户批准。
+                    if status == .enabled || status == .pendingApproval {
+                        return
+                    }
+                } else if status == .off {
+                    return
+                }
             }
 
-            // 3 秒后仍未收敛：以真实状态为准。
-            launchAtLoginOn = LaunchAtLoginManager.status == .enabled
+            // 3 秒后仍未收敛：以系统真实状态为准。
+            let actualEnabled = LaunchAtLoginManager.isEnabled
+            launchAtLoginOn = actualEnabled
+
+            if actualEnabled != enabled {
+                launchAtLoginError = enabled
+                    ? "登录启动未能在系统中生效，请稍后重试。"
+                    : "关闭登录启动未能在系统中生效，请稍后重试。"
+            }
         }
     }
 }

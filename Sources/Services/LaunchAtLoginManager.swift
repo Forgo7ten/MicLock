@@ -43,8 +43,7 @@ enum LaunchAtLoginManager {
         status != .off
     }
 
-    @discardableResult
-    static func setEnabled(_ enabled: Bool) -> Bool {
+    static func setEnabled(_ enabled: Bool) throws {
         do {
             if enabled {
                 try SMAppService.mainApp.register()
@@ -52,13 +51,12 @@ enum LaunchAtLoginManager {
                 try SMAppService.mainApp.unregister()
             }
             Self.logger.info("launchAtLogin=\(enabled, privacy: .public)")
-            return true
         } catch {
             // 例如 ad-hoc 签名/非常规安装路径下注册可能被系统拒绝。
             Self.logger.error(
                 "launchAtLogin \(enabled, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
             )
-            return false
+            throw error
         }
     }
 }
