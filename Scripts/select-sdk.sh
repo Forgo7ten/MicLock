@@ -77,7 +77,6 @@ struct ProbeView: View {
     }
 }
 
-@main
 struct ProbeApp: App {
     @State private var model = ProbeModel()
 
@@ -98,21 +97,40 @@ struct ProbeApp: App {
 var probeListener: AudioObjectPropertyListenerBlock?
 PROBE
 
+PROBE_LOG="${PROBE_DIR}/probe.log"
+: > "${PROBE_LOG}"
+
 for CANDIDATE in \
     "$(xcrun --show-sdk-path --sdk macosx)" \
     /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk \
     /Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk; do
     [[ -d "${CANDIDATE}" ]] || continue
 
+    CANDIDATE_LOG="${PROBE_DIR}/candidate.log"
+
     if "${SWIFT}" -typecheck \
         -swift-version 6 \
         -sdk "${CANDIDATE}" \
         -target "${ARCH}-apple-macos14.0" \
-        "${PROBE_DIR}/probe.swift" >/dev/null 2>&1; then
+        "${PROBE_DIR}/probe.swift" >"${CANDIDATE_LOG}" 2>&1; then
         echo "${CANDIDATE}"
         exit 0
     fi
+
+    {
+        echo "=== SDK probe failed: ${CANDIDATE} ==="
+        cat "${CANDIDATE_LOG}"
+        echo
+    } >> "${PROBE_LOG}"
 done
 
 echo "error: 所选 Swift 工具链无法解析任何已安装的 macOS SDK" >&2
+
+if [[ -s "${PROBE_LOG}" ]]; then
+    echo "Swift probe diagnostics:" >&2
+    cat "${PROBE_LOG}" >&2
+else
+    echo "error: 未找到可测试的 macOS SDK 候选路径" >&2
+fi
+
 exit 1
