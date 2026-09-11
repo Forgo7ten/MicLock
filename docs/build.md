@@ -78,10 +78,10 @@ plutil -lint Info.plist            ← 校验 plist 语法
 | `make icon` | 从 SVG 重新生成 `Resources/AppIcon.icns` |
 | `make run` | 构建并启动（`open`） |
 | `make debug` | `MICLOCK_DEBUG=1` 前台运行，决策日志到终端 |
-| `make install` | 停止运行中的实例 → ditto 到 `~/Applications` → 启动 |
+| `make install` | 停止运行中的实例 → ditto 到 `/Applications` → 启动 |
 | `make clean` | 删除 `build/` 产物 |
 | `make all` | test + build（build 过程中会自动检查并生成缺失的 `AppIcon.icns`） |
 
 ## 安装路径与登录项
 
-「登录时启动」（SMAppService）要求 App 位于稳定路径（`~/Applications` 或 `/Applications`）；从临时构建目录 `open` 的实例注册会被系统拒绝。`make install` 已处理停止旧实例、覆盖安装、重新启动。
+「登录时启动」（SMAppService）要求 App 位于稳定路径（`/Applications` 或 `~/Applications`）；从临时构建目录 `open` 的实例注册会被系统拒绝。`make install` 已处理停止旧实例、覆盖安装、重新启动。`/Applications` 通常 admin 组可直接写入；仅当旧 `.app` 属主为 root（如 pkg 安装）时需 `sudo make install`。

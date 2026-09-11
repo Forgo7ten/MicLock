@@ -4,7 +4,7 @@ MicLock 只做一件事：守住系统默认输入设备（CoreAudio 的 `kAudio
 
 ## 设计原则
 
-- **事件驱动**：所有决策由 CoreAudio 属性监听回调触发，无轮询、无定时 enforce。工程只有 settle 窗口和程序化切换确认超时两类短时任务（见 [auto-mode.md](auto-mode.md)）
+- **事件驱动**：所有决策由 CoreAudio 属性监听回调触发，无轮询、无定时 enforce。工程只有 settle 窗口、程序化切换确认超时和设置窗口展示诊断三类短时任务（见 [auto-mode.md](auto-mode.md)）
 - **分层可测**：CoreAudio 访问封装在 `AudioDeviceProviding` 协议后面，策略层（AudioMonitor）只依赖协议；单元测试注入内存 Fake
 - **单写入口**：所有恢复统一走 `restorePreferred(from:to:reason:)`，唯一的写入目标始终是 `DefaultInputDevice`，绝不触碰任何输出设备
 - **零依赖**：仅使用系统框架（SwiftUI / AppKit / CoreAudio / UserNotifications / ServiceManagement / OSLog / Observation）
@@ -13,8 +13,9 @@ MicLock 只做一件事：守住系统默认输入设备（CoreAudio 的 `kAudio
 
 ```mermaid
 flowchart TD
-    subgraph UI["菜单栏与 SwiftUI 层"]
-        APP["NSStatusItem / NSPopover / MenuBarView（菜单栏窗口）"]
+    subgraph UI["菜单栏与设置（SwiftUI Scene 层）"]
+        APP["MenuBarExtra(.window) / MenuBarView（高频操作）"]
+        SET["Settings Scene / SettingsView（低频配置 + 关于）"]
     end
     subgraph CORE["Sources/Core — 策略层"]
         AM["AudioMonitor（@MainActor 状态机）"]
@@ -31,8 +32,9 @@ flowchart TD
         FAKE["FakeAudioDeviceProvider / RecordingNotifier"]
     end
 
-    APP -->|"@State / @Bindable 观测"| AM
-    APP -->|"登录项开关"| LM
+    APP -->|"@Bindable 观测"| AM
+    SET -->|"@Bindable 观测"| AM
+    SET -->|"登录项开关"| LM
     AM -->|"读写配置"| PR
     AM -->|"枚举 / 读写默认输入"| PROV
     AM -->|"恢复通知"| NM
@@ -45,9 +47,10 @@ flowchart TD
 
 | 文件 | 职责 |
 |---|---|
-| `Sources/MicLockApp.swift` | AppKit `NSStatusItem`/`NSPopover` 菜单栏入口（左右键共用），通过 `NSHostingController` 承载 SwiftUI 菜单 UI |
-| `Sources/AboutView.swift` | About 窗口 SwiftUI 内容：图标、动态版本/构建号、说明与 GitHub 链接 |
-| `Sources/AboutWindowController.swift` | About 窗口生命周期与显示/激活管理 |
+| `Sources/MicLockApp.swift` | SwiftUI App 入口：`MenuBarExtra(.window)`（高频操作，左/右键共用）与 `Settings` Scene 两个 Scene；`MicLockAppDelegate` 负责启动时序、label 状态镜像与右键事件桥接 |
+| `Sources/ActivationPolicyManager.swift` | 动态 Activation Policy：平时 `.accessory` 常驻菜单栏，打开普通窗口（Settings）时临时 `.regular`（有 Dock / 顶部 App Menu），demand 全部结束后切回。窗口 identity 与 regular demand 两个正交状态：identity（weak，close 后保留）识别复用的 NSWindow；demand 由用户意图与 `willCloseNotification` 驱动 policy。无基于超时的降级——`openSettings()` 没有 success/failure 回调，窗口物化耗时（实测 ~2–3s）不能推断 Scene 生命周期 |
+| `Sources/SettingsView.swift` | 设置窗口：通用（登录项 / 通知）/ 高级（设备稳定窗口）/ 关于（`AboutView`）三个 Tab；`WindowAccessor` bridge 把底层 NSWindow 注册给 ActivationPolicyManager |
+| `Sources/AboutView.swift` | 设置窗口「关于」Tab 内容：图标、动态版本/构建号、说明与 GitHub / License 链接 |
 | `Sources/Core/AudioMonitor.swift` | 核心状态机：事件处理、模式判定、恢复、通知编排、调试 trace；UI 可见状态以 `@Observable` 暴露，内部状态 `@ObservationIgnored` |
 | `Sources/Core/LiveAudioDeviceProvider.swift` | CoreAudio HAL 封装：设备枚举、UID/名称/传输类型查询、默认输入读写 |
 | `Sources/Core/AudioDeviceProviding.swift` | CoreAudio 访问抽象协议（测试注入点） |
@@ -136,7 +139,7 @@ Manual 抢麦恢复、Auto 抢麦恢复、重连恢复、启动对齐全部走 `
 
 ## 通知
 
-**授权**：`NotificationManager.ensureAuthorization()` 先读 `UNUserNotificationCenter.notificationSettings()`；`notDetermined` 才调 `requestAuthorization`（此时请求才会真正弹窗）；被拒时菜单显示提示行并可一键跳转系统设置。请求时机：启动后 0.5s、或用户重新打开「显示通知」开关时。
+**授权**：`NotificationManager.ensureAuthorization()` 先读 `UNUserNotificationCenter.notificationSettings()`；`notDetermined` 才调 `requestAuthorization`（此时请求才会真正弹窗）；被拒时设置窗口（通用 → 通知）显示提示行并可一键跳转系统设置。请求时机：启动后 0.5s、或用户重新打开「显示通知」开关时。
 
 **投递**：按 `RestoreReason` 生成标题，正文 `旧设备 → 新设备`，无声音；App 处于前台时仍显示横幅（`willPresent` 返回 `.banner`——菜单栏应用没有前台窗口概念，不设此项横幅会被吞掉）。
 

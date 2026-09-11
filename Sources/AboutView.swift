@@ -7,6 +7,9 @@ struct AboutView: View {
     private static let repositoryURL =
         URL(string: "https://github.com/Forgo7ten/MicLock")!
 
+    private static let licenseURL =
+        URL(string: "https://github.com/Forgo7ten/MicLock/blob/main/LICENSE")!
+
     private var versionText: String {
         let version = Bundle.main.object(
             forInfoDictionaryKey: "CFBundleShortVersionString"
@@ -25,6 +28,8 @@ struct AboutView: View {
 
     var body: some View {
         VStack(spacing: 12) {
+            Spacer()
+
             Image(nsImage: NSApplication.shared.applicationIconImage)
                 .resizable()
                 .scaledToFit()
@@ -43,19 +48,22 @@ struct AboutView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
 
-            Button {
-                NSWorkspace.shared.open(Self.repositoryURL)
-            } label: {
-                Label("在 GitHub 上查看", systemImage: "arrow.up.right.square")
+            HStack(spacing: 16) {
+                Link(destination: Self.repositoryURL) {
+                    Label("GitHub 项目", systemImage: "arrow.up.right.square")
+                }
+
+                Link("MIT License", destination: Self.licenseURL)
             }
-            .controlSize(.large)
             .padding(.top, 6)
 
-            Text("MIT License")
+            Text("Copyright © 2026 Forgo7ten")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
+
+            Spacer()
         }
         .padding(28)
-        .frame(width: 380)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

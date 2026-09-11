@@ -9,14 +9,15 @@ MicLock 监听 macOS 的 CoreAudio 设备变化，在不录音、不联网的前
 
 ## 功能
 
-- 自定义模板图标常驻菜单栏，左键或右键均可打开面板，无 Dock 图标，防双开
+- 自定义模板图标常驻菜单栏，左键或右键均可打开面板；平时无 Dock 图标，打开设置窗口时临时显示 Dock 图标，关闭后恢复，防双开
+- 菜单栏面板只保留高频操作（保护开关、模式、首选麦克风）；「设置…」打开独立设置窗口（通用 / 高级 / 关于）
 - 两种保护模式：
   - **自动**：设备接入的不稳定窗口内阻止系统抢麦；设备稳定后，你主动切换的麦克风会自动成为新的首选
   - **手动**：严格锁定首选麦克风，任何来源的外部切换都会被立即恢复
 - CoreAudio 事件驱动，无轮询
 - 设备 Device UID 持久化，跨插拔稳定；首选设备离线时保留等待重连
-- 恢复时发送本地通知（首次启动自动请求授权，被拒时菜单内引导开启）
-- 登录时启动（SMAppService）
+- 恢复时发送本地通知（首次启动自动请求授权，被拒时在设置中引导开启）
+- 登录时启动（SMAppService，设置 → 通用）
 - 无第三方依赖、无网络、不录音、无 root
 
 详细文档见 [docs/](docs/)：
@@ -61,7 +62,7 @@ git clone https://github.com/Forgo7ten/MicLock.git
 cd MicLock
 
 make            # 测试 + 构建
-make install    # 安装到 ~/Applications 并启动
+make install    # 安装到 /Applications 并启动
 ```
 
 常用命令：
@@ -73,10 +74,10 @@ make install    # 安装到 ~/Applications 并启动
 | `make icon` | 从 `Resources/AppIcon.svg` 重新生成 icns |
 | `make run` | 构建并启动 |
 | `make debug` | `MICLOCK_DEBUG=1` 前台运行，决策日志到终端 |
-| `make install` | 停止旧实例 → 安装到 ~/Applications → 启动 |
+| `make install` | 停止旧实例 → 安装到 /Applications → 启动 |
 | `make clean` | 清理构建产物 |
 
-首次启动约 0.5 秒后请求通知权限，允许即可；被拒绝时菜单会显示提示行并可一键跳转系统设置。
+首次启动约 0.5 秒后请求通知权限，允许即可；被拒绝时设置窗口（通用 → 通知）会显示提示行并可一键跳转系统设置。
 
 更多调试手段（`MICLOCK_TRACE_PATH` 决策流文件、OSLog）见 [docs/architecture.md](docs/architecture.md#调试)。
 

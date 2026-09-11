@@ -3,7 +3,7 @@
 ROOT := $(dir $(realpath $(firstword $(MAKEFILE_LIST))))
 
 APP := $(ROOT)build/MicLock.app
-INSTALL_DIR := $(HOME)/Applications
+INSTALL_DIR := /Applications
 
 .PHONY: all help build test icon run debug install clean
 
@@ -19,7 +19,7 @@ help:
 	@echo "  make icon     从 Resources/AppIcon.svg 重新生成 icns"
 	@echo "  make run      构建并启动"
 	@echo "  make debug    MICLOCK_DEBUG=1 前台运行，决策日志到终端"
-	@echo "  make install  停止旧实例 → 安装到 ~/Applications → 启动"
+	@echo "  make install  停止旧实例 → 安装到 /Applications → 启动"
 	@echo "  make clean    清理构建产物"
 	@echo
 	@echo "详见 docs/build.md"
@@ -48,8 +48,9 @@ run: build
 debug: build
 	MICLOCK_DEBUG=1 ./$(APP)/Contents/MacOS/MicLock
 
-# 停止旧实例 → 注销 build/ 残留注册 → 覆盖安装到 ~/Applications → 启动
+# 停止旧实例 → 注销 build/ 残留注册 → 覆盖安装到 /Applications → 启动
 # build/ 注册项残留会让通知系统解析到无图标的旧 bundle（同 bundle ID），故每次注销。
+# /Applications 通常 admin 组可直接写入；仅当旧 .app 属主为 root（如 pkg 安装）时需 sudo make install。
 install:
 	@pgrep -x MicLock >/dev/null && { pkill -x MicLock; sleep 2; } || true
 	@LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister; \
