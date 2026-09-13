@@ -15,6 +15,8 @@ func runAllTests() async {
     testPendingRestoreIsAtomicallySupersededByModeChange()
     testIntermediateCallbackWhileExpectedDoesNotRestoreAgain()
     testA1_NewDeviceHijack()
+    testA1_DefaultCallbackBeforeDeviceAddedCallback()
+    testPreferredRemoval_DefaultCallbackBeforeDeviceListCallback()
     testA2_SettledUserSwitch()
     testA2_RecentEventUsesOldPreferredAfterNoDeltaDeviceCallback()
     testA3_ManualSwitchInsideSettleWindow()
@@ -278,6 +280,60 @@ private func testA1_NewDeviceHijack() {
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "preferred stays BuiltIn")
     expect(monitor.currentDevice?.uid == builtInMic.uid, "current restored")
     expect(notifier.presentCount == 1, "exactly one notification")
+}
+
+/// A1 反序回归：DefaultInput callback 先于 Devices callback 时，
+/// 第一次 wake-up 也必须从 CoreAudio 重读完整 snapshot 并识别新增设备抢麦。
+@MainActor
+private func testA1_DefaultCallbackBeforeDeviceAddedCallback() {
+    test("A1 default callback before device-added callback")
+
+    let (monitor, provider, notifier) = makeMonitor(
+        devices: [builtInMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto
+    )
+
+    // CoreAudio 真实状态已经同时变化，但 listener 投递顺序是 Default → Devices。
+    provider.devices = [builtInMic, airpodsMic]
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls == [builtInMic.uid], "default-first callback still restores hijack immediately")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "default-first callback does not learn AirPods")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "current restored after default-first callback")
+    expect(notifier.presentCount == 1, "default-first hijack notifies once")
+
+    // 随后的 Devices callback 只会看到 no delta，不得改变结论或重复 setter。
+    monitor.handleDeviceListChanged()
+    expect(provider.setCalls == [builtInMic.uid], "later devices callback is idempotent")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "preferred remains BuiltIn")
+}
+
+/// preferred 拔出反序回归：DefaultInput callback 先到时必须先刷新 topology，
+/// 识别 preferred 已离线并保留原 UID，不能把系统 fallback 学成新的 preferred。
+@MainActor
+private func testPreferredRemoval_DefaultCallbackBeforeDeviceListCallback() {
+    test("preferred removal default callback before device-list callback")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: usbMic,
+        preferred: usbMic.uid,
+        mode: .auto
+    )
+
+    provider.devices = [builtInMic]
+    provider.current = builtInMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls.isEmpty, "offline preferred is not restored to an unavailable device")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "default-first removal preserves offline preferred UID")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "system fallback remains current while preferred is offline")
+
+    monitor.handleDeviceListChanged()
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "later devices callback does not overwrite offline preferred")
 }
 
 /// A2：设备稳定后的外部切换 → 接受并保存为新的 preferred，不恢复。

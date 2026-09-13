@@ -435,101 +435,101 @@ final class AudioMonitor {
         restorePreferred(from: current, to: preferred, reason: .startup)
     }
 
-    // MARK: - Device List Changed
+    // MARK: - CoreAudio Reconciliation
 
-    /// 设备列表变化（插拔/重连）。
-    ///
-    /// burst 事件中集合可能重复不变，此时不重置 settle window（幂等）。
+    private enum CoreAudioWakeReason: String {
+        case devices
+        case defaultInput
+    }
+
+    /// 两个 CoreAudio listener 都只作为 wake-up 信号。
+    /// 每次回调都重新读取完整设备列表 + 默认输入快照，并固定按：
+    /// topology delta → current → pending transaction → policy 的顺序收敛。
+    /// 因此不依赖 Devices / DefaultInput 两个独立 property callback 的到达顺序。
     func handleDeviceListChanged() {
+        reconcileCoreAudioState(trigger: .devices)
+    }
+
+    func handleDefaultInputChanged() {
+        reconcileCoreAudioState(trigger: .defaultInput)
+    }
+
+    private func reconcileCoreAudioState(trigger: CoreAudioWakeReason) {
+        let previous = currentDevice
         let newDevices = provider.listInputDevices()
+        let newCurrent = provider.currentInputDevice()
         let newUIDs = Set(newDevices.map(\.uid))
         let added = newUIDs.subtracting(connectedUIDs)
         let removed = connectedUIDs.subtracting(newUIDs)
+        let topologyChanged = !added.isEmpty || !removed.isEmpty
 
-        guard !added.isEmpty || !removed.isEmpty else {
-            Self.logger.debug("DEVICE_LIST_CHANGED (no delta)")
-            Self.trace("DEVICE_LIST_CHANGED (no delta)")
-            refreshCurrentDevice()
-            return
-        }
-
-        Self.trace("DEVICE_LIST_CHANGED added=\(added) removed=\(removed)")
-        connectedUIDs = newUIDs
-
+        // 1. topology 永远先于 default-input policy 更新。
         devices = Self.sortedDevices(newDevices)
+        connectedUIDs = newUIDs
         recordDeviceNames(newDevices)
 
-        Self.logger.info(
-            "DEVICE_LIST_CHANGED added=\(String(describing: added), privacy: .public) removed=\(String(describing: removed), privacy: .public)"
-        )
-
-        markTopologyUnsettled()
-
-        // 先读取设备列表变化后的真实 default input，再决定是否需要主动恢复。
-        refreshCurrentDevice()
-
-        // preferred 设备重新出现：立即恢复（Auto / Manual 都执行）。
-        if let preferredUID = preferredMicrophoneUID, added.contains(preferredUID) {
-            handlePreferredReconnected()
+        if topologyChanged {
+            Self.trace(
+                "CORE_AUDIO_RECONCILE trigger=\(trigger.rawValue) added=\(added) removed=\(removed)"
+            )
+            Self.logger.info(
+                "CORE_AUDIO_RECONCILE trigger=\(trigger.rawValue, privacy: .public) added=\(String(describing: added), privacy: .public) removed=\(String(describing: removed), privacy: .public)"
+            )
+            markTopologyUnsettled()
+        } else if trigger == .devices {
+            Self.logger.debug("DEVICE_LIST_CHANGED (no delta)")
+            Self.trace("DEVICE_LIST_CHANGED (no delta)")
         }
-    }
 
-    private func handlePreferredReconnected() {
-        guard protectionEnabled,
-              let preferredUID = preferredMicrophoneUID,
-              let preferred = devices.first(where: { $0.uid == preferredUID }),
-              let current = currentDevice,
-              current.uid != preferred.uid
-        else { return }
-
-        restorePreferred(from: current, to: preferred, reason: .preferredReconnected)
-    }
-
-    // MARK: - Default Input Changed
-
-    /// 默认输入变化回调。每次开始都重新读取真实状态（幂等）。
-    func handleDefaultInputChanged() {
-        let previous = currentDevice
-
-        refreshCurrentDevice()
-
+        // 2. 使用同一份 CoreAudio snapshot 更新真实 current。
+        currentDevice = newCurrent
         guard let current = currentDevice else { return }
 
-        // MicLock 自己触发的变化优先于策略判定：等待中的事务只有在真实 current
-        // 达到 target 时才确认；中间 callback 只被吸收，不重复 setter。
+        // 3. MicLock 自己触发的变化优先于 Auto / Manual policy。
         if case .awaitingConfirmation(let pending) = programmaticSwitchState {
-            Self.trace("DEFAULT_INPUT_CHANGED → \(current.name) pendingTarget=\(pending.targetUID)")
+            Self.trace(
+                "CORE_AUDIO_RECONCILE current=\(current.name) pendingTarget=\(pending.targetUID)"
+            )
             if finishProgrammaticSwitchIfConfirmed() {
                 Self.logger.debug(
-                    "DEFAULT_INPUT_CHANGED (self-induced confirmed) → \(current.name, privacy: .public)"
+                    "PROGRAMMATIC_SWITCH confirmed → \(current.name, privacy: .public)"
                 )
             } else {
                 Self.logger.debug(
-                    "DEFAULT_INPUT_CHANGED while waiting programmatic switch; current=\(current.name, privacy: .public) target=\(pending.targetUID, privacy: .public)"
+                    "PROGRAMMATIC_SWITCH still pending current=\(current.name, privacy: .public) target=\(pending.targetUID, privacy: .public)"
                 )
             }
             return
         }
 
-        Self.trace("DEFAULT_INPUT_CHANGED → \(current.name) pendingTarget=nil")
-
+        Self.trace(
+            "CORE_AUDIO_RECONCILE trigger=\(trigger.rawValue) current=\(current.name) pendingTarget=nil"
+        )
         Self.logger.info(
-            "DEFAULT_INPUT_CHANGED \(previous?.name ?? "nil", privacy: .public) → \(current.name, privacy: .public) mode=\(self.protectionMode.rawValue, privacy: .public)"
+            "DEFAULT_INPUT_STATE \(previous?.name ?? "nil", privacy: .public) → \(current.name, privacy: .public) mode=\(self.protectionMode.rawValue, privacy: .public)"
         )
 
         guard protectionEnabled else { return }
 
         guard let preferredUID = preferredMicrophoneUID else {
-            // 未设置 preferred：学习当前设备。
             preferredMicrophoneUID = current.uid
             return
         }
 
-        // 已经是 preferred：无事可做（幂等，避免 Listener 循环）。
+        // preferred 设备重新出现：无论 Auto / Manual 都立即恢复。
+        if added.contains(preferredUID),
+           let preferred = devices.first(where: { $0.uid == preferredUID }),
+           current.uid != preferred.uid
+        {
+            restorePreferred(from: current, to: preferred, reason: .preferredReconnected)
+            return
+        }
+
         if current.uid == preferredUID { return }
 
         guard let preferred = devices.first(where: { $0.uid == preferredUID }) else {
-            // preferred 离线：保留 UID，不 fallback，也不学习系统 fallback 设备。
+            // preferred 离线：即使 default callback 先到，也因为本次已先刷新完整
+            // topology snapshot，所以不会把系统 fallback 错学成新的 preferred。
             Self.logger.info(
                 "PREFERRED_OFFLINE keep=\(preferredUID, privacy: .public) current=\(current.name, privacy: .public)"
             )
@@ -543,19 +543,12 @@ final class AudioMonitor {
         case .auto:
             let settled = isTopologySettled()
             Self.trace("auto: settled=\(settled)")
-            Self.logger.info(
-                "mode=auto settled=\(settled, privacy: .public)"
-            )
+            Self.logger.info("mode=auto settled=\(settled, privacy: .public)")
 
             if !settled {
-                // 设备接入/断开的不稳定窗口内的变化 → 系统抢麦，立即恢复。
                 Self.trace("decision=restore reason=topology-unsettled")
                 restorePreferred(from: current, to: preferred, reason: .automaticHijack)
             } else {
-                // 设备已稳定 + 非 self-induced → 用户主动切换，接受。
-                // Recent Event 的 from 取旧 preferred，而不是缓存的 previous current：
-                // CoreAudio 的 devices callback 可能先刷新 currentDevice，再到 default callback；
-                // 此时 previous 已经是新设备，但 preferred 仍准确代表策略迁移前的设备。
                 preferredMicrophoneUID = current.uid
                 recordRecentAudioEvent(RecentAudioEvent(
                     kind: .acceptedUserSwitch,
