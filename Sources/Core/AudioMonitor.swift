@@ -64,6 +64,11 @@ final class AudioMonitor {
     /// 通知权限被系统拒绝时提示用户去系统设置开启。
     private(set) var notificationDenied = false
 
+    /// 最近已经确认生效的关键麦克风事件，最新事件排在最前。
+    private(set) var recentAudioEvents: [RecentAudioEvent] = []
+
+    private static let recentAudioEventLimit = 10
+
     var preferredMicrophoneUID: String? {
         didSet {
             guard preferredMicrophoneUID != oldValue else { return }
@@ -84,6 +89,7 @@ final class AudioMonitor {
             } else {
                 // Protection OFF：只监控与刷新，不执行任何策略、不学习。
                 pendingRestoreNotification = nil
+                pendingRecentAudioEvent = nil
                 clearExpectedDefaultSwitch()
             }
         }
@@ -160,6 +166,9 @@ final class AudioMonitor {
 
     /// 待确认的恢复通知：set 成功后挂起，确认 current == preferred 才投递。
     @ObservationIgnored private var pendingRestoreNotification: (from: String, to: String, reason: RestoreReason)?
+
+    /// 程序化切换对应的解释事件；只有 expected switch 被真实状态确认后才提交。
+    @ObservationIgnored private var pendingRecentAudioEvent: RecentAudioEvent?
 
     /// 离线 preferred 设备的最近已知名称（跨启动持久化，用于 UI 展示）。
     @ObservationIgnored private var lastKnownDeviceNames: [String: String]
@@ -351,6 +360,12 @@ final class AudioMonitor {
 
         // 用户的新选择取代尚未确认的自动恢复，不应沿用旧通知。
         pendingRestoreNotification = nil
+        pendingRecentAudioEvent = RecentAudioEvent(
+            kind: .selectedInMicLock,
+            fromDeviceName: currentDevice?.name,
+            toDeviceName: device.name,
+            occurredAt: Date()
+        )
         beginExpectedDefaultSwitch(to: device.uid)
 
         if provider.setInputDevice(uid: device.uid) {
@@ -367,6 +382,7 @@ final class AudioMonitor {
             }
         } else {
             clearExpectedDefaultSwitch()
+            pendingRecentAudioEvent = nil
             lastError = "Unable to set default input device"
             Self.logger.error("USER_SELECT failed uid=\(device.uid, privacy: .public)")
         }
@@ -503,6 +519,12 @@ final class AudioMonitor {
             } else {
                 // 设备已稳定 + 非 self-induced → 用户主动切换，接受。
                 preferredMicrophoneUID = current.uid
+                recordRecentAudioEvent(RecentAudioEvent(
+                    kind: .acceptedUserSwitch,
+                    fromDeviceName: previous?.name,
+                    toDeviceName: current.name,
+                    occurredAt: Date()
+                ))
                 Self.trace("decision=accept reason=user-initiated → \(current.name)")
                 Self.logger.info(
                     "decision=accept reason=user-initiated preferred=\(current.name, privacy: .public)"
@@ -522,12 +544,19 @@ final class AudioMonitor {
         guard protectionEnabled else { return }
 
         beginExpectedDefaultSwitch(to: preferred.uid)
+        pendingRecentAudioEvent = RecentAudioEvent(
+            kind: .restored(reason),
+            fromDeviceName: current.name,
+            toDeviceName: preferred.name,
+            occurredAt: Date()
+        )
 
         let ok = provider.setInputDevice(uid: preferred.uid)
 
         guard ok else {
             clearExpectedDefaultSwitch()
             pendingRestoreNotification = nil
+            pendingRecentAudioEvent = nil
             lastError = "Unable to set default input device"
             Self.logger.error("RESTORE_FAILURE reason=\(reason, privacy: .public) target=\(preferred.name, privacy: .public)")
             return
@@ -583,6 +612,7 @@ final class AudioMonitor {
             self.expectedDefaultUID = nil
             self.expectedSwitchTimeoutTask = nil
             self.pendingRestoreNotification = nil
+            self.pendingRecentAudioEvent = nil
             self.lastError = "Unable to confirm default input device change"
 
             Self.logger.error("EXPECTED_SWITCH timeout uid=\(uid, privacy: .public)")
@@ -604,8 +634,20 @@ final class AudioMonitor {
         else { return false }
 
         clearExpectedDefaultSwitch()
+        if let pendingRecentAudioEvent {
+            recordRecentAudioEvent(pendingRecentAudioEvent)
+            self.pendingRecentAudioEvent = nil
+        }
         completePendingRestoreNotification()
         return true
+    }
+
+
+    private func recordRecentAudioEvent(_ event: RecentAudioEvent) {
+        recentAudioEvents.insert(event, at: 0)
+        if recentAudioEvents.count > Self.recentAudioEventLimit {
+            recentAudioEvents.removeLast(recentAudioEvents.count - Self.recentAudioEventLimit)
+        }
     }
 
     // MARK: - Notification 去重
