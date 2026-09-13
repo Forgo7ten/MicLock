@@ -22,6 +22,7 @@ func runAllTests() async {
     testA3_ManualSwitchInsideSettleWindow()
     await testA4_NewDeviceSettlesThenAccepted()
     testBurst()
+    testNotificationDedupeOnlyConsumedWhenActuallySent()
     await testSettleConfigurationChangeKeepsEpisodeNotificationDeduped()
     testPreferredReconnect()
     testPreferredReconnectAlreadyCurrentDoesNotSetAgain()
@@ -476,6 +477,42 @@ private func testBurst() {
     expect(monitor.currentDevice?.uid == builtInMic.uid, "final current = preferred")
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "preferred stable")
     expect(notifier.presentCount == 1, "one notification per protection episode")
+}
+
+/// pending restore 确认前关闭通知，不应消耗当前 episode 的去重额度。
+@MainActor
+private func testNotificationDedupeOnlyConsumedWhenActuallySent() {
+    test("notification dedupe only consumed when actually sent")
+
+    let (monitor, provider, notifier) = makeMonitor(
+        devices: [builtInMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto,
+        settle: 30.0
+    )
+    provider.applySetImmediately = false
+
+    provider.devices = [builtInMic, airpodsMic]
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls == [builtInMic.uid], "first hijack starts pending restore")
+    expect(notifier.presentCount == 0, "pending restore has not notified")
+
+    monitor.notificationsEnabled = false
+    provider.current = builtInMic
+    monitor.handleDefaultInputChanged()
+
+    expect(notifier.presentCount == 0, "confirmation while notifications are off sends nothing")
+
+    monitor.notificationsEnabled = true
+    provider.applySetImmediately = true
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls == [builtInMic.uid, builtInMic.uid], "second hijack is restored in same episode")
+    expect(notifier.presentCount == 1, "second hijack can still consume the unused notification slot")
 }
 
 /// 运行中的 settleSeconds 修改必须立即重排当前 episode 的 deadline；

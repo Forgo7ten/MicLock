@@ -749,6 +749,10 @@ final class AudioMonitor {
     private func commitNotification(_ pending: PendingNotification?) {
         guard let pending else { return }
 
+        // 用户可能在事务确认前关闭通知；没有真正发送就不能消耗
+        // 当前 settle episode 的 notificationSent 去重额度。
+        guard notificationsEnabled else { return }
+
         // Auto notification 只修改创建它的 episode；旧事务晚到的 confirmation
         // 绝不能把一个更新的 episode 标记成已通知。
         if let episodeID = pending.episodeID,
@@ -759,9 +763,6 @@ final class AudioMonitor {
             episode.notificationSent = true
             stabilityState = .settling(episode)
         }
-
-        // 用户可能在事务确认前关闭通知；关闭后不应投递。
-        guard notificationsEnabled else { return }
 
         Self.logger.info(
             "NOTIFICATION_SENT \(pending.from, privacy: .public) → \(pending.to, privacy: .public)"
