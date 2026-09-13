@@ -20,8 +20,9 @@ func runAllTests() async {
     testA1_NewDeviceHijack()
     testA1_DefaultCallbackBeforeDeviceAddedCallback()
     testPreferredRemoval_DefaultCallbackBeforeDeviceListCallback()
-    testA2_SettledUserSwitch()
-    testA2_RecentEventUsesOldPreferredAfterNoDeltaDeviceCallback()
+    await testPreferredRemoval_DefaultPropertyChangesBeforeDevicesProperty()
+    await testA2_SettledUserSwitch()
+    await testA2_RecentEventUsesOldPreferredAfterNoDeltaDeviceCallback()
     testA3_ManualSwitchInsideSettleWindow()
     await testA4_NewDeviceSettlesThenAccepted()
     testBurst()
@@ -37,7 +38,7 @@ func runAllTests() async {
     testDeviceNamePersistence()
     testPreferencesFreshInstall()
     testPreferencesSettleClamp()
-    testRecentEventsKeepLatestTen()
+    await testRecentEventsKeepLatestTen()
 }
 
 // MARK: - Manual Mode (§57)
@@ -432,9 +433,42 @@ private func testPreferredRemoval_DefaultCallbackBeforeDeviceListCallback() {
     expect(monitor.preferredMicrophoneUID == usbMic.uid, "later devices callback does not overwrite offline preferred")
 }
 
-/// A2：设备稳定后的外部切换 → 接受并保存为新的 preferred，不恢复。
+/// 分阶段属性变化回归：DefaultInput 已 fallback，但 Devices 尚未移除 preferred。
+/// Auto stable 只能先形成候选，不能立刻学习 fallback；随后 topology delta 会取消候选。
 @MainActor
-private func testA2_SettledUserSwitch() {
+private func testPreferredRemoval_DefaultPropertyChangesBeforeDevicesProperty() async {
+    test("preferred removal default property changes before devices property")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: usbMic,
+        preferred: usbMic.uid,
+        mode: .auto
+    )
+
+    // Phase 1：default 已 fallback，但设备枚举仍暂时报告 USB 在线。
+    provider.current = builtInMic
+    monitor.handleDefaultInputChanged()
+
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "UI follows real fallback current immediately")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "fallback is only a candidate before topology settles")
+    expect(monitor.recentAudioEvents.isEmpty, "candidate is not recorded as accepted yet")
+
+    // Phase 2：HAL 稍后才把 USB 从 devices 中移除。
+    provider.devices = [builtInMic]
+    monitor.handleDeviceListChanged()
+
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "topology removal preserves offline preferred")
+
+    // 即使旧 candidate timer 随后醒来，也不能再学习 BuiltIn。
+    await waitPastStableExternalSwitchClassification()
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "cancelled candidate cannot commit after topology delta")
+    expect(monitor.recentAudioEvents.isEmpty, "cancelled fallback candidate leaves no accepted event")
+}
+
+/// A2：设备稳定后的外部切换 → 短暂候选确认后接受并保存为新的 preferred，不恢复。
+@MainActor
+private func testA2_SettledUserSwitch() async {
     test("A2 settled user switch")
 
     let (monitor, provider, notifier) = makeMonitor(
@@ -444,20 +478,25 @@ private func testA2_SettledUserSwitch() {
         mode: .auto
     )
 
-    // 无拓扑事件发生 → settled。
+    // 无拓扑事件发生 → stable，但先只形成短暂候选。
     provider.current = usbMic
     monitor.handleDefaultInputChanged()
 
-    expect(provider.setCalls.isEmpty, "no restore for user-initiated switch")
-    expect(monitor.preferredMicrophoneUID == usbMic.uid, "preferred learned = USB")
+    expect(provider.setCalls.isEmpty, "no restore for stable external switch candidate")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "candidate does not learn preferred immediately")
+    expect(monitor.currentDevice?.uid == usbMic.uid, "UI current updates immediately while preferred learning waits")
+
+    await waitPastStableExternalSwitchClassification()
+
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "preferred learned after candidate confirmation")
     expect(notifier.presentCount == 0, "no notification on accept")
     expect(monitor.recentAudioEvents.first?.kind == .acceptedUserSwitch, "recent event explains accepted switch")
     expect(monitor.recentAudioEvents.first?.fromDeviceName == builtInMic.name, "accepted switch event starts from old preferred")
 }
 
-/// A2 回归：devices callback 可能先刷新 current；Recent Event 仍应从旧 preferred 解释迁移。
+/// A2 回归：no-delta devices wake-up 也只能维持同一 candidate，不能改变 Recent Event 来源。
 @MainActor
-private func testA2_RecentEventUsesOldPreferredAfterNoDeltaDeviceCallback() {
+private func testA2_RecentEventUsesOldPreferredAfterNoDeltaDeviceCallback() async {
     test("A2 recent event uses old preferred after no-delta devices callback")
 
     let (monitor, provider, _) = makeMonitor(
@@ -468,10 +507,14 @@ private func testA2_RecentEventUsesOldPreferredAfterNoDeltaDeviceCallback() {
     )
 
     // 外部切到 USB 后，CoreAudio 先送一个 devices callback；设备集合没有变化，
-    // 但 handleDeviceListChanged 会刷新 currentDevice。
+    // 只应创建/维持同一个候选，不能立刻提交 preferred。
     provider.current = usbMic
     monitor.handleDeviceListChanged()
     monitor.handleDefaultInputChanged()
+
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "no-delta wake-ups keep candidate pending")
+
+    await waitPastStableExternalSwitchClassification()
 
     let event = monitor.recentAudioEvents.first
     expect(event?.kind == .acceptedUserSwitch, "accepted switch event is recorded")
@@ -524,8 +567,12 @@ private func testA4_NewDeviceSettlesThenAccepted() async {
     provider.current = usbMic
     monitor.handleDefaultInputChanged()
 
-    expect(provider.setCalls.isEmpty, "accept user switch to settled new device")
-    expect(monitor.preferredMicrophoneUID == usbMic.uid, "preferred learned = USB")
+    expect(provider.setCalls.isEmpty, "stable external switch does not restore")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "preferred learning waits for candidate confirmation")
+
+    await waitPastStableExternalSwitchClassification()
+
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "preferred learned after candidate confirmation")
 }
 
 // MARK: - Burst Robustness (§60)
@@ -878,7 +925,7 @@ private func testPreferencesSettleClamp() {
 
 
 @MainActor
-private func testRecentEventsKeepLatestTen() {
+private func testRecentEventsKeepLatestTen() async {
     test("recent events keep latest ten")
 
     let (monitor, provider, _) = makeMonitor(
@@ -891,6 +938,7 @@ private func testRecentEventsKeepLatestTen() {
     for index in 0..<12 {
         provider.current = index.isMultiple(of: 2) ? usbMic : builtInMic
         monitor.handleDefaultInputChanged()
+        await waitPastStableExternalSwitchClassification()
     }
 
     expect(monitor.recentAudioEvents.count == 10, "recent event history is capped at ten")

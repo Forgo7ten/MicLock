@@ -129,3 +129,8 @@ func makeMonitor(
 func waitPastSettleWindow() async {
     try? await Task.sleep(for: .seconds(1.4))
 }
+
+/// 等待 stable external switch candidate 的短暂分类窗口结束。
+func waitPastStableExternalSwitchClassification() async {
+    try? await Task.sleep(for: .milliseconds(350))
+}

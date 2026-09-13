@@ -83,6 +83,8 @@ final class AudioMonitor {
             preferences.protectionEnabled = protectionEnabled
             Self.logger.info("PROTECTION \(self.protectionEnabled ? "ON" : "OFF", privacy: .public)")
 
+            cancelStableExternalSwitchCandidate()
+
             if protectionEnabled {
                 // 开启即对齐（等同启动策略，不通知）。
                 evaluateStartupPolicy()
@@ -99,8 +101,9 @@ final class AudioMonitor {
             preferences.protectionMode = protectionMode
             Self.logger.info("MODE=\(self.protectionMode.rawValue, privacy: .public)")
 
-            // 模式切换是新的用户意图：旧模式下尚未确认的程序化切换事务不应继续
-            // 携带旧 Recent Event / notification 元数据。
+            // 模式切换是新的用户意图：旧模式下尚未确认的程序化切换事务或
+            // stable external switch candidate 都不应继续携带旧策略语义。
+            cancelStableExternalSwitchCandidate()
             cancelProgrammaticSwitch()
 
             // auto → manual：保留 preferred，立即执行 manual enforce。
@@ -167,6 +170,23 @@ final class AudioMonitor {
     @ObservationIgnored private var settleTask: Task<Void, Never>?
 
     @ObservationIgnored private var connectedUIDs: Set<String> = []
+
+    /// Auto + stable 下观察到的外部 default 变化先进入候选态。
+    /// 这只延迟 preferred 的学习，不延迟 currentDevice UI，也不延迟 settling 内的 corrective restore。
+    private struct StableExternalSwitchCandidate {
+        let id: UInt64
+        let oldPreferredUID: String
+        let oldPreferredName: String
+        let newCurrentUID: String
+        let newCurrentName: String
+    }
+
+    @ObservationIgnored private var stableExternalSwitchCandidate: StableExternalSwitchCandidate?
+    @ObservationIgnored private var nextStableExternalSwitchCandidateID: UInt64 = 0
+    @ObservationIgnored private var stableExternalSwitchCandidateTask: Task<Void, Never>?
+
+    /// 仅用于等待分阶段 HAL 属性变化收敛；不是 restore delay，也不是程序化切换 timeout。
+    private static let stableExternalSwitchClassificationDelay: Duration = .milliseconds(200)
 
     private struct PendingEventDraft {
         let kind: RecentAudioEvent.Kind
@@ -436,6 +456,7 @@ final class AudioMonitor {
     private enum CoreAudioWakeReason: String {
         case devices
         case defaultInput
+        case stableExternalSwitchConfirmation
     }
 
     /// 两个 CoreAudio listener 都只作为 wake-up 信号。
@@ -465,6 +486,7 @@ final class AudioMonitor {
         recordDeviceNames(newDevices)
 
         if topologyChanged {
+            cancelStableExternalSwitchCandidate()
             Self.trace(
                 "CORE_AUDIO_RECONCILE trigger=\(trigger.rawValue) added=\(added) removed=\(removed)"
             )
@@ -551,11 +573,13 @@ final class AudioMonitor {
             return
         }
 
-        if current.uid == preferredUID { return }
+        if current.uid == preferredUID {
+            cancelStableExternalSwitchCandidate()
+            return
+        }
 
         guard let preferred = devices.first(where: { $0.uid == preferredUID }) else {
-            // preferred 离线：即使 default callback 先到，也因为本次已先刷新完整
-            // topology snapshot，所以不会把系统 fallback 错学成新的 preferred。
+            cancelStableExternalSwitchCandidate()
             Self.logger.info(
                 "PREFERRED_OFFLINE keep=\(preferredUID, privacy: .public) current=\(current.name, privacy: .public)"
             )
@@ -564,6 +588,7 @@ final class AudioMonitor {
 
         switch protectionMode {
         case .manual:
+            cancelStableExternalSwitchCandidate()
             restorePreferred(from: current, to: preferred, reason: .manualLock)
 
         case .auto:
@@ -572,22 +597,87 @@ final class AudioMonitor {
             Self.logger.info("mode=auto settled=\(settled, privacy: .public)")
 
             if !settled {
+                cancelStableExternalSwitchCandidate()
                 Self.trace("decision=restore reason=topology-unsettled")
                 restorePreferred(from: current, to: preferred, reason: .automaticHijack)
+            } else if trigger == .stableExternalSwitchConfirmation,
+                      let candidate = stableExternalSwitchCandidate,
+                      candidate.oldPreferredUID == preferredUID,
+                      candidate.newCurrentUID == current.uid
+            {
+                commitStableExternalSwitchCandidate(candidate)
             } else {
-                preferredMicrophoneUID = current.uid
-                recordRecentAudioEvent(RecentAudioEvent(
-                    kind: .acceptedUserSwitch,
-                    fromDeviceName: preferred.name,
-                    toDeviceName: current.name,
-                    occurredAt: Date()
-                ))
-                Self.trace("decision=accept reason=user-initiated → \(current.name)")
-                Self.logger.info(
-                    "decision=accept reason=user-initiated preferred=\(current.name, privacy: .public)"
-                )
+                beginStableExternalSwitchCandidate(from: preferred, to: current)
             }
         }
+    }
+
+    // MARK: - Stable External Switch Candidate
+
+    private func beginStableExternalSwitchCandidate(
+        from preferred: AudioInputDevice,
+        to current: AudioInputDevice
+    ) {
+        if let candidate = stableExternalSwitchCandidate,
+           candidate.oldPreferredUID == preferred.uid,
+           candidate.newCurrentUID == current.uid
+        {
+            return
+        }
+
+        cancelStableExternalSwitchCandidate()
+
+        nextStableExternalSwitchCandidateID &+= 1
+        let candidate = StableExternalSwitchCandidate(
+            id: nextStableExternalSwitchCandidateID,
+            oldPreferredUID: preferred.uid,
+            oldPreferredName: preferred.name,
+            newCurrentUID: current.uid,
+            newCurrentName: current.name
+        )
+        stableExternalSwitchCandidate = candidate
+
+        Self.trace(
+            "STABLE_EXTERNAL_SWITCH_CANDIDATE id=\(candidate.id) from=\(preferred.name) to=\(current.name)"
+        )
+        Self.logger.debug(
+            "STABLE_EXTERNAL_SWITCH_CANDIDATE id=\(candidate.id, privacy: .public) from=\(preferred.uid, privacy: .public) to=\(current.uid, privacy: .public)"
+        )
+
+        stableExternalSwitchCandidateTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.stableExternalSwitchClassificationDelay)
+            guard !Task.isCancelled, let self else { return }
+            guard self.stableExternalSwitchCandidate?.id == candidate.id else { return }
+            self.reconcileCoreAudioState(trigger: .stableExternalSwitchConfirmation)
+        }
+    }
+
+    private func commitStableExternalSwitchCandidate(
+        _ candidate: StableExternalSwitchCandidate
+    ) {
+        guard stableExternalSwitchCandidate?.id == candidate.id else { return }
+
+        cancelStableExternalSwitchCandidate()
+        preferredMicrophoneUID = candidate.newCurrentUID
+        recordRecentAudioEvent(RecentAudioEvent(
+            kind: .acceptedUserSwitch,
+            fromDeviceName: candidate.oldPreferredName,
+            toDeviceName: candidate.newCurrentName,
+            occurredAt: Date()
+        ))
+
+        Self.trace(
+            "decision=accept reason=stable-external-switch-confirmed → \(candidate.newCurrentName)"
+        )
+        Self.logger.info(
+            "decision=accept reason=stable-external-switch-confirmed preferred=\(candidate.newCurrentName, privacy: .public)"
+        )
+    }
+
+    private func cancelStableExternalSwitchCandidate() {
+        stableExternalSwitchCandidate = nil
+        stableExternalSwitchCandidateTask?.cancel()
+        stableExternalSwitchCandidateTask = nil
     }
 
     // MARK: - Restore（统一入口）
@@ -659,6 +749,7 @@ final class AudioMonitor {
         event: PendingEventDraft,
         notification: PendingNotification?
     ) -> UInt64 {
+        cancelStableExternalSwitchCandidate()
         nextProgrammaticSwitchID &+= 1
         let id = nextProgrammaticSwitchID
         let pending = PendingSwitch(
