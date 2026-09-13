@@ -14,6 +14,7 @@ func runAllTests() async {
     testSelectingAlreadyCurrentDeviceBypassesSetter()
     testSelectingAlreadyCurrentPreferredDeviceIsNoOp()
     testSelectingCachedCurrentAfterReadFailureStillUsesSetter()
+    await testAcceptedSelectionDoesNotConfirmFromCachedCurrentAfterReadFailure()
     testRestoreImmediateConfirmation()
     testRestoreWaitsForRealConfirmation()
     await testRestoreSetterRejectionKeepsRetrying()
@@ -21,8 +22,12 @@ func runAllTests() async {
     await testDelayedConfirmationBeyondLegacyTimeoutSucceeds()
     testPendingSwitchFailsWhenTargetDisappears()
     testPendingSwitchFailsWhenTargetDisappearsAndCurrentIsNil()
-    testNilSourceTrustedSelectionRetainsExplicitTarget()
-    await testDelayedOlderTrustedSelectionCannotCancelLatestChoice()
+    await testNilSourceTrustedSelectionDoesNotInferExternalProvenance()
+    testTrustedSelectionLatestWinsImmediately()
+    await testLateSupersededTrustedCallbackDoesNotCancelLatest()
+    testRapidTrustedSelectionsTrackOnlyLatestTransaction()
+    await testTrustedSelectionExpiresAfterSingleFastRetry()
+    await testTrustedSelectionExpirySurvivesCurrentReadFailure()
     await testNilSourcePendingSwitchWatchdogRetriesWithoutCurrent()
     testEnumerationFailureDoesNotApplyEmptyTopology()
     testPartialTopologyUpdatesUIButFreezesPolicyFacts()
@@ -270,6 +275,48 @@ private func testSelectingCachedCurrentAfterReadFailureStillUsesSetter() {
     expect(monitor.recentAudioEvents.isEmpty, "unconfirmed selection is not recorded")
 }
 
+/// setter 已被接受后，如果第二次 current read 仍失败，缓存的 target 不能被误当成确认。
+/// 读取恢复后主动 recovery 只更新 fresh observation；真正到 watchdog 时仍必须再次尝试 target。
+@MainActor
+private func testAcceptedSelectionDoesNotConfirmFromCachedCurrentAfterReadFailure() async {
+    test("accepted selection does not confirm from cached current after read failure")
+
+    let scheduler = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: usbMic,
+        preferred: builtInMic.uid,
+        mode: .manual,
+        protection: false,
+        scheduler: scheduler
+    )
+
+    // monitor 最后一次可信 cache 是 USB，但真实 CoreAudio 已经变成 BuiltIn。
+    provider.current = builtInMic
+    provider.applySetImmediately = false
+    provider.currentInputDeviceError = AudioDeviceProviderError.coreAudio(
+        operation: .queryDefaultInputDevice,
+        objectID: nil,
+        status: -1
+    )
+
+    monitor.selectDevice(usbMic)
+
+    expect(provider.setCalls == [usbMic.uid], "setter is accepted once despite both current reads failing")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "accepted trusted action may persist preferred before confirmation")
+    expect(monitor.currentDevice?.uid == usbMic.uid, "failed reads preserve the stale USB cache")
+    expect(monitor.recentAudioEvents.isEmpty, "stale cached target must not confirm the transaction")
+
+    // 读取恢复；250ms topology recovery 会先观察到真实 BuiltIn，但这是主动 re-read，
+    // 不是新的外部 callback。500ms watchdog 到达时必须再次 setter USB。
+    provider.currentInputDeviceError = nil
+    await scheduler.advance(by: .milliseconds(500))
+
+    expect(provider.setCalls == [usbMic.uid, usbMic.uid], "watchdog retries USB after fresh observation shows BuiltIn")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "fresh observation replaces the stale cache")
+    expect(monitor.recentAudioEvents.isEmpty, "transaction remains unconfirmed while actual current is BuiltIn")
+}
+
 /// setter 立即反映真实状态时，恢复仍应立即确认并通知。
 @MainActor
 private func testRestoreImmediateConfirmation() {
@@ -498,45 +545,71 @@ private func testPendingSwitchFailsWhenTargetDisappearsAndCurrentIsNil() {
     expect(notifier.presentCount == 0, "no notification when pending target disappears")
 }
 
-/// sourceUID == nil 的 Trusted User Selection 同样代表明确用户意图。
-/// 非 target current 不能把它误当成外部 supersede；事务继续等待 / 重试 target。
+/// source/current provenance 对 Trusted latest-wins 没有 correctness 含义。
+/// 非 target callback 只更新 UI；短生命周期结束前不会因此取消最新 MicLock target。
 @MainActor
-private func testNilSourceTrustedSelectionRetainsExplicitTarget() {
-    test("nil-source trusted selection retains explicit target")
+private func testNilSourceTrustedSelectionDoesNotInferExternalProvenance() async {
+    test("nil-source trusted selection does not infer external provenance")
 
+    let scheduler = ManualAudioMonitorScheduler()
     let (monitor, provider, _) = makeMonitor(
         devices: [usbMic, airpodsMic],
         current: nil,
         preferred: nil,
-        mode: .manual
+        mode: .manual,
+        protection: false,
+        scheduler: scheduler
     )
 
     provider.applySetImmediately = false
     monitor.selectDevice(usbMic)
 
-    expect(provider.setCalls == [usbMic.uid], "trusted selection starts pending switch from nil source")
-    expect(monitor.preferredMicrophoneUID == usbMic.uid, "trusted selection persists target preferred")
-
     provider.current = airpodsMic
     monitor.handleDefaultInputChanged()
 
-    expect(provider.setCalls == [usbMic.uid], "third-state callback does not cancel the trusted selection")
-    expect(monitor.preferredMicrophoneUID == usbMic.uid, "latest explicit target remains preferred")
-    expect(monitor.currentDevice?.uid == airpodsMic.uid, "UI still reflects the real temporary current")
+    expect(monitor.currentDevice?.uid == airpodsMic.uid, "non-target callback still updates visible current")
+    expect(provider.setCalls == [usbMic.uid], "callback itself neither cancels nor rewrites the latest trusted target")
+    expect(monitor.recentAudioEvents.isEmpty, "non-target callback cannot confirm trusted selection")
+
+    await scheduler.advance(by: .milliseconds(500))
+    expect(provider.setCalls == [usbMic.uid, usbMic.uid], "trusted watchdog retries the latest target once")
 }
 
-/// A -> B -> C 两次 MicLock 明确选择连续发生时，较早 B 写入的延迟回声不能取消最新 C。
-/// 最新 Trusted User Selection 应持续向 C 收敛，并阻止 B 被 Auto stable candidate 学成 preferred。
+/// Trusted User Selection 使用 latest-wins：新点击立即 supersede 旧 transaction，
+/// 不等待旧 target confirm/offline，也不存在 queued intent。
 @MainActor
-private func testDelayedOlderTrustedSelectionCannotCancelLatestChoice() async {
-    test("delayed older trusted selection cannot cancel latest choice")
+private func testTrustedSelectionLatestWinsImmediately() {
+    test("trusted selection latest wins immediately")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic, airpodsMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual,
+        protection: false
+    )
+
+    provider.applySetImmediately = false
+    monitor.selectDevice(usbMic)
+    monitor.selectDevice(airpodsMic)
+
+    expect(provider.setCalls == [usbMic.uid, airpodsMic.uid], "new C setter is issued immediately instead of waiting for B")
+    expect(monitor.preferredMicrophoneUID == airpodsMic.uid, "latest accepted MicLock selection becomes preferred immediately")
+    expect(monitor.recentAudioEvents.isEmpty, "superseded B and pending C are not recorded as confirmed")
+}
+
+/// 旧 B setter 的延迟回声到达时，不推断 provenance，也不能结束最新 C transaction。
+@MainActor
+private func testLateSupersededTrustedCallbackDoesNotCancelLatest() async {
+    test("late superseded trusted callback does not cancel latest")
 
     let scheduler = ManualAudioMonitorScheduler()
     let (monitor, provider, _) = makeMonitor(
         devices: [builtInMic, usbMic, airpodsMic],
         current: builtInMic,
         preferred: builtInMic.uid,
-        mode: .auto,
+        mode: .manual,
+        protection: false,
         scheduler: scheduler
     )
 
@@ -544,26 +617,119 @@ private func testDelayedOlderTrustedSelectionCannotCancelLatestChoice() async {
     monitor.selectDevice(usbMic)
     monitor.selectDevice(airpodsMic)
 
-    expect(provider.setCalls == [usbMic.uid, airpodsMic.uid], "second trusted action supersedes the first transaction")
-    expect(monitor.preferredMicrophoneUID == airpodsMic.uid, "latest trusted target is preferred immediately")
-
-    // 第一笔 B 写入现在才反映到 HAL。
     provider.current = usbMic
     monitor.handleDefaultInputChanged()
+    expect(monitor.currentDevice?.uid == usbMic.uid, "late B callback may update current UI")
+    expect(monitor.recentAudioEvents.isEmpty, "late B callback cannot confirm latest C")
 
-    expect(monitor.preferredMicrophoneUID == airpodsMic.uid, "delayed B callback cannot overwrite latest preferred C")
-    expect(provider.setCalls == [usbMic.uid, airpodsMic.uid], "callback only retains C transaction; it does not create a new policy restore")
-
-    // 最新 C 事务仍存活；watchdog 到点继续重试 C。
     await scheduler.advance(by: .milliseconds(500))
-    expect(provider.setCalls == [usbMic.uid, airpodsMic.uid, airpodsMic.uid], "watchdog continues converging to latest target C")
+    expect(provider.setCalls == [usbMic.uid, airpodsMic.uid, airpodsMic.uid], "watchdog retries C, never the superseded B")
 
     provider.current = airpodsMic
     monitor.handleDefaultInputChanged()
+    expect(monitor.recentAudioEvents.count == 1, "only latest C confirmation produces an event")
+    expect(monitor.recentAudioEvents.first?.toDeviceName == airpodsMic.name, "confirmed event belongs to latest C")
+}
 
-    expect(monitor.currentDevice?.uid == airpodsMic.uid, "latest target eventually confirms")
-    expect(monitor.preferredMicrophoneUID == airpodsMic.uid, "confirmed latest target remains preferred")
-    expect(monitor.recentAudioEvents.first?.kind == .selectedInMicLock, "only the confirmed trusted selection is recorded")
+/// B → C → D 每次点击都立即发出 setter，但 active transaction 永远只代表最后的 D。
+@MainActor
+private func testRapidTrustedSelectionsTrackOnlyLatestTransaction() {
+    test("rapid trusted selections track only latest transaction")
+
+    let deskMic = makeDevice("DeskMic", name: "Desk Microphone", id: 4, transport: 0)
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic, airpodsMic, deskMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual,
+        protection: false
+    )
+
+    provider.applySetImmediately = false
+    monitor.selectDevice(usbMic)
+    monitor.selectDevice(airpodsMic)
+    monitor.selectDevice(deskMic)
+
+    expect(provider.setCalls == [usbMic.uid, airpodsMic.uid, deskMic.uid], "each explicit MicLock click issues its setter immediately")
+    expect(monitor.preferredMicrophoneUID == deskMic.uid, "only latest D remains the intended preferred target")
+
+    provider.current = usbMic
+    monitor.handleDefaultInputChanged()
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+    expect(monitor.recentAudioEvents.isEmpty, "superseded B/C callbacks cannot finish D transaction")
+
+    provider.current = deskMic
+    monitor.handleDefaultInputChanged()
+    expect(monitor.recentAudioEvents.count == 1, "D confirmation records exactly one trusted event")
+    expect(monitor.recentAudioEvents.first?.toDeviceName == deskMic.name, "event belongs to latest D")
+}
+
+/// Trusted 是短生命周期 UI command：首次未确认后仅在 500ms fast retry 一次，
+/// 再过 500ms 仍未确认就结束，不进入 Protection 的 1/2/4/.../64s 永久重试。
+@MainActor
+private func testTrustedSelectionExpiresAfterSingleFastRetry() async {
+    test("trusted selection expires after single fast retry")
+
+    let scheduler = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual,
+        protection: false,
+        scheduler: scheduler
+    )
+
+    provider.applySetImmediately = false
+    monitor.selectDevice(usbMic)
+    expect(provider.setCalls == [usbMic.uid], "initial trusted command writes once")
+
+    await scheduler.advance(by: .milliseconds(500))
+    expect(provider.setCalls == [usbMic.uid, usbMic.uid], "first watchdog performs the only fast retry")
+
+    await scheduler.advance(by: .milliseconds(500))
+    expect(provider.setCalls == [usbMic.uid, usbMic.uid], "final confirmation watchdog expires without another setter")
+    expect(monitor.lastError == "Unable to confirm default input change", "expired trusted command reports bounded confirmation failure")
+
+    await scheduler.advance(by: .seconds(120))
+    expect(provider.setCalls == [usbMic.uid, usbMic.uid], "expired trusted command never enters background 64s retry")
+}
+
+/// current read failure 不能绕过 Trusted 的 bounded lifetime；否则 final watchdog 的早退
+/// 会把一次 UI command 重新变成永久 pending。
+@MainActor
+private func testTrustedSelectionExpirySurvivesCurrentReadFailure() async {
+    test("trusted selection expiry survives current read failure")
+
+    let scheduler = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual,
+        protection: false,
+        scheduler: scheduler
+    )
+
+    provider.applySetImmediately = false
+    monitor.selectDevice(usbMic)
+    provider.currentInputDeviceError = AudioDeviceProviderError.coreAudio(
+        operation: .queryDefaultInputDevice,
+        objectID: nil,
+        status: -1
+    )
+
+    await scheduler.advance(by: .milliseconds(500))
+    expect(provider.setCalls == [usbMic.uid, usbMic.uid], "first watchdog still performs the one fast retry when current read fails")
+
+    await scheduler.advance(by: .milliseconds(500))
+    expect(provider.setCalls == [usbMic.uid, usbMic.uid], "final read failure expires trusted command without another setter")
+    expect(monitor.lastError == "Unable to confirm default input change", "read failure cannot leave trusted command permanently pending")
+
+    provider.currentInputDeviceError = nil
+    await scheduler.advance(by: .seconds(2))
+    expect(provider.setCalls == [usbMic.uid, usbMic.uid], "recovery after expiry does not resurrect trusted retry")
 }
 
 /// sourceUID == nil 且 current 仍为 nil 时，watchdog 也必须主动重试 setter；
@@ -904,7 +1070,7 @@ private func testDelayedProtectionConfirmationReopensSettleAndRebindsNotificatio
     expect(notifier.presentCount == 1, "confirmation-rebound episode still dedupes the immediate re-hijack notification")
 }
 
-/// Trusted User Selection 可以长期等待/重试，但不能冒充 protection retry。
+/// Trusted User Selection 只做一次 fast retry，并且永远不暴露 Protection retry 状态。
 @MainActor
 private func testTrustedSelectionRetryNeverExposesProtectionState() async {
     test("trusted selection retry never exposes protection state")
@@ -925,13 +1091,13 @@ private func testTrustedSelectionRetryNeverExposesProtectionState() async {
     expect(monitor.preferredMicrophoneUID == usbMic.uid, "trusted selection commits preferred after accepted setter")
     expect(monitor.protectionRetryState == nil, "trusted selection never starts protection retry UI")
 
-    await scheduler.advance(by: .seconds(7.5))
+    await scheduler.advance(by: .seconds(2))
 
-    expect(provider.setCalls.count == 5, "trusted selection shares the same four fast watchdog retries")
-    expect(monitor.protectionRetryState == nil, "long trusted selection retry still has no protection state")
+    expect(provider.setCalls.count == 2, "trusted selection performs only one bounded fast retry")
+    expect(monitor.protectionRetryState == nil, "expired trusted selection still has no protection state")
     expect(
-        monitor.lastError == "Unable to confirm default input change; MicLock is retrying",
-        "long trusted selection uses neutral MicLock retry wording"
+        monitor.lastError == "Unable to confirm default input change",
+        "bounded trusted selection reports confirmation failure without retry wording"
     )
     expect(monitor.lastError?.contains("protection") == false, "trusted selection wording never claims protection is retrying")
 }

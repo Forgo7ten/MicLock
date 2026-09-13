@@ -146,37 +146,37 @@ awaitingConfirmation(PendingSwitch)
 一笔 `PendingSwitch` 原子保存：
 
 - transaction `id`
-- `sourceUID`：发起写入时观察到的 current
+- `sourceUID`：仅 Protection Restore 使用，用于描述其发起时的 current；Trusted User Selection 不依赖 source 做 provenance 判断
 - `targetUID`
 - `ProgrammaticSwitchOrigin`：`protectionRestore(reason)` 或 `trustedUserSelection`
 - Recent Event 的 from/to 展示 metadata；kind 在确认时只从 origin 推导
 - 待提交的通知（如果本次动作应该通知）
 
-旧实现中 `expectedDefaultUID`、pending Recent Event 和 pending notification 分开保存，存在两笔操作之间 metadata 串线的风险。现在新的程序化切换会整体 supersede 旧事务，source / target / origin / metadata / notification 永远属于同一 transaction；origin 是程序化事务语义的唯一来源，不再额外保存一份可与 origin 冲突的 event kind。
+旧实现中 `expectedDefaultUID`、pending Recent Event 和 pending notification 分开保存，存在两笔操作之间 metadata 串线的风险。现在 source / target / origin / metadata / notification 永远属于同一 transaction；origin 是程序化事务语义的唯一来源，不再额外保存一份可与 origin 冲突的 event kind。Trusted User Selection 使用 latest-wins：新的 MicLock 点击立即 supersede 旧 Trusted transaction，并马上发出新 target 的 setter；active transaction 始终只代表最后一次明确的 MicLock 选择。
 
-### 确认规则：不使用固定时间宣告失败
+### 确认与 retry 生命周期
 
-`setInputDevice()` 返回成功只表示 CoreAudio 接受了写请求，不代表默认输入已经真实变化。HAL 也没有给出“必须在 1 秒或任何固定秒数内完成”的正确性保证，因此 PendingSwitch 不再设置 confirmation timeout。
+`setInputDevice()` 返回成功只表示 CoreAudio 接受了写请求，不代表默认输入已经真实变化。成功确认仍必须来自 fresh current observation；但 Protection Restore 与 Trusted User Selection 的生命周期不同：前者维护保护 invariant，可以长期 retry；后者只是一次 UI command，只保留一个很短的确认窗口。
 
 后续用可靠的可观察事实推进事务：
 
-1. `current.uid == targetUID`：这是独立于 topology 的充分成功证据；即使同一轮设备枚举失败，也立即确认。若 origin 是 Auto 下的 Protection restore，确认本身会先重新开启/延长 settle，并把既有 notification rebind 到当前 episode，再提交 Recent Event / 通知；Trusted User Selection 不制造 protection episode
+1. `current.uid == targetUID`：只有当 `current` 来自本轮成功的 fresh read 时，才是独立于 topology 的充分成功证据；共享 `currentDevice` cache 绝不能参与 confirmation。即使同一轮设备枚举失败，只要 fresh current 已到 target 仍可立即确认。若 origin 是 Auto 下的 Protection restore，确认本身会先重新开启/延长 settle，并把既有 notification rebind 到当前 episode，再提交 Recent Event / 通知；Trusted User Selection 不制造 protection episode
 2. 只有在 topology sample 有效且跨属性一致时，`targetUID` 不在线才可作为目标明确不可达的失败证据
-3. `sourceUID != nil && current.uid == sourceUID`：说明写入尚未反映；watchdog 按 500ms → 1s → 2s → 4s → 8s → 16s → 32s → 64s 重新读取并重试 setter，之后固定 64s 一次。若该 transaction 的 origin 是 Protection restore，任何 accepted retry 都会重新开启/延长 settle；Trusted User Selection 则不会制造 protection episode
-4. 完成前四档快速重试后，不把“时间经过”解释为 HAL failure，也不释放仍停留在 source 的 transaction。Protection restore 显示 `protection is retrying` 并更新 `ProtectionRetryState`；Trusted User Selection 只使用中性的 MicLock retry 文案，不暴露 Protection 状态
-5. 其余非 target current 按 origin 区分：Protection restore 认为出现了更新的外部事实，旧事务被 supersede 后重新运行 policy；Trusted User Selection 则保留最新显式用户目标，不让更早 MicLock 写入的延迟回声取消它，并继续通过 watchdog 向 target 收敛。`sourceUID == nil` 也遵循同一 origin 规则
+3. Protection Restore：`sourceUID != nil && current.uid == sourceUID` 表示写入尚未反映；watchdog 按 500ms → 1s → 2s → 4s → 8s → 16s → 32s → 64s 重新读取并重试 setter，之后固定 64s 一次。任何 accepted retry 都会重新开启/延长 settle，并可更新 `ProtectionRetryState`
+4. Protection Restore 的其余第三状态仍按“更新事实”处理：旧 restore transaction 被 supersede，再由当前 protection policy 决定后续
+5. Trusted User Selection 不解释 source / third current / callback 类型的 provenance。只要 fresh current 还不是最新 target，就继续保持最新 MicLock target；500ms watchdog 做唯一一次 fast retry，再给 500ms 最终确认窗口。若约 1 秒后仍未确认，则结束 Trusted transaction，立刻把当前状态交回正常 policy，不进入 1/2/4/.../64s 的后台 retry
 6. topology sample 无效或 partial：不能做 target-offline 判定；策略继续使用上一份完整可信 topology，partial 中健康设备仍可更新 UI，并通过独立 recovery retry 重新采样
-7. 模式切换、保护关闭或新的 Trusted User Action：属于明确的新用户意图，直接取消/取代旧事务；如果 UI 正显示 `protection is retrying`，同时清理这条只属于旧事务的瞬态状态
+7. Trusted User Selection 为 latest-wins：新的 MicLock 点击立即取消旧 Trusted transaction、建立新 transaction 并 `set(newTarget)`。旧 setter 若稍后回声为旧 target，只会更新 current UI；它既不能完成也不能取消最新 transaction。只有最新 target 的 fresh confirmation 才能提交 Recent Event
 
-因此不会恢复旧的“固定 1 秒后宣告失败”语义：时间只触发重新检查/重试，不直接决定成功或失败。允许一笔 transaction 在尚无决定性结束事实时长期 pending，但这种 pending 会按 capped interval 主动执行 setter；Protection restore 可由第三个 current 结束，Trusted User Selection 则需要 target confirmed、target 在完整可信 topology 中确定离线或新的用户意图才能结束。
+因此，只有 Protection Restore 允许长期 pending；Trusted User Selection 明确是有界的 UI command。它的短窗口只用于吸收 CoreAudio 正常的异步传播与一次快速 retry，不会在几分钟后偷偷再次 set 用户早已放弃的旧选择。
 
-Protection restore 中还区分两类未完成状态：`setInputDevice()` 未抛错但 `current != target` 表示“请求已接受、等待确认”；watchdog 某次 setter 抛错则表示“本次请求没有完成”。provider error 保留 lookup 阶段、CoreAudio 操作阶段、对象 ID 与 `OSStatus`，并写入日志。setter 抛错时显示 `Unable to set default input device; protection will keep retrying`，accepted 但长期未确认时显示 `Unable to confirm default input change; protection is retrying`。任一后续成功确认都会由 `finishProgrammaticSwitchIfConfirmed()` 清空这些瞬态错误。设置窗口的「高级 → 设备切换」只显示 Protection restore 的结构化警告；Trusted User Selection 即使长期 pending 也不会修改 `ProtectionRetryState`，只使用中性的 MicLock retry 文案。MicLock UI 中用户主动选择设备若所需的首个 setter 抛错，仍按该次 Trusted User Action 失败处理，不擅自改写 preferred。
+Protection restore 中还区分两类未完成状态：`setInputDevice()` 未抛错但 `current != target` 表示“请求已接受、等待确认”；watchdog 某次 setter 抛错则表示“本次请求没有完成”。provider error 保留 lookup 阶段、CoreAudio 操作阶段、对象 ID 与 `OSStatus`，并写入日志。setter 抛错时显示 `Unable to set default input device; protection will keep retrying`，accepted 但长期未确认时显示 `Unable to confirm default input change; protection is retrying`。任一后续成功确认都会由 `finishProgrammaticSwitchIfConfirmed()` 清空这些瞬态错误。设置窗口的「高级 → 设备切换」只显示 Protection restore 的结构化警告。Trusted User Selection 不修改 `ProtectionRetryState`；首个 setter 抛错仍立即失败且不擅自改写 preferred，短确认窗口耗尽则显示 `Unable to confirm default input change`。
 
 Recent Event 的 `occurredAt` 使用**确认时间**，而不是 setter 请求时间。
 
 ### 模式切换与保护关闭
 
-模式切换代表新的用户意图，会取消旧模式下尚未确认的事务；切到 Manual 后再基于当前真实状态执行新的 startup 对齐。关闭保护同样会取消 pending transaction。
+模式切换代表新的用户意图，会取消旧模式下尚未确认的 transaction；切到 Manual 后再基于当前真实状态执行新的 startup 对齐。关闭保护同样会取消 active transaction。Trusted latest-wins 没有额外 queued intent 需要清理。
 
 ## 通知去重与 episode ID
 
@@ -186,7 +186,11 @@ Auto Mode 的 pending notification 会记录当前绑定的 `episodeID`。如果
 
 ## Trusted User Action
 
-用户在 MicLock 菜单里选择设备属于明确的 Trusted User Action，不受 settle window 限制。动作开始时先 fresh-read current：若 target 已经是真实 current，则直接完成用户意图而不依赖 setter；若 target 同时也是 preferred，则纯 no-op，不记录无意义的同设备 Recent Event。否则正常建立 `PendingSwitch`：所需 setter 抛错不覆盖 preferred；setter 被接受后 preferred 可以立即更新，但 Recent Event 仍等真实 current 达到目标后才提交。连续两次选择时，后一次完整 supersede 前一次；随后出现更早写入的延迟回声也不能取消最新 target。Trusted User Selection 可以复用同一 watchdog 重试机制，但不会重新开启 settle，也不会冒充 Protection retry。
+用户在 MicLock 菜单里选择设备属于明确的 Trusted User Action，不受 settle window 限制。动作开始时先 fresh-read current：若 target 已经是真实 current，则直接完成用户意图而不依赖 setter；若 target 同时也是 preferred，则纯 no-op，不记录无意义的同设备 Recent Event。否则正常建立 `PendingSwitch`：所需 setter 抛错不覆盖 preferred；setter 被接受后 preferred 可以立即更新，但 Recent Event 仍必须等某次成功 fresh read 明确观察到 target 后才提交，失败读取保留下来的 `currentDevice` cache 不能确认事务。
+
+Trusted User Selection 使用 **latest-wins** 语义。`A → 点击 B → 点击 C → 点击 D` 会立即依次发出 `set(B)`、`set(C)`、`set(D)`，但 active transaction 始终只有一笔，并且永远代表最后一次 MicLock 明确选择 D。旧 B/C setter 若随后延迟生效，MicLock 不尝试判断它是旧写回声还是外部选择；只知道最新 MicLock target 仍是 D，因此旧回声不能完成或取消 D。
+
+Trusted transaction 在最新 setter 后只保留很短的确认窗口：立即 fresh-read；未确认则 500ms 后对最新 target fast retry 一次；再过 500ms 仍未确认就结束。这个窗口内，System Settings 的非 target 变化不会被解释成新的外部意图；窗口结束后立即恢复普通 Auto policy，因此正常情况下 MicLock target 很快确认后，之后用户在 System Settings 选择 D 仍会走稳定外部切换 candidate，并按 `settleSeconds` 学习为新的 preferred。
 
 设备刚接入的 settle window 内如果确实要更换首选麦克风，直接在 MicLock 菜单中选择即可。
 
