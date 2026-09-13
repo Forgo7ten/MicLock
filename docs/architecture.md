@@ -51,12 +51,12 @@ flowchart TD
 | `Sources/ActivationPolicyManager.swift` | 动态 Activation Policy：平时 `.accessory` 常驻菜单栏，打开普通窗口（Settings）时临时 `.regular`（有 Dock / 顶部 App Menu），demand 全部结束后切回。窗口 identity 与 regular demand 两个正交状态：identity（weak，close 后保留）识别复用的 NSWindow；demand 由用户意图与 `willCloseNotification` 驱动 policy。无基于超时的降级——`openSettings()` 没有 success/failure 回调，窗口物化耗时（实测 ~2–3s）不能推断 Scene 生命周期 |
 | `Sources/SettingsView.swift` | 设置窗口：通用（登录项 / 通知）/ 高级（设备稳定窗口）/ 关于（`AboutView`）三个 Tab；`WindowAccessor` bridge 把底层 NSWindow 注册给 ActivationPolicyManager |
 | `Sources/AboutView.swift` | 设置窗口「关于」Tab 内容：图标、动态版本/构建号、说明与 GitHub / License 链接 |
-| `Sources/Core/AudioMonitor.swift` | 核心状态机：事件处理、模式判定、恢复、通知编排、调试 trace；UI 可见状态以 `@Observable` 暴露，内部状态 `@ObservationIgnored` |
+| `Sources/Core/AudioMonitor.swift` | 核心策略协调器：事件处理、Auto 稳定性状态机、程序化切换事务、恢复、Recent Events、通知编排与调试 trace；UI 可见状态以 `@Observable` 暴露，内部状态 `@ObservationIgnored` |
 | `Sources/Core/LiveAudioDeviceProvider.swift` | CoreAudio HAL 封装：设备枚举、UID/名称/传输类型查询、默认输入读写 |
 | `Sources/Core/AudioDeviceProviding.swift` | CoreAudio 访问抽象协议（测试注入点） |
 | `Sources/Core/AudioInputDevice.swift` | 设备模型 |
 | `Sources/Core/Preferences.swift` | UserDefaults 封装 |
-| `Sources/Core/ProtectionMode.swift` | `auto` / `manual` 枚举与 `RestoreReason` |
+| `Sources/Core/ProtectionMode.swift` | `auto` / `manual`、`RestoreReason` 与 `RecentAudioEvent` 模型及展示文案 |
 | `Sources/Core/NotificationPresenting.swift` | 通知抽象协议（测试注入点） |
 | `Sources/Services/NotificationManager.swift` | UserNotifications 授权管理与横幅投递 |
 | `Sources/Services/LaunchAtLoginManager.swift` | SMAppService 登录项 |
@@ -88,7 +88,9 @@ CoreAudio 的 `AudioDeviceID` 是运行时数值，重启或重插后会变；`k
 
 burst 事件（CoreAudio 常在插拔瞬间连发多条）的处理保证幂等：列表事件无 delta 时只刷新当前设备、不重开窗口；默认输入事件未实际变化时直接返回。
 
-**self-induced 回声**：MicLock 自己 set `DefaultInputDevice` 同样会触发监听。恢复前先把 `expectedDefaultUID` 置为 preferred 的 UID，之后只有重新读取到真实 `currentDevice` 命中该值才确认成功；中间 callback 会等待后续状态传播，超时则清理 expected 状态。这是防止 setter 循环和伪造成功状态的关键。
+**self-induced 回声**：MicLock 自己 set `DefaultInputDevice` 同样会触发监听。现在用 `ProgrammaticSwitchState.awaitingConfirmation(PendingSwitch)` 原子保存 transaction ID、目标 UID、待提交 Recent Event 与通知。只有重新读取到真实 `currentDevice.uid == targetUID` 才确认成功；中间 callback 被吸收、不重复 setter。新事务会整体 supersede 旧事务，因此不同操作之间不会出现 target / event / notification 串线。
+
+**Auto 稳定性**：`StabilityState` 与程序化切换事务正交存在，仅有 `stable` / `settling(SettleEpisode)` 两态。每个 episode 保存唯一 ID、revision、`lastActivity`、deadline 与通知去重状态；timer 醒来必须同时匹配 episode ID + revision + deadline 才能把状态变成 stable。详见 [auto-mode.md](auto-mode.md)。
 
 ```mermaid
 sequenceDiagram
@@ -99,21 +101,21 @@ sequenceDiagram
 
     HAL--)AM: DefaultInputDevice 变化（主队列回调）
     AM->>P: currentInputDevice()（重读真实状态）
-    AM->>AM: self-induced / 幂等 / 离线 / 模式判定
-    alt 需要恢复（manual，或 auto 判定抢麦）
+    alt 存在 PendingSwitch
+        AM->>AM: current == target ? confirm : absorb callback
+    else 需要恢复（manual，或 auto=settling）
+        AM->>AM: 建立 PendingSwitch transaction
         AM->>P: setInputDevice(preferred UID)
-        AM->>AM: 记录 expectedDefaultUID，重开 settle 窗口
+        AM->>AM: 延长当前 settle episode / revision
         AM->>P: currentInputDevice()（确认真实结果）
-        alt current == expected
-            AM->>AM: 确认切换并吸收回声
-            AM->>N: presentRestored（episode 去重）
+        alt current == transaction.targetUID
+            AM->>AM: 原子提交 Recent Event / notification
+            AM->>N: presentRestored（episode ID 去重）
         else 状态仍未传播
-            HAL--)AM: 后续 callback 或超时清理
+            HAL--)AM: 后续 callback 或 transaction timeout
         end
-    else auto 判定为用户切换
-        AM->>AM: 学习 preferred = current
-    else 无需处理
-        AM->>AM: 直接返回
+    else auto=stable
+        AM->>AM: 接受外部切换，学习 preferred = current
     end
 ```
 
@@ -130,10 +132,13 @@ sequenceDiagram
 
 Manual 抢麦恢复、Auto 抢麦恢复、重连恢复、启动对齐全部走 `restorePreferred(from:to:reason:)`：
 
-1. 置 `expectedDefaultUID = preferred.uid`，并安排确认超时（吸收即将到来的回声）
-2. `provider.setInputDevice(preferred.uid)`——全工程唯一的写入口，只写 `DefaultInputDevice`
-3. 失败：清除回声标记与挂起通知、记录 `lastError`，结束
-4. 成功：重新读取真实 `currentDevice`；若已达到目标则确认，否则等待 listener callback → **重开 settle 窗口**（系统/蓝牙栈常在被打回后立刻反抢，窗口内继续立即恢复直到收敛）→ 仅在确认后投递通知（episode 去重）
+1. 创建一笔 `PendingSwitch`，原子保存 transaction ID、目标 UID、Recent Event draft 与本次通知 draft
+2. `provider.setInputDevice(preferred.uid)`——恢复路径统一只写 `DefaultInputDevice`；用户在 MicLock 中主动选择设备时由 `selectDevice(_:)` 发起同类程序化事务
+3. 失败：只失败当前 transaction，记录 `lastError`，不提交成功事件/通知
+4. 成功：延长当前 settle episode，重新读取真实 `currentDevice`；若已达到 transaction target 则确认，否则等待 listener callback 或 1 秒 confirmation timeout
+5. 确认时原子提交 Recent Event，并按创建通知时携带的 episode ID 做去重后投递通知
+
+`settleTask` 和 confirmation timeout task 都只是执行机制；业务事实分别保存在 `StabilityState` 与 `ProgrammaticSwitchState` 中。运行中修改 `settleSeconds` 会以当前 episode 的 `lastActivity` 为基点重算 deadline 并递增 revision。
 
 `RestoreReason`：`manualLock`（Manual 恢复）/ `automaticHijack`（Auto 判定抢麦）/ `preferredReconnected`（重连恢复）/ `startup`（启动对齐，不发通知）。
 
@@ -143,7 +148,13 @@ Manual 抢麦恢复、Auto 抢麦恢复、重连恢复、启动对齐全部走 `
 
 **投递**：按 `RestoreReason` 生成标题，正文 `旧设备 → 新设备`，无声音；App 处于前台时仍显示横幅（`willPresent` 返回 `.banner`——菜单栏应用没有前台窗口概念，不设此项横幅会被吞掉）。
 
-**去重**：Auto 模式下一次设备拓扑变化 = 一个 Protection Episode，从窗口开启到 settle 到期，整个 episode 最多投递一条通知（蓝牙栈反抢 2-3 次很常见）；Manual 模式没有 episode 限制，每次外部切换→恢复都通知；启动对齐从不通知。
+**去重**：Auto 模式下一次设备拓扑变化 = 一个 `SettleEpisode`。pending notification 会保存创建时的 episode ID；确认时只允许修改同 ID episode 的 `notificationSent`，因此旧事务晚到的 confirmation 不会污染新 episode。整个 episode 最多投递一条通知；Manual 模式没有 episode 限制；startup 对齐不通知。
+
+## Recent Events
+
+菜单栏最多展示最近 5 条，内存中最多保留最近 10 条。只有已经确认生效的关键动作才写入：MicLock 菜单选择、Auto 在 stable 状态接受的外部切换，以及各类已确认恢复。
+
+程序化切换的事件先作为 `PendingSwitch` 内的 draft 保存，确认 `current.uid == targetUID` 后才构造成 `RecentAudioEvent`，因此 `occurredAt` 表示确认时间。失败、超时或被新事务 supersede 的动作不会留下成功事件。Auto 接受外部切换时，事件来源使用旧 preferred，而不是可能被提前刷新的 `previous currentDevice`。
 
 ## 登录时启动（SMAppService）
 
@@ -205,14 +216,15 @@ Self.logger.info(
 ./Tests/run.sh
 ```
 
-与 App 相同的 Core/Services 源一起编译（不含 `@main` 入口），注入 `FakeAudioDeviceProvider`（内存设备表 + 可控 setter 失败/延迟状态 + 调用记录）与 `RecordingNotifier`（通知计数），直接调用 `handleDefaultInputChanged()` / `handleDeviceListChanged()` 模拟 CoreAudio 回调，`UserDefaults` 用随机命名的独立 suite 隔离。当前 22 个用例 / 71 个断言：
+与 App 相同的 Core/Services 源一起编译（不含 `@main` 入口），注入 `FakeAudioDeviceProvider`（内存设备表 + 可控 setter 失败/延迟状态 + 调用记录）与 `RecordingNotifier`（通知计数），直接调用 `handleDefaultInputChanged()` / `handleDeviceListChanged()` 模拟 CoreAudio 回调，`UserDefaults` 用随机命名的独立 suite 隔离。当前 26 个用例 / 93 个断言：
 
 | 场景 | 断言要点 |
 |---|---|
 | M1–M3（Manual） | 外部切换立即恢复、preferred 离线不动、MicLock 内选择立即生效且回调不误判 |
-| 状态确认回归 | setter 失败不覆盖 preferred、异步状态未确认前不通知、中间 callback 不重复 setter |
-| A1–A4（Auto） | 接入抢麦立即恢复、稳定后切换被学习、窗口内切换按启发式恢复、新设备稳定后接受 |
-| burst | 交错重复事件下 setter 不循环、一 episode 一条通知 |
+| Programmatic transaction | setter 失败不覆盖 preferred、异步确认前不通知/不写 Recent Event、中间 callback 不重复 setter、模式切换原子 supersede 旧事务 |
+| A1–A4（Auto） | 接入抢麦立即恢复、stable 后切换被学习、settling 内切换按启发式恢复、新设备稳定后接受 |
+| Recent Events | accepted switch 来源取旧 preferred、失败动作不记录、历史最多十条且最新优先 |
+| Stability episode | burst 下 setter 不循环、episode 一条通知、修改 settleSeconds 后旧 timer 不得提前结束 episode |
 | 重连 | preferred 断开保留 UID、同 UID 复现自动恢复、系统已自动恢复时不重复 setter |
 | 窗口内 Trusted 选择 | 立即生效且不被回声恢复 |
 | 保护关闭 / 启动对齐 / 幂等 / 首次运行 / 钳制 | 各边界行为 |

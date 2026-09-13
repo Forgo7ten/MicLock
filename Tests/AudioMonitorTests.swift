@@ -366,7 +366,7 @@ private func testA4_NewDeviceSettlesThenAccepted() async {
     provider.devices = [builtInMic, usbMic]
     monitor.handleDeviceListChanged()
 
-    // 等待 settle window 过期：USB 从 unsettledNewUIDs 移除。
+    // 等待 settle episode 到期并回到 stable。
     await waitPastSettleWindow()
 
     provider.current = usbMic
