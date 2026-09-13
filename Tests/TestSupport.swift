@@ -19,31 +19,51 @@ final class FakeAudioDeviceProvider: AudioDeviceProviding {
     /// 关闭后由测试手动模拟稍后的 CoreAudio 状态传播。
     var applySetImmediately = true
 
-    func listInputDevices() -> [AudioInputDevice] {
-        devices
+    /// 模拟设备枚举失败；nil 表示枚举成功（即使 devices == [] 也属于成功空列表）。
+    var listInputDevicesError: Error?
+
+    /// 模拟单个 HAL object 的关键属性读取失败；非空时返回 partial snapshot。
+    var incompleteDeviceIDs: [AudioDeviceID] = []
+
+    /// 模拟默认输入读取失败；失败时不能把 monitor 最后一次可信 current 覆盖成 nil。
+    var currentInputDeviceError: Error?
+
+    func listInputDevices() throws -> AudioInputDeviceSnapshot {
+        if let listInputDevicesError {
+            throw listInputDevicesError
+        }
+        return AudioInputDeviceSnapshot(
+            devices: devices,
+            incompleteDeviceIDs: incompleteDeviceIDs,
+            issues: []
+        )
     }
 
-    func currentInputDevice() -> AudioInputDevice? {
-        current
+    func currentInputDevice() throws -> AudioInputDevice? {
+        if let currentInputDeviceError {
+            throw currentInputDeviceError
+        }
+        return current
     }
 
-    @discardableResult
-    func setInputDevice(uid: String) -> Bool {
+    func setInputDevice(uid: String) throws {
         setCalls.append(uid)
 
-        guard !forceSetFailure else {
-            return false
+        if forceSetFailure {
+            throw AudioDeviceProviderError.coreAudio(
+                operation: .setDefaultInputDevice,
+                objectID: nil,
+                status: -1
+            )
         }
 
         guard let device = devices.first(where: { $0.uid == uid }) else {
-            return false
+            throw AudioDeviceProviderError.targetDeviceNotFound(uid: uid)
         }
 
         if applySetImmediately {
             current = device
         }
-
-        return true
     }
 }
 
@@ -63,6 +83,87 @@ final class RecordingNotifier: NotificationPresenting, @unchecked Sendable {
 
     func ensureAuthorization() async -> NotificationAuthorizationState {
         authorizationState
+    }
+}
+
+/// 手动推进的单调 scheduler。`schedule()` 同步登记 action，因此状态机在函数返回前
+/// 已经拥有确定的下一档 timer；`advance()` 可在一次调用中按 deadline 顺序跑完整条重试链。
+@MainActor
+final class ManualAudioMonitorScheduler: AudioMonitorScheduling {
+
+    private struct ScheduledAction {
+        let deadline: ContinuousClock.Instant
+        let sequence: UInt64
+        let action: @MainActor () -> Void
+    }
+
+    private(set) var now: ContinuousClock.Instant = ContinuousClock().now
+    private var scheduledActions: [UUID: ScheduledAction] = [:]
+    private var nextSequence: UInt64 = 0
+
+    @discardableResult
+    func schedule(
+        after delay: Duration,
+        action: @escaping @MainActor () -> Void
+    ) -> AudioMonitorScheduledTask {
+        let id = UUID()
+        nextSequence &+= 1
+
+        let requestedDeadline = now.advanced(by: delay)
+        let deadline = requestedDeadline < now ? now : requestedDeadline
+        scheduledActions[id] = ScheduledAction(
+            deadline: deadline,
+            sequence: nextSequence,
+            action: action
+        )
+
+        return ManualScheduledTask(id: id, scheduler: self)
+    }
+
+    /// 推进到目标单调时间。action 在执行前先从队列移除；action 内同步注册的下一档
+    /// timer 会立刻进入同一队列，因此只要 deadline 仍不晚于 target，就在本轮继续执行。
+    func advance(by duration: Duration) async {
+        let target = now.advanced(by: duration)
+
+        while let next = nextScheduledAction(),
+              next.scheduled.deadline <= target
+        {
+            now = next.scheduled.deadline
+            scheduledActions.removeValue(forKey: next.id)
+            next.scheduled.action()
+        }
+
+        now = target
+    }
+
+    private func nextScheduledAction() -> (id: UUID, scheduled: ScheduledAction)? {
+        scheduledActions.min { lhs, rhs in
+            if lhs.value.deadline != rhs.value.deadline {
+                return lhs.value.deadline < rhs.value.deadline
+            }
+            return lhs.value.sequence < rhs.value.sequence
+        }
+        .map { (id: $0.key, scheduled: $0.value) }
+    }
+
+    private func cancel(_ id: UUID) {
+        scheduledActions.removeValue(forKey: id)
+    }
+
+    @MainActor
+    private final class ManualScheduledTask: AudioMonitorScheduledTask {
+        let id: UUID
+        weak var scheduler: ManualAudioMonitorScheduler?
+
+        init(id: UUID, scheduler: ManualAudioMonitorScheduler) {
+            self.id = id
+            self.scheduler = scheduler
+        }
+
+        func cancel() {
+            scheduler?.cancel(id)
+            scheduler = nil
+        }
     }
 }
 
@@ -97,7 +198,8 @@ func makeMonitor(
     protection: Bool = true,
     settle: Double = 1.0,
     notifications: Bool = true,
-    authorization: NotificationAuthorizationState = .authorized
+    authorization: NotificationAuthorizationState = .authorized,
+    scheduler: AudioMonitorScheduling? = nil
 ) -> (monitor: AudioMonitor, provider: FakeAudioDeviceProvider, notifier: RecordingNotifier) {
     let suite = "MicLockTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
@@ -119,7 +221,8 @@ func makeMonitor(
     let monitor = AudioMonitor(
         provider: provider,
         preferences: Preferences(defaults: defaults),
-        notifier: notifier
+        notifier: notifier,
+        scheduler: scheduler
     )
 
     return (monitor, provider, notifier)
@@ -127,5 +230,11 @@ func makeMonitor(
 
 /// 等待 settle window 到期（settleSeconds 最小 1.0，等待 1.4s 保证 task 完成）。
 func waitPastSettleWindow() async {
+    try? await Task.sleep(for: .seconds(1.4))
+}
+
+/// 等待 stable external switch candidate 分类窗口结束。
+/// candidate 复用 settleSeconds；测试默认 settle=1s，因此等待 1.4s。
+func waitPastStableExternalSwitchClassification() async {
     try? await Task.sleep(for: .seconds(1.4))
 }

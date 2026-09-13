@@ -3,6 +3,60 @@ import CoreAudio
 import OSLog
 import Observation
 
+/// AudioMonitor 的单调时钟 / 延迟调度抽象。
+/// timer 必须在 `schedule` 返回前完成登记；这样测试时钟可以确定性推进多级 watchdog，
+/// 不依赖新建 Task 何时获得执行机会。
+@MainActor
+protocol AudioMonitorScheduledTask: AnyObject {
+    func cancel()
+}
+
+@MainActor
+protocol AudioMonitorScheduling: AnyObject {
+    var now: ContinuousClock.Instant { get }
+
+    @discardableResult
+    func schedule(
+        after delay: Duration,
+        action: @escaping @MainActor () -> Void
+    ) -> AudioMonitorScheduledTask
+}
+
+@MainActor
+final class ContinuousAudioMonitorScheduler: AudioMonitorScheduling {
+    private let clock = ContinuousClock()
+
+    var now: ContinuousClock.Instant {
+        clock.now
+    }
+
+    @discardableResult
+    func schedule(
+        after delay: Duration,
+        action: @escaping @MainActor () -> Void
+    ) -> AudioMonitorScheduledTask {
+        let token = ContinuousScheduledTask()
+        token.task = Task { @MainActor in
+            if delay > .zero {
+                try? await Task.sleep(for: delay)
+            }
+            guard !Task.isCancelled else { return }
+            action()
+        }
+        return token
+    }
+
+    @MainActor
+    private final class ContinuousScheduledTask: AudioMonitorScheduledTask {
+        var task: Task<Void, Never>?
+
+        func cancel() {
+            task?.cancel()
+            task = nil
+        }
+    }
+}
+
 /// 麦克风保护状态机（Auto / Manual）。
 ///
 /// 职责：设备拓扑 settle window、self-induced 回调识别、
@@ -58,8 +112,15 @@ final class AudioMonitor {
 
     private(set) var lastError: String?
 
+    /// Protection restore 进入长期 watchdog retry 或 setter 被拒绝时，
+    /// 向设置界面暴露结构化状态；事务成功/取消/supersede 后清空。
+    private(set) var protectionRetryState: ProtectionRetryState?
+
     /// CoreAudio 监听基础能力失败；独立于一次性设备操作错误。
     private(set) var listenerError: String?
+
+    /// 输入设备枚举失败；与“成功但没有输入设备”区分。
+    private(set) var deviceEnumerationError: String?
 
     /// 通知权限被系统拒绝时提示用户去系统设置开启。
     private(set) var notificationDenied = false
@@ -83,14 +144,14 @@ final class AudioMonitor {
             preferences.protectionEnabled = protectionEnabled
             Self.logger.info("PROTECTION \(self.protectionEnabled ? "ON" : "OFF", privacy: .public)")
 
+            cancelStableExternalSwitchCandidate()
+
             if protectionEnabled {
                 // 开启即对齐（等同启动策略，不通知）。
                 evaluateStartupPolicy()
             } else {
                 // Protection OFF：只监控与刷新，不执行任何策略、不学习。
-                pendingRestoreNotification = nil
-                pendingRecentAudioEvent = nil
-                clearExpectedDefaultSwitch()
+                cancelProgrammaticSwitch()
             }
         }
     }
@@ -100,6 +161,11 @@ final class AudioMonitor {
             guard protectionMode != oldValue else { return }
             preferences.protectionMode = protectionMode
             Self.logger.info("MODE=\(self.protectionMode.rawValue, privacy: .public)")
+
+            // 模式切换是新的用户意图：旧模式下尚未确认的程序化切换事务或
+            // stable external switch candidate 都不应继续携带旧策略语义。
+            cancelStableExternalSwitchCandidate()
+            cancelProgrammaticSwitch()
 
             // auto → manual：保留 preferred，立即执行 manual enforce。
             if protectionMode == .manual {
@@ -131,6 +197,8 @@ final class AudioMonitor {
                 return
             }
             preferences.settleSeconds = settleSeconds
+            rescheduleActiveSettleEpisodeForConfigurationChange()
+            rescheduleStableExternalSwitchCandidateForConfigurationChange()
         }
     }
 
@@ -139,36 +207,130 @@ final class AudioMonitor {
     private let provider: AudioDeviceProviding
     private let preferences: Preferences
     private let notifier: NotificationPresenting
+    private let scheduler: AudioMonitorScheduling
 
     // MARK: - Settle State Machine
 
-    /// 时间间隔判断使用 monotonic clock。
-    private let clock = ContinuousClock()
+    /// 时间判断和延迟任务共用同一个 monotonic scheduler，避免状态机出现双时钟。
 
-    @ObservationIgnored private var lastTopologyChange: ContinuousClock.Instant?
+    private struct SettleEpisode {
+        let id: UInt64
+        var revision: UInt64
+        var lastActivity: ContinuousClock.Instant
+        var deadline: ContinuousClock.Instant
+        var notificationSent: Bool
+    }
 
-    @ObservationIgnored private var settleTask: Task<Void, Never>?
+    private enum StabilityState {
+        case stable
+        case settling(SettleEpisode)
+    }
 
+    /// Auto Mode 的稳定性状态是策略事实来源；scheduler timer 只负责唤醒，不承载业务状态。
+    @ObservationIgnored private var stabilityState: StabilityState = .stable
+    @ObservationIgnored private var nextSettleEpisodeID: UInt64 = 0
+    @ObservationIgnored private var settleTask: AudioMonitorScheduledTask?
+
+    /// 最近一份“完整且与 current 不矛盾”的可信 topology；策略判断只使用它。
+    /// `devices` 则可展示 partial snapshot 中仍可读取的健康设备。
+    @ObservationIgnored private var trustedDevices: [AudioInputDevice] = []
     @ObservationIgnored private var connectedUIDs: Set<String> = []
 
-    /// MicLock 自己最后一次 set 期望达到的设备 UID，用于识别 self-induced 回调。
-    @ObservationIgnored private var expectedDefaultUID: String?
+    /// Auto + stable 下观察到的外部 default 变化先进入候选态。
+    /// 这只延迟 preferred 的学习，不延迟 currentDevice UI，也不延迟 settling 内的 corrective restore。
+    private struct StableExternalSwitchCandidate {
+        let id: UInt64
+        let oldPreferredUID: String
+        let oldPreferredName: String
+        let newCurrentUID: String
+        let newCurrentName: String
+        let startedAt: ContinuousClock.Instant
+        var deadline: ContinuousClock.Instant
+    }
 
-    /// 用于清理始终无法从 CoreAudio 真实状态确认的程序化切换。
-    @ObservationIgnored private var expectedSwitchTimeoutTask: Task<Void, Never>?
+    @ObservationIgnored private var stableExternalSwitchCandidate: StableExternalSwitchCandidate?
+    @ObservationIgnored private var nextStableExternalSwitchCandidateID: UInt64 = 0
+    @ObservationIgnored private var stableExternalSwitchCandidateTask: AudioMonitorScheduledTask?
 
-    private static let expectedSwitchConfirmationTimeout: Duration = .seconds(1.0)
+    /// CoreAudio topology 采样失败/矛盾时主动重试；与 settle / switch confirmation 独立。
+    @ObservationIgnored private var topologyRecoveryTask: AudioMonitorScheduledTask?
+    @ObservationIgnored private var topologyRecoveryAttempt = 0
+    /// 初始化阶段设备枚举失败后，第一份可信 topology 必须作为启动基线处理，
+    /// 不能把“从空缓存恢复”为普通设备接入事件，也不能丢失 startup restore 语义。
+    @ObservationIgnored private var startupTopologyRecoveryPending = false
+    private static let topologyRecoveryDelays: [Duration] = [
+        .milliseconds(250),
+        .milliseconds(500),
+        .seconds(1),
+        .seconds(2),
+    ]
 
-    /// Auto Mode 保护片段：一次设备拓扑变化期间的所有抢麦/恢复共享
-    /// 一个 episode，通知最多发一条。
-    @ObservationIgnored private var protectionEpisodeActive = false
-    @ObservationIgnored private var protectionEpisodeNotified = false
+    private enum ProgrammaticSwitchOrigin: Equatable {
+        case protectionRestore(RestoreReason)
+        case trustedUserSelection
+    }
 
-    /// 待确认的恢复通知：set 成功后挂起，确认 current == preferred 才投递。
-    @ObservationIgnored private var pendingRestoreNotification: (from: String, to: String, reason: RestoreReason)?
+    private struct PendingNotification {
+        let from: String
+        let to: String
+        let episodeID: UInt64?
+    }
 
-    /// 程序化切换对应的解释事件；只有 expected switch 被真实状态确认后才提交。
-    @ObservationIgnored private var pendingRecentAudioEvent: RecentAudioEvent?
+    private struct PendingSwitch {
+        let id: UInt64
+        let sourceUID: String?
+        let targetUID: String
+        let origin: ProgrammaticSwitchOrigin
+        let fromDeviceName: String?
+        let toDeviceName: String
+        var notification: PendingNotification?
+        var retryAttempt: Int
+    }
+
+    private enum ProgrammaticSwitchState {
+        case idle
+        case awaitingConfirmation(PendingSwitch)
+    }
+
+    /// pending transaction 对本轮 reconciliation 的消费语义。
+    /// Trusted watchdog expiry 需要单独表示：transaction 已经结束，但 synthetic
+    /// watchdog observation 不能自动获得 Auto external-switch evidence 资格。
+    private enum PendingReconcileResult {
+        case consumed
+        case trustedSelectionExpired
+        case continuePolicy
+    }
+
+    /// MicLock 自己发起的切换事务；目标、解释事件与通知必须原子地属于同一笔事务。
+    @ObservationIgnored private var programmaticSwitchState: ProgrammaticSwitchState = .idle
+    @ObservationIgnored private var programmaticSwitchWatchdogTask: AudioMonitorScheduledTask?
+
+    @ObservationIgnored private var nextProgrammaticSwitchID: UInt64 = 0
+
+    /// Protection Restore 是持续 invariant：长期异常时指数退避，最后固定 64s 一次。
+    private static let programmaticSwitchRetryDelays: [Duration] = [
+        .milliseconds(500),
+        .seconds(1),
+        .seconds(2),
+        .seconds(4),
+        .seconds(8),
+        .seconds(16),
+        .seconds(32),
+        .seconds(64),
+    ]
+    /// Trusted User Selection 是一次 UI command，不进入 Protection 的永久 retry 生命周期。
+    /// 首次 setter 未确认时，500ms 后只快速 retry 一次，再给 500ms 最终确认窗口。
+    private static let trustedUserSelectionRetryDelay: Duration = .milliseconds(500)
+    private static let trustedUserSelectionMaxRetryAttempts = 1
+    /// 保持原有 UX：完成 0.5/1/2/4s 四档快速重试后开始显示长期 retry 状态，
+    /// 但 transaction 不结束，后续 watchdog 继续按 8/16/32/64s 退避。
+    private static let programmaticSwitchRetryWarningAttempt = 4
+    private static let protectionSwitchRetryingError =
+        "Unable to confirm default input change; protection is retrying"
+    private static let protectionSwitchSetterRejectedRetryingError =
+        "Unable to set default input device; protection will keep retrying"
+    private static let userSelectionConfirmationFailedError =
+        "Unable to confirm default input change"
 
     /// 离线 preferred 设备的最近已知名称（跨启动持久化，用于 UI 展示）。
     @ObservationIgnored private var lastKnownDeviceNames: [String: String]
@@ -269,11 +431,13 @@ final class AudioMonitor {
     init(
         provider: AudioDeviceProviding,
         preferences: Preferences,
-        notifier: NotificationPresenting
+        notifier: NotificationPresenting,
+        scheduler: AudioMonitorScheduling? = nil
     ) {
         self.provider = provider
         self.preferences = preferences
         self.notifier = notifier
+        self.scheduler = scheduler ?? ContinuousAudioMonitorScheduler()
 
         preferredMicrophoneUID = preferences.preferredMicrophoneUID
         protectionEnabled = preferences.protectionEnabled
@@ -284,13 +448,14 @@ final class AudioMonitor {
 
         refreshDeviceList(initial: true)
 
-        // 首次运行：默认选择内置麦克风。
-        if preferredMicrophoneUID == nil {
-            let preferred = devices.first { $0.isBuiltIn } ?? currentDevice
-            if let preferred {
-                preferredMicrophoneUID = preferred.uid
-                preferences.preferredMicrophoneUID = preferred.uid
-            }
+        // 首次运行只使用可信 startup baseline 初始化 preferred。
+        // 初始 topology 枚举失败/跨属性不一致时，等待 startup recovery 的第一份可信快照，
+        // 避免把瞬时 fallback current 永久持久化为首选设备。
+        if !startupTopologyRecoveryPending {
+            initializeFirstRunPreferredIfNeeded(
+                devices: devices,
+                current: currentDevice
+            )
         }
 
         // 权限检查必须在 App 完成启动之后进行：
@@ -341,7 +506,7 @@ final class AudioMonitor {
     /// 离线 preferred 的展示名（nil = preferred 在线或未选择）。
     var offlinePreferredName: String? {
         guard let uid = preferredMicrophoneUID,
-              !devices.contains(where: { $0.uid == uid })
+              !connectedUIDs.contains(uid)
         else { return nil }
 
         return lastKnownDeviceNames[uid] ?? "Unknown device"
@@ -349,51 +514,108 @@ final class AudioMonitor {
 
     var isPreferredMicrophoneAvailable: Bool {
         guard let uid = preferredMicrophoneUID else { return false }
-        return devices.contains { $0.uid == uid }
+        return connectedUIDs.contains(uid)
     }
 
     /// 用户在 MicLock UI 主动选择设备：Trusted User Action。
     ///
-    /// 不受 settle window 限制，setter 成功后提交 preferred 并切换。
+    /// Trusted User Selection 使用 latest-wins：每次新的 MicLock 点击都立即 supersede
+    /// 旧 Trusted transaction，并把最新 target 作为唯一仍有意义的用户意图。
     func selectDevice(_ device: AudioInputDevice) {
         Self.logger.info("USER_SELECT \(device.name, privacy: .public)")
+        startUserSelection(device)
+    }
 
-        // 用户的新选择取代尚未确认的自动恢复，不应沿用旧通知。
-        pendingRestoreNotification = nil
-        pendingRecentAudioEvent = RecentAudioEvent(
-            kind: .selectedInMicLock,
+    /// 发起一笔最新的 Trusted User Selection。beginProgrammaticSwitch 会完整取消旧事务，
+    /// 因此连续 B → C → D 会立即依次发出 setter，但 active transaction 始终只代表 D。
+    private func startUserSelection(_ device: AudioInputDevice) {
+        // 先重新读取真实 current；只有本次 fresh observation 明确证明 target 已经生效时，
+        // 才能绕过 setter。读取失败时 currentDevice 只是缓存，不能拿它当成功事实。
+        let initialObservation = refreshCurrentDevice()
+        if case .observed(let observedCurrent) = initialObservation,
+           observedCurrent?.uid == device.uid
+        {
+            cancelStableExternalSwitchCandidate()
+            cancelProgrammaticSwitch()
+
+            let previousPreferredUID = preferredMicrophoneUID
+            guard previousPreferredUID != device.uid else {
+                lastError = nil
+                Self.logger.debug(
+                    "USER_SELECT no-op already current/preferred uid=\(device.uid, privacy: .public)"
+                )
+                return
+            }
+
+            let previousPreferredName = previousPreferredUID.flatMap { uid in
+                trustedDevices.first(where: { $0.uid == uid })?.name
+                    ?? lastKnownDeviceNames[uid]
+            }
+
+            preferredMicrophoneUID = device.uid
+            lastError = nil
+            recordRecentAudioEvent(RecentAudioEvent(
+                kind: .selectedInMicLock,
+                fromDeviceName: previousPreferredName,
+                toDeviceName: device.name,
+                occurredAt: Date()
+            ))
+            Self.logger.info(
+                "USER_SELECT already current; preferred updated uid=\(device.uid, privacy: .public)"
+            )
+            return
+        }
+
+        let transactionID = beginProgrammaticSwitch(
+            to: device.uid,
+            origin: .trustedUserSelection,
             fromDeviceName: currentDevice?.name,
             toDeviceName: device.name,
-            occurredAt: Date()
+            notification: nil
         )
-        beginExpectedDefaultSwitch(to: device.uid)
 
-        if provider.setInputDevice(uid: device.uid) {
+        do {
+            try provider.setInputDevice(uid: device.uid)
+
             // setter 成功只代表 CoreAudio 接受了写操作；preferred 可以提交，
             // 但 currentDevice 仍必须来自 provider 的真实读取。
             preferredMicrophoneUID = device.uid
             lastError = nil
 
-            refreshCurrentDevice()
-            if finishExpectedDefaultSwitchIfConfirmed() {
+            let confirmationObservation = refreshCurrentDevice()
+            if case .observed(let observedCurrent) = confirmationObservation,
+               finishProgrammaticSwitchIfConfirmed(observedCurrent: observedCurrent)
+            {
                 Self.logger.debug(
                     "USER_SELECT confirmed immediately uid=\(device.uid, privacy: .public)"
                 )
+            } else if case .awaitingConfirmation(let pending) = programmaticSwitchState {
+                scheduleProgrammaticSwitchWatchdog(for: pending)
             }
-        } else {
-            clearExpectedDefaultSwitch()
-            pendingRecentAudioEvent = nil
-            lastError = "Unable to set default input device"
-            Self.logger.error("USER_SELECT failed uid=\(device.uid, privacy: .public)")
+        } catch {
+            failProgrammaticSwitch(
+                id: transactionID,
+                error: "Unable to set default input device"
+            )
+            Self.logger.error(
+                "USER_SELECT failed uid=\(device.uid, privacy: .public) providerError=\(String(describing: error), privacy: .public)"
+            )
         }
     }
 
     /// 启动 / 切换模式 / 开启保护时的对齐：
     /// protection 开且 preferred 在线且 current != preferred → 恢复（不通知）。
     func evaluateStartupPolicy() {
+        // init 阶段不启动异步 recovery；等 start() 安装完 listeners 后由这里接手。
+        // 测试也可直接调用本方法模拟“listeners 已就绪”的启动阶段。
+        if startupTopologyRecoveryPending {
+            scheduleTopologySampleRecovery()
+            return
+        }
+
         guard protectionEnabled,
               let preferredUID = preferredMicrophoneUID,
-              let preferred = devices.first(where: { $0.uid == preferredUID }),
+              let preferred = trustedDevices.first(where: { $0.uid == preferredUID }),
               let current = currentDevice,
               current.uid != preferred.uid
         else { return }
@@ -401,100 +623,243 @@ final class AudioMonitor {
         restorePreferred(from: current, to: preferred, reason: .startup)
     }
 
-    // MARK: - Device List Changed
+    // MARK: - CoreAudio Reconciliation
 
-    /// 设备列表变化（插拔/重连）。
-    ///
-    /// burst 事件中集合可能重复不变，此时不重置 settle window（幂等）。
+    private enum CoreAudioWakeReason: String {
+        case devices
+        case defaultInput
+        case stableExternalSwitchConfirmation
+        case startupRecovery
+        case topologyRecovery
+        case programmaticSwitchWatchdog
+    }
+
+    /// `currentDevice` 是 UI/cache；程序化切换确认只能消费一次 fresh read 的结果。
+    private enum CurrentDeviceObservation {
+        case observed(AudioInputDevice?)
+        case failed
+    }
+
+    /// 两个 CoreAudio listener 都只作为 wake-up 信号。
+    /// 每次回调都重新读取完整设备列表 + 默认输入快照，并固定按：
+    /// topology delta → current → pending transaction → policy 的顺序收敛。
+    /// 因此不依赖 Devices / DefaultInput 两个独立 property callback 的到达顺序。
     func handleDeviceListChanged() {
-        let newDevices = provider.listInputDevices()
-        let newUIDs = Set(newDevices.map(\.uid))
-        let added = newUIDs.subtracting(connectedUIDs)
-        let removed = connectedUIDs.subtracting(newUIDs)
-
-        guard !added.isEmpty || !removed.isEmpty else {
-            Self.logger.debug("DEVICE_LIST_CHANGED (no delta)")
-            Self.trace("DEVICE_LIST_CHANGED (no delta)")
-            refreshCurrentDevice()
-            return
-        }
-
-        Self.trace("DEVICE_LIST_CHANGED added=\(added) removed=\(removed)")
-        connectedUIDs = newUIDs
-
-        devices = Self.sortedDevices(newDevices)
-        recordDeviceNames(newDevices)
-
-        Self.logger.info(
-            "DEVICE_LIST_CHANGED added=\(String(describing: added), privacy: .public) removed=\(String(describing: removed), privacy: .public)"
-        )
-
-        markTopologyUnsettled()
-
-        // 先读取设备列表变化后的真实 default input，再决定是否需要主动恢复。
-        refreshCurrentDevice()
-
-        // preferred 设备重新出现：立即恢复（Auto / Manual 都执行）。
-        if let preferredUID = preferredMicrophoneUID, added.contains(preferredUID) {
-            handlePreferredReconnected()
-        }
+        reconcileCoreAudioState(trigger: .devices)
     }
 
-    private func handlePreferredReconnected() {
-        guard protectionEnabled,
-              let preferredUID = preferredMicrophoneUID,
-              let preferred = devices.first(where: { $0.uid == preferredUID }),
-              let current = currentDevice,
-              current.uid != preferred.uid
-        else { return }
-
-        restorePreferred(from: current, to: preferred, reason: .preferredReconnected)
-    }
-
-    // MARK: - Default Input Changed
-
-    /// 默认输入变化回调。每次开始都重新读取真实状态（幂等）。
     func handleDefaultInputChanged() {
+        reconcileCoreAudioState(trigger: .defaultInput)
+    }
+
+    private func reconcileCoreAudioState(trigger: CoreAudioWakeReason) {
         let previous = currentDevice
+        let newCurrent: AudioInputDevice?
 
-        refreshCurrentDevice()
+        do {
+            newCurrent = try provider.currentInputDevice()
+            currentDevice = newCurrent
+            clearResolvedUserSelectionErrorIfNeeded(current: newCurrent)
+        } catch {
+            markTopologySampleInvalid(
+                message: "Unable to read current input device",
+                trigger: trigger
+            )
+            Self.logger.error(
+                "CURRENT_INPUT_READ_FAILED trigger=\(trigger.rawValue, privacy: .public) providerError=\(String(describing: error), privacy: .public)"
+            )
 
-        guard let current = currentDevice else { return }
-
-        // MicLock 自己触发的变化：只有真实 current 已达到 expected 才确认成功。
-        Self.trace("DEFAULT_INPUT_CHANGED → \(current.name) expected=\(expectedDefaultUID ?? "nil")")
-        if expectedDefaultUID != nil {
-            if finishExpectedDefaultSwitchIfConfirmed() {
-                Self.logger.debug(
-                    "DEFAULT_INPUT_CHANGED (self-induced confirmed) → \(current.name, privacy: .public)"
-                )
-            } else {
-                // CoreAudio 可能先发出中间 callback；在 expected 仍未确认时，
-                // 不把中间状态误判为新的外部抢麦，也不重复 setter。
-                Self.logger.debug(
-                    "DEFAULT_INPUT_CHANGED while waiting expected target; current=\(current.name, privacy: .public)"
-                )
+            // Trusted 是有界 UI command；即使 final watchdog 恰好遇到 current read failure，
+            // 也不能因此永久卡在 pending。Protection 的既有 recovery 语义保持不变。
+            if trigger == .programmaticSwitchWatchdog,
+               case .awaitingConfirmation(let pending) = programmaticSwitchState,
+               case .trustedUserSelection = pending.origin
+            {
+                _ = handleTrustedUserSelectionWatchdog(pending)
             }
             return
         }
 
+        // current == target 是独立于 topology 的充分成功证据。即使本轮设备枚举失败，
+        // 也必须先完成 transaction，避免已经成功的切换永久停在 pending。
+        let confirmedProgrammaticSwitch = finishProgrammaticSwitchIfConfirmed(
+            observedCurrent: newCurrent
+        )
+        if confirmedProgrammaticSwitch {
+            Self.logger.debug("PROGRAMMATIC_SWITCH confirmed from current state")
+        }
+
+        let snapshot: AudioInputDeviceSnapshot
+        do {
+            snapshot = try provider.listInputDevices()
+        } catch {
+            markTopologySampleInvalid(
+                message: "Unable to enumerate input devices",
+                trigger: trigger
+            )
+
+            if confirmedProgrammaticSwitch { return }
+            if shouldStopAfterPendingReconcile(observedCurrent: newCurrent, trigger: trigger) { return }
+            reconcileWithoutTrustedTopology(previous: previous, current: newCurrent)
+            return
+        }
+
+        let newDevices = snapshot.devices
+
+        // partial snapshot 仍可服务 UI/诊断，但绝不能推进 removal / target-offline / Auto learning。
+        // 策略事实继续使用 trustedDevices / connectedUIDs 的最后一份完整快照。
+        devices = Self.sortedDevices(newDevices)
+        recordDeviceNames(newDevices)
+
+        if !snapshot.isComplete {
+            markTopologySampleInvalid(
+                message: "Some input device properties are temporarily unreadable",
+                trigger: trigger
+            )
+            Self.logger.error(
+                "CORE_AUDIO_RECONCILE partial topology trigger=\(trigger.rawValue, privacy: .public) incompleteDeviceIDs=\(String(describing: snapshot.incompleteDeviceIDs), privacy: .public) issues=\(String(describing: snapshot.issues), privacy: .public)"
+            )
+
+            if confirmedProgrammaticSwitch { return }
+            if shouldStopAfterPendingReconcile(observedCurrent: newCurrent, trigger: trigger) { return }
+            reconcileWithoutTrustedTopology(previous: previous, current: newCurrent)
+            return
+        }
+
+        let newUIDs = Set(newDevices.map(\.uid))
+
+        // DefaultInput 与 Devices 不是原子事务。current 指向一个本轮 devices 中不存在的 UID
+        // 时，这一轮跨属性采样自相矛盾：可以更新 UI current，但不能据此做 topology removal、
+        // pending target offline 或 Auto preferred 学习等不可逆判定。
+        if let newCurrent,
+           !newUIDs.contains(newCurrent.uid)
+        {
+            markTopologySampleInvalid(
+                message: "CoreAudio input device state is temporarily inconsistent",
+                trigger: trigger
+            )
+
+            if confirmedProgrammaticSwitch { return }
+            if shouldStopAfterPendingReconcile(observedCurrent: newCurrent, trigger: trigger) { return }
+            reconcileWithoutTrustedTopology(previous: previous, current: newCurrent)
+            return
+        }
+
+        // 初始化枚举失败后，第一份可信快照是“启动基线”，不是一次真实 topology delta。
+        // 否则 connectedUIDs 仍为空会把所有设备误判为 added，进而把 startup 对齐记录成
+        // preferredReconnected / automaticHijack，并可能错误发送通知。
+        if startupTopologyRecoveryPending {
+            clearTopologySampleRecovery()
+            deviceEnumerationError = nil
+
+            devices = Self.sortedDevices(newDevices)
+            trustedDevices = devices
+            connectedUIDs = newUIDs
+            recordDeviceNames(newDevices)
+            startupTopologyRecoveryPending = false
+
+            initializeFirstRunPreferredIfNeeded(
+                devices: devices,
+                current: currentDevice
+            )
+
+            Self.trace("STARTUP_TOPOLOGY_RECOVERED devices=\(newUIDs)")
+            Self.logger.info(
+                "STARTUP_TOPOLOGY_RECOVERED devices=\(String(describing: newUIDs), privacy: .public)"
+            )
+
+            if confirmedProgrammaticSwitch { return }
+
+            if case .awaitingConfirmation(let pending) = programmaticSwitchState,
+               !connectedUIDs.contains(pending.targetUID)
+            {
+                failProgrammaticSwitch(
+                    id: pending.id,
+                    error: "Target input device is no longer available"
+                )
+            }
+
+            if shouldStopAfterPendingReconcile(observedCurrent: newCurrent, trigger: trigger) { return }
+            evaluateStartupPolicy()
+            return
+        }
+
+        clearTopologySampleRecovery()
+        deviceEnumerationError = nil
+
+        let added = newUIDs.subtracting(connectedUIDs)
+        let removed = connectedUIDs.subtracting(newUIDs)
+        let topologyChanged = !added.isEmpty || !removed.isEmpty
+
+        // 只有完整且跨属性一致的 topology sample 才能更新策略事实。
+        devices = Self.sortedDevices(newDevices)
+        trustedDevices = devices
+        connectedUIDs = newUIDs
+        recordDeviceNames(newDevices)
+
+        if topologyChanged {
+            cancelStableExternalSwitchCandidate()
+            Self.trace(
+                "CORE_AUDIO_RECONCILE trigger=\(trigger.rawValue) added=\(added) removed=\(removed)"
+            )
+            Self.logger.info(
+                "CORE_AUDIO_RECONCILE trigger=\(trigger.rawValue, privacy: .public) added=\(String(describing: added), privacy: .public) removed=\(String(describing: removed), privacy: .public)"
+            )
+            markTopologyUnsettled()
+        } else if trigger == .devices {
+            Self.logger.debug("DEVICE_LIST_CHANGED (no delta)")
+            Self.trace("DEVICE_LIST_CHANGED (no delta)")
+        }
+
+        // transaction 已经由 current==target 确认；topology 仍然完成刷新，但不再运行 policy。
+        if confirmedProgrammaticSwitch { return }
+
+        // target disappearance 只能使用有效且一致的 topology 作为证据。
+        if case .awaitingConfirmation(let pending) = programmaticSwitchState,
+           !connectedUIDs.contains(pending.targetUID)
+        {
+            failProgrammaticSwitch(
+                id: pending.id,
+                error: "Target input device is no longer available"
+            )
+            Self.logger.error(
+                "PROGRAMMATIC_SWITCH target disappeared id=\(pending.id, privacy: .public) uid=\(pending.targetUID, privacy: .public)"
+            )
+        }
+
+        if shouldStopAfterPendingReconcile(observedCurrent: newCurrent, trigger: trigger) { return }
+        guard let current = currentDevice else { return }
+
+        Self.trace(
+            "CORE_AUDIO_RECONCILE trigger=\(trigger.rawValue) current=\(current.name) pendingTarget=nil"
+        )
         Self.logger.info(
-            "DEFAULT_INPUT_CHANGED \(previous?.name ?? "nil", privacy: .public) → \(current.name, privacy: .public) mode=\(self.protectionMode.rawValue, privacy: .public)"
+            "DEFAULT_INPUT_STATE \(previous?.name ?? "nil", privacy: .public) → \(current.name, privacy: .public) mode=\(self.protectionMode.rawValue, privacy: .public)"
         )
 
         guard protectionEnabled else { return }
 
         guard let preferredUID = preferredMicrophoneUID else {
-            // 未设置 preferred：学习当前设备。
             preferredMicrophoneUID = current.uid
             return
         }
 
-        // 已经是 preferred：无事可做（幂等，避免 Listener 循环）。
-        if current.uid == preferredUID { return }
+        // preferred 设备重新出现：无论 Auto / Manual 都立即恢复。
+        if added.contains(preferredUID),
+           let preferred = trustedDevices.first(where: { $0.uid == preferredUID }),
+           current.uid != preferred.uid
+        {
+            restorePreferred(from: current, to: preferred, reason: .preferredReconnected)
+            return
+        }
 
-        guard let preferred = devices.first(where: { $0.uid == preferredUID }) else {
-            // preferred 离线：保留 UID，不 fallback，也不学习系统 fallback 设备。
+        if current.uid == preferredUID {
+            cancelStableExternalSwitchCandidate()
+            return
+        }
+
+        guard let preferred = trustedDevices.first(where: { $0.uid == preferredUID }) else {
+            cancelStableExternalSwitchCandidate()
             Self.logger.info(
                 "PREFERRED_OFFLINE keep=\(preferredUID, privacy: .public) current=\(current.name, privacy: .public)"
             )
@@ -503,34 +868,307 @@ final class AudioMonitor {
 
         switch protectionMode {
         case .manual:
+            cancelStableExternalSwitchCandidate()
             restorePreferred(from: current, to: preferred, reason: .manualLock)
 
         case .auto:
             let settled = isTopologySettled()
-            Self.trace("auto: settled=\(settled) lastTopologyChange=\(lastTopologyChange != nil)")
-            Self.logger.info(
-                "mode=auto settled=\(settled, privacy: .public)"
-            )
+            Self.trace("auto: settled=\(settled)")
+            Self.logger.info("mode=auto settled=\(settled, privacy: .public)")
 
             if !settled {
-                // 设备接入/断开的不稳定窗口内的变化 → 系统抢麦，立即恢复。
+                cancelStableExternalSwitchCandidate()
                 Self.trace("decision=restore reason=topology-unsettled")
                 restorePreferred(from: current, to: preferred, reason: .automaticHijack)
+            } else if trigger == .stableExternalSwitchConfirmation,
+                      let candidate = stableExternalSwitchCandidate,
+                      candidate.oldPreferredUID == preferredUID,
+                      candidate.newCurrentUID == current.uid,
+                      connectedUIDs.contains(candidate.newCurrentUID)
+            {
+                commitStableExternalSwitchCandidate(candidate)
             } else {
-                // 设备已稳定 + 非 self-induced → 用户主动切换，接受。
-                preferredMicrophoneUID = current.uid
-                recordRecentAudioEvent(RecentAudioEvent(
-                    kind: .acceptedUserSwitch,
-                    fromDeviceName: previous?.name,
-                    toDeviceName: current.name,
-                    occurredAt: Date()
-                ))
-                Self.trace("decision=accept reason=user-initiated → \(current.name)")
-                Self.logger.info(
-                    "decision=accept reason=user-initiated preferred=\(current.name, privacy: .public)"
-                )
+                beginStableExternalSwitchCandidate(from: preferred, to: current)
             }
         }
+    }
+
+    /// 在 topology 不可信时，只执行不依赖新 topology 的确定性动作。
+    /// Manual 可以使用上一份有效设备表继续严格恢复；Auto 不做 preferred 学习/抢麦分类。
+    private func reconcileWithoutTrustedTopology(
+        previous: AudioInputDevice?,
+        current: AudioInputDevice?
+    ) {
+        guard let current else { return }
+
+        Self.trace(
+            "CORE_AUDIO_DEGRADED \(previous?.name ?? "nil") -> \(current.name) mode=\(protectionMode.rawValue)"
+        )
+        Self.logger.info(
+            "CORE_AUDIO_DEGRADED current=\(current.name, privacy: .public) mode=\(self.protectionMode.rawValue, privacy: .public)"
+        )
+
+        guard protectionEnabled,
+              let preferredUID = preferredMicrophoneUID
+        else { return }
+
+        if current.uid == preferredUID {
+            cancelStableExternalSwitchCandidate()
+            return
+        }
+
+        guard protectionMode == .manual,
+              let preferred = trustedDevices.first(where: { $0.uid == preferredUID })
+        else {
+            // Auto 需要可信 topology 才能做不可逆分类；等待 recovery retry。
+            return
+        }
+
+        cancelStableExternalSwitchCandidate()
+        restorePreferred(from: current, to: preferred, reason: .manualLock)
+    }
+
+    /// 统一决定 pending transaction 是否应截断本轮 reconciliation。
+    /// Trusted watchdog expiry 在 Auto 下必须停在这里：该 observation 是 MicLock 自己
+    /// 的 synthetic re-read，不能据此创建 StableExternalSwitchCandidate；Manual 则仍需
+    /// 继续 normal protection policy，以便必要时 restore 最新 preferred。
+    private func shouldStopAfterPendingReconcile(
+        observedCurrent: AudioInputDevice?,
+        trigger: CoreAudioWakeReason
+    ) -> Bool {
+        switch reconcilePendingSwitchUsingCurrentOnly(
+            observedCurrent: observedCurrent,
+            trigger: trigger
+        ) {
+        case .consumed:
+            return true
+        case .trustedSelectionExpired:
+            return trigger == .programmaticSwitchWatchdog
+                && protectionMode == .auto
+        case .continuePolicy:
+            return false
+        }
+    }
+
+    /// PendingSwitch 的 current-only 语义：target 已在调用方通过本轮 fresh observation 确认。
+    /// Trusted User Selection 只关心“最新 MicLock target 是否已确认”，不根据 source、
+    /// third current 或 callback 类型推断 writer/provenance；Protection Restore 则保留
+    /// 原有 source/third-state 语义与 persistent retry。
+    private func reconcilePendingSwitchUsingCurrentOnly(
+        observedCurrent: AudioInputDevice?,
+        trigger: CoreAudioWakeReason
+    ) -> PendingReconcileResult {
+        guard case .awaitingConfirmation(let pending) = programmaticSwitchState else {
+            return .continuePolicy
+        }
+
+        if case .trustedUserSelection = pending.origin {
+            if trigger == .programmaticSwitchWatchdog {
+                return handleTrustedUserSelectionWatchdog(pending)
+            }
+
+            // 非 target callback 无法说明是谁写入；在短 Trusted 窗口内只保持 latest target，
+            // 等 watchdog fresh-read/retry，不做 external-vs-old-write provenance 推断。
+            scheduleProgrammaticSwitchWatchdog(for: pending)
+            return .consumed
+        }
+
+        guard let current = observedCurrent else {
+            if trigger == .programmaticSwitchWatchdog {
+                retryProgrammaticSwitch(pending)
+            } else {
+                scheduleProgrammaticSwitchWatchdog(for: pending)
+            }
+            return .consumed
+        }
+
+        Self.trace(
+            "PROGRAMMATIC_SWITCH current-only current=\(current.name) source=\(pending.sourceUID ?? "nil") target=\(pending.targetUID)"
+        )
+
+        if let sourceUID = pending.sourceUID,
+           current.uid == sourceUID
+        {
+            if trigger == .programmaticSwitchWatchdog {
+                retryProgrammaticSwitch(pending)
+            } else {
+                scheduleProgrammaticSwitchWatchdog(for: pending)
+            }
+            return .consumed
+        }
+
+        // Protection restore 的第三状态属于更新事实：结束旧 transaction，
+        // 再由当前 protection policy 决定后续。
+        cancelProgrammaticSwitch()
+        Self.logger.info(
+            "PROGRAMMATIC_SWITCH superseded id=\(pending.id, privacy: .public) current=\(current.uid, privacy: .public) trigger=\(trigger.rawValue, privacy: .public)"
+        )
+        return .continuePolicy
+    }
+
+    /// Trusted User Selection 的唯一 watchdog 生命周期：一次 fast retry + 一次最终确认。
+    /// expiry 单独返回 `.trustedSelectionExpired`，由调用方根据 trigger / mode 决定
+    /// synthetic watchdog observation 是否有资格继续进入 normal policy。
+    @discardableResult
+    private func handleTrustedUserSelectionWatchdog(
+        _ pending: PendingSwitch
+    ) -> PendingReconcileResult {
+        guard case .awaitingConfirmation(let currentPending) = programmaticSwitchState,
+              currentPending.id == pending.id,
+              case .trustedUserSelection = currentPending.origin
+        else { return .continuePolicy }
+
+        if currentPending.retryAttempt < Self.trustedUserSelectionMaxRetryAttempts {
+            retryProgrammaticSwitch(currentPending)
+            return .consumed
+        }
+
+        cancelProgrammaticSwitch()
+        lastError = Self.userSelectionConfirmationFailedError
+        Self.logger.warning(
+            "PROGRAMMATIC_SWITCH trusted selection expired id=\(currentPending.id, privacy: .public) target=\(currentPending.targetUID, privacy: .public)"
+        )
+        return .trustedSelectionExpired
+    }
+
+    /// Trusted confirmation timeout 只描述“当时未能确认”，不是永久错误。
+    /// 后续任意一次成功 fresh read 若已经证明 current == preferred，就清掉这条
+    /// transient error；其他 setter / listener / topology / protection error 一律不碰。
+    private func clearResolvedUserSelectionErrorIfNeeded(current: AudioInputDevice?) {
+        guard lastError == Self.userSelectionConfirmationFailedError,
+              let current,
+              current.uid == preferredMicrophoneUID
+        else { return }
+
+        lastError = nil
+    }
+
+    private func markTopologySampleInvalid(message: String, trigger: CoreAudioWakeReason) {
+        deviceEnumerationError = message
+        Self.trace("CORE_AUDIO_RECONCILE invalid-topology trigger=\(trigger.rawValue) error=\(message)")
+        Self.logger.error(
+            "CORE_AUDIO_RECONCILE invalid topology trigger=\(trigger.rawValue, privacy: .public) error=\(message, privacy: .public)"
+        )
+        scheduleTopologySampleRecovery()
+    }
+
+    private func scheduleTopologySampleRecovery() {
+        guard topologyRecoveryTask == nil else { return }
+
+        let index = min(topologyRecoveryAttempt, Self.topologyRecoveryDelays.count - 1)
+        let delay = Self.topologyRecoveryDelays[index]
+        let trigger: CoreAudioWakeReason = startupTopologyRecoveryPending
+            ? .startupRecovery
+            : .topologyRecovery
+        topologyRecoveryAttempt += 1
+        topologyRecoveryTask = scheduler.schedule(after: delay) { [weak self] in
+            guard let self else { return }
+            self.topologyRecoveryTask = nil
+            self.reconcileCoreAudioState(trigger: trigger)
+        }
+    }
+
+    private func clearTopologySampleRecovery() {
+        topologyRecoveryTask?.cancel()
+        topologyRecoveryTask = nil
+        topologyRecoveryAttempt = 0
+    }
+
+    // MARK: - Stable External Switch Candidate
+
+    private func beginStableExternalSwitchCandidate(
+        from preferred: AudioInputDevice,
+        to current: AudioInputDevice
+    ) {
+        if let candidate = stableExternalSwitchCandidate,
+           candidate.oldPreferredUID == preferred.uid,
+           candidate.newCurrentUID == current.uid
+        {
+            if stableExternalSwitchCandidateTask == nil {
+                scheduleStableExternalSwitchCandidateConfirmation(candidate)
+            }
+            return
+        }
+
+        cancelStableExternalSwitchCandidate()
+
+        nextStableExternalSwitchCandidateID &+= 1
+        let now = scheduler.now
+        let candidate = StableExternalSwitchCandidate(
+            id: nextStableExternalSwitchCandidateID,
+            oldPreferredUID: preferred.uid,
+            oldPreferredName: preferred.name,
+            newCurrentUID: current.uid,
+            newCurrentName: current.name,
+            startedAt: now,
+            deadline: now.advanced(by: .seconds(settleSeconds))
+        )
+        stableExternalSwitchCandidate = candidate
+
+        Self.trace(
+            "STABLE_EXTERNAL_SWITCH_CANDIDATE id=\(candidate.id) from=\(preferred.name) to=\(current.name)"
+        )
+        Self.logger.debug(
+            "STABLE_EXTERNAL_SWITCH_CANDIDATE id=\(candidate.id, privacy: .public) from=\(preferred.uid, privacy: .public) to=\(current.uid, privacy: .public)"
+        )
+
+        scheduleStableExternalSwitchCandidateConfirmation(candidate)
+    }
+
+    private func scheduleStableExternalSwitchCandidateConfirmation(
+        _ candidate: StableExternalSwitchCandidate
+    ) {
+        stableExternalSwitchCandidateTask?.cancel()
+        let delay = scheduler.now.duration(to: candidate.deadline)
+        stableExternalSwitchCandidateTask = scheduler.schedule(after: delay) { [weak self] in
+            guard let self else { return }
+
+            // 标记本次 timer 已消费；如果此次确认因无效 topology sample 无法完成，
+            // 后续同 candidate 的 wake-up 可以重新安排一次确认。
+            self.stableExternalSwitchCandidateTask = nil
+
+            guard self.stableExternalSwitchCandidate?.id == candidate.id else { return }
+            self.reconcileCoreAudioState(trigger: .stableExternalSwitchConfirmation)
+        }
+    }
+
+    private func rescheduleStableExternalSwitchCandidateForConfigurationChange() {
+        guard var candidate = stableExternalSwitchCandidate else { return }
+
+        candidate.deadline = candidate.startedAt.advanced(by: .seconds(settleSeconds))
+        stableExternalSwitchCandidate = candidate
+        scheduleStableExternalSwitchCandidateConfirmation(candidate)
+    }
+
+    private func commitStableExternalSwitchCandidate(
+        _ candidate: StableExternalSwitchCandidate
+    ) {
+        guard stableExternalSwitchCandidate?.id == candidate.id else { return }
+
+        cancelStableExternalSwitchCandidate()
+        preferredMicrophoneUID = candidate.newCurrentUID
+        // candidate 只有在本轮 fresh current 仍等于 target 时才会提交；preferred 更新后
+        // 已经证明先前 Trusted timeout 的 confirmation error 被当前事实解决。
+        clearResolvedUserSelectionErrorIfNeeded(current: currentDevice)
+        recordRecentAudioEvent(RecentAudioEvent(
+            kind: .acceptedUserSwitch,
+            fromDeviceName: candidate.oldPreferredName,
+            toDeviceName: candidate.newCurrentName,
+            occurredAt: Date()
+        ))
+
+        Self.trace(
+            "decision=accept reason=stable-external-switch-confirmed → \(candidate.newCurrentName)"
+        )
+        Self.logger.info(
+            "decision=accept reason=stable-external-switch-confirmed preferred=\(candidate.newCurrentName, privacy: .public)"
+        )
+    }
+
+    private func cancelStableExternalSwitchCandidate() {
+        stableExternalSwitchCandidate = nil
+        stableExternalSwitchCandidateTask?.cancel()
+        stableExternalSwitchCandidateTask = nil
     }
 
     // MARK: - Restore（统一入口）
@@ -543,38 +1181,52 @@ final class AudioMonitor {
     ) {
         guard protectionEnabled else { return }
 
-        beginExpectedDefaultSwitch(to: preferred.uid)
-        pendingRecentAudioEvent = RecentAudioEvent(
-            kind: .restored(reason),
+        let transactionID = beginProgrammaticSwitch(
+            to: preferred.uid,
+            origin: .protectionRestore(reason),
             fromDeviceName: current.name,
             toDeviceName: preferred.name,
-            occurredAt: Date()
+            notification: pendingNotificationForRestore(
+                from: current.name,
+                to: preferred.name,
+                reason: reason
+            )
         )
 
-        let ok = provider.setInputDevice(uid: preferred.uid)
-
-        guard ok else {
-            clearExpectedDefaultSwitch()
-            pendingRestoreNotification = nil
-            pendingRecentAudioEvent = nil
-            lastError = "Unable to set default input device"
-            Self.logger.error("RESTORE_FAILURE reason=\(reason, privacy: .public) target=\(preferred.name, privacy: .public)")
+        do {
+            try provider.setInputDevice(uid: preferred.uid)
+        } catch {
+            // Protection restore 与一次性的 UI 选择不同：目标仍在线时，一次 setter 失败
+            // 只说明本次请求没有完成，不足以放弃保护。保留 PendingSwitch，让 watchdog
+            // 继续退避重试；具体 lookup / HAL / OSStatus 原因保留在结构化日志中。
+            lastError = Self.protectionSwitchSetterRejectedRetryingError
+            protectionRetryState = .setterRejected
+            Self.logger.error(
+                "RESTORE_SETTER_REJECTED_RETRYING reason=\(reason, privacy: .public) target=\(preferred.name, privacy: .public) providerError=\(String(describing: error), privacy: .public)"
+            )
+            if case .awaitingConfirmation(let pending) = programmaticSwitchState,
+               pending.id == transactionID
+            {
+                scheduleProgrammaticSwitchWatchdog(for: pending)
+            }
             return
         }
 
-        lastError = nil
+        if lastError != Self.protectionSwitchRetryingError {
+            lastError = nil
+        }
 
         // 恢复后重新开启 settle window：
         // 系统/蓝牙子系统可能立刻再次抢麦，直到稳定前继续保护。
         markTopologyUnsettled()
 
-        preparePendingNotification(from: current.name, to: preferred.name, reason: reason)
+        // setter 返回成功不等于 CoreAudio 已经切换；只有本次 fresh read 成功且
+        // 明确观察到 target 才能确认。读取失败时保留 pending，等待 callback/watchdog。
+        let confirmationObservation = refreshCurrentDevice()
 
-        // setter 返回成功不等于 CoreAudio 已经切换；重新读取真实 current，
-        // 同步生效时可立即确认，异步生效时等待 listener callback。
-        refreshCurrentDevice()
-
-        if finishExpectedDefaultSwitchIfConfirmed() {
+        if case .observed(let observedCurrent) = confirmationObservation,
+           finishProgrammaticSwitchIfConfirmed(observedCurrent: observedCurrent)
+        {
             Self.logger.info(
                 "RESTORE_CONFIRMED \(current.name, privacy: .public) → \(preferred.name, privacy: .public) reason=\(reason, privacy: .public)"
             )
@@ -582,66 +1234,260 @@ final class AudioMonitor {
             Self.logger.debug(
                 "RESTORE_PENDING_CONFIRMATION target=\(preferred.name, privacy: .public)"
             )
-        }
-    }
-
-    // MARK: - Expected Switch Lifecycle
-
-    /// 开始一次由 MicLock 发起的切换，并安排无法确认时的最终清理。
-    private func beginExpectedDefaultSwitch(to uid: String) {
-        expectedSwitchTimeoutTask?.cancel()
-        expectedDefaultUID = uid
-
-        expectedSwitchTimeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: Self.expectedSwitchConfirmationTimeout)
-
-            guard !Task.isCancelled else { return }
-            guard let self else { return }
-            guard self.expectedDefaultUID == uid else { return }
-
-            // timeout 到达时最后再读一次真实 CoreAudio 状态。
-            self.refreshCurrentDevice()
-
-            if self.finishExpectedDefaultSwitchIfConfirmed() {
-                Self.logger.debug(
-                    "EXPECTED_SWITCH confirmed on timeout recheck uid=\(uid, privacy: .public)"
-                )
-                return
+            if case .awaitingConfirmation(let pending) = programmaticSwitchState {
+                scheduleProgrammaticSwitchWatchdog(for: pending)
             }
-
-            self.expectedDefaultUID = nil
-            self.expectedSwitchTimeoutTask = nil
-            self.pendingRestoreNotification = nil
-            self.pendingRecentAudioEvent = nil
-            self.lastError = "Unable to confirm default input device change"
-
-            Self.logger.error("EXPECTED_SWITCH timeout uid=\(uid, privacy: .public)")
         }
     }
 
-    /// 清理 expected 状态；pending restore 通知由调用方按语义单独处理。
-    private func clearExpectedDefaultSwitch() {
-        expectedDefaultUID = nil
-        expectedSwitchTimeoutTask?.cancel()
-        expectedSwitchTimeoutTask = nil
+    // MARK: - Programmatic Switch Transaction
+
+    /// 开始一笔由 MicLock 发起的切换事务。新事务会原子地取代旧事务，
+    /// 因此 source / target / Recent Event / notification 不会跨两次操作串线。
+    ///
+    /// Protection Restore 没有固定确认超时；Trusted User Selection 则是短生命周期 UI command。
+    @discardableResult
+    private func beginProgrammaticSwitch(
+        to uid: String,
+        origin: ProgrammaticSwitchOrigin,
+        fromDeviceName: String?,
+        toDeviceName: String,
+        notification: PendingNotification?
+    ) -> UInt64 {
+        cancelStableExternalSwitchCandidate()
+
+        // 新 MicLock 动作属于更高优先级事实：完整 supersede 旧事务，
+        // 同时清理旧事务留下的 retrying UI 状态。
+        cancelProgrammaticSwitch()
+        nextProgrammaticSwitchID &+= 1
+        let id = nextProgrammaticSwitchID
+        // Trusted latest-wins 不使用 source/third-state provenance 推断；sourceUID 只服务
+        // Protection Restore 的 persistent transaction 语义。
+        let sourceUID: String?
+        switch origin {
+        case .trustedUserSelection:
+            sourceUID = nil
+        case .protectionRestore:
+            sourceUID = currentDevice?.uid
+        }
+
+        let pending = PendingSwitch(
+            id: id,
+            sourceUID: sourceUID,
+            targetUID: uid,
+            origin: origin,
+            fromDeviceName: fromDeviceName,
+            toDeviceName: toDeviceName,
+            notification: notification,
+            retryAttempt: 0
+        )
+        programmaticSwitchState = .awaitingConfirmation(pending)
+        return id
     }
 
-    /// 仅在 provider 已经读到目标设备时确认程序化切换。
+    private func cancelProgrammaticSwitch() {
+        programmaticSwitchState = .idle
+        programmaticSwitchWatchdogTask?.cancel()
+        programmaticSwitchWatchdogTask = nil
+        protectionRetryState = nil
+
+        // retrying 文案只描述当前仍存活的程序化事务。事务被明确取消、
+        // supersede、切模式或关闭保护后，保护/用户选择两类瞬态错误都不能残留。
+        if lastError == Self.protectionSwitchRetryingError
+            || lastError == Self.protectionSwitchSetterRejectedRetryingError
+        {
+            lastError = nil
+        }
+    }
+
+    private func failProgrammaticSwitch(id: UInt64, error: String) {
+        guard case .awaitingConfirmation(let pending) = programmaticSwitchState,
+              pending.id == id
+        else { return }
+
+        cancelProgrammaticSwitch()
+        lastError = error
+    }
+
+    /// 仅在“本次 fresh read”已经观察到事务 target 时确认程序化切换。
+    /// 不允许从共享 `currentDevice` cache 推断成功。
     @discardableResult
-    private func finishExpectedDefaultSwitchIfConfirmed() -> Bool {
-        guard let expected = expectedDefaultUID,
-              currentDevice?.uid == expected
+    private func finishProgrammaticSwitchIfConfirmed(
+        observedCurrent: AudioInputDevice?
+    ) -> Bool {
+        guard case .awaitingConfirmation(var pending) = programmaticSwitchState,
+              observedCurrent?.uid == pending.targetUID
         else { return false }
 
-        clearExpectedDefaultSwitch()
-        if let pendingRecentAudioEvent {
-            recordRecentAudioEvent(pendingRecentAudioEvent)
-            self.pendingRecentAudioEvent = nil
+        // Auto 下 protection restore 的“真实确认”本身也是 protection activity。
+        // 某个更早已 accepted 的 setter 可能在旧 settle episode 结束后才真正反映到 HAL；
+        // 如果确认时仍保持 stable，紧接着的再次抢麦会被误分类为稳定外部切换。
+        // 因此从真实 target confirmation 时刻重新锚定 settle，并把既有 notification
+        // 迁移到当前 episode；Trusted User Selection 不参与 protection settle。
+        if case .protectionRestore = pending.origin,
+           protectionMode == .auto
+        {
+            markTopologyUnsettled()
+            rebindPendingNotificationToCurrentEpisode(&pending)
         }
-        completePendingRestoreNotification()
+
+        cancelProgrammaticSwitch()
+        lastError = nil
+
+        // Recent Event 的时间是确认时间，而不是 setter 请求时间；
+        // 事件语义只从 transaction origin 推导，避免 origin/event kind 双写不一致。
+        let eventKind: RecentAudioEvent.Kind
+        switch pending.origin {
+        case .trustedUserSelection:
+            eventKind = .selectedInMicLock
+        case .protectionRestore(let reason):
+            eventKind = .restored(reason)
+        }
+
+        recordRecentAudioEvent(RecentAudioEvent(
+            kind: eventKind,
+            fromDeviceName: pending.fromDeviceName,
+            toDeviceName: pending.toDeviceName,
+            occurredAt: Date()
+        ))
+
+        commitNotification(pending.notification, origin: pending.origin)
+
         return true
     }
 
+    private func scheduleProgrammaticSwitchWatchdog(for pending: PendingSwitch) {
+        guard programmaticSwitchWatchdogTask == nil else { return }
+
+        let delay: Duration
+        switch pending.origin {
+        case .trustedUserSelection:
+            delay = Self.trustedUserSelectionRetryDelay
+        case .protectionRestore:
+            let index = min(pending.retryAttempt, Self.programmaticSwitchRetryDelays.count - 1)
+            delay = Self.programmaticSwitchRetryDelays[index]
+        }
+        let transactionID = pending.id
+        programmaticSwitchWatchdogTask = scheduler.schedule(after: delay) { [weak self] in
+            guard let self else { return }
+            guard case .awaitingConfirmation(let currentPending) = self.programmaticSwitchState,
+                  currentPending.id == transactionID
+            else { return }
+
+            self.programmaticSwitchWatchdogTask = nil
+            self.reconcileCoreAudioState(trigger: .programmaticSwitchWatchdog)
+        }
+    }
+
+    private func retryProgrammaticSwitch(_ pending: PendingSwitch) {
+        guard case .awaitingConfirmation(var currentPending) = programmaticSwitchState,
+              currentPending.id == pending.id
+        else { return }
+
+        switch currentPending.origin {
+        case .trustedUserSelection:
+            currentPending.retryAttempt += 1
+        case .protectionRestore:
+            // Protection 的 retryAttempt 表示退避阶段而非无限增长的总次数。
+            // 到达最后一档后保持 capped 64s 持续主动重试。
+            if currentPending.retryAttempt < Self.programmaticSwitchRetryDelays.count {
+                currentPending.retryAttempt += 1
+            }
+        }
+        programmaticSwitchState = .awaitingConfirmation(currentPending)
+
+        let accepted: Bool
+        let setterError: Error?
+        do {
+            try provider.setInputDevice(uid: currentPending.targetUID)
+            accepted = true
+            setterError = nil
+        } catch {
+            accepted = false
+            setterError = error
+        }
+
+        // 只有 protection restore 被 CoreAudio 接受时才重新开启/延长 settle。
+        // Trusted User Action 不制造 protection episode。若 transaction 本来就携带
+        // Auto notification，则把它迁移到新的/延长后的当前 episode；nil 绝不补造。
+        if accepted,
+           case .protectionRestore = currentPending.origin
+        {
+            markProtectionRetryAccepted(&currentPending)
+            // confirmation 必须读取更新后的 notification metadata。
+            programmaticSwitchState = .awaitingConfirmation(currentPending)
+        }
+
+        let confirmationObservation = refreshCurrentDevice()
+
+        if case .observed(let observedCurrent) = confirmationObservation,
+           finishProgrammaticSwitchIfConfirmed(observedCurrent: observedCurrent)
+        {
+            Self.logger.info(
+                "PROGRAMMATIC_SWITCH retry confirmed id=\(currentPending.id, privacy: .public) attempt=\(currentPending.retryAttempt, privacy: .public)"
+            )
+            return
+        }
+
+        let setterErrorDescription = setterError.map { String(describing: $0) } ?? "none"
+        Self.logger.warning(
+            "PROGRAMMATIC_SWITCH retry id=\(currentPending.id, privacy: .public) attempt=\(currentPending.retryAttempt, privacy: .public) setterAccepted=\(accepted, privacy: .public) providerError=\(setterErrorDescription, privacy: .public)"
+        )
+
+        if case .protectionRestore = currentPending.origin {
+            updateProtectionRetryStatus(
+                for: currentPending,
+                setterAccepted: accepted
+            )
+        }
+
+        if case .awaitingConfirmation(let stillPending) = programmaticSwitchState,
+           stillPending.id == currentPending.id
+        {
+            scheduleProgrammaticSwitchWatchdog(for: stillPending)
+        }
+    }
+
+    private func markProtectionRetryAccepted(_ pending: inout PendingSwitch) {
+        markTopologyUnsettled()
+
+        guard protectionMode == .auto else { return }
+        rebindPendingNotificationToCurrentEpisode(&pending)
+    }
+
+    private func rebindPendingNotificationToCurrentEpisode(_ pending: inout PendingSwitch) {
+        guard let notification = pending.notification,
+              case .settling(let episode) = stabilityState
+        else { return }
+
+        pending.notification = PendingNotification(
+            from: notification.from,
+            to: notification.to,
+            episodeID: episode.id
+        )
+    }
+
+    private func updateProtectionRetryStatus(
+        for pending: PendingSwitch,
+        setterAccepted: Bool
+    ) {
+        guard case .protectionRestore = pending.origin else { return }
+
+        if !setterAccepted {
+            lastError = Self.protectionSwitchSetterRejectedRetryingError
+            protectionRetryState = .setterRejected
+        } else if pending.retryAttempt >= Self.programmaticSwitchRetryWarningAttempt {
+            // 时间经过本身既不能宣告 HAL failure，也不能把仍停留在 source 的状态
+            // 重新交给 Auto 分类，否则会把原本正在抵抗的 hijack 反向学习为 preferred。
+            lastError = Self.protectionSwitchRetryingError
+            protectionRetryState = .awaitingConfirmation
+        } else if lastError == Self.protectionSwitchSetterRejectedRetryingError {
+            // 上一次 retry 被拒绝，但这次请求已重新被接受；在进入长期 retry 阶段前，
+            // 不再保留已经过时的“setter rejected”状态。
+            lastError = nil
+            protectionRetryState = nil
+        }
+    }
 
     private func recordRecentAudioEvent(_ event: RecentAudioEvent) {
         recentAudioEvents.insert(event, at: 0)
@@ -652,71 +1498,159 @@ final class AudioMonitor {
 
     // MARK: - Notification 去重
 
-    private func preparePendingNotification(from: String, to: String, reason: RestoreReason) {
-        guard notificationsEnabled else { return }
-        guard reason != .startup else { return }
+    private func pendingNotificationForRestore(
+        from: String,
+        to: String,
+        reason: RestoreReason
+    ) -> PendingNotification? {
+        guard notificationsEnabled else { return nil }
+        guard reason != .startup else { return nil }
 
-        // Auto Mode：一个 protection episode 只通知一次。
-        if protectionMode == .auto, protectionEpisodeNotified { return }
-
-        pendingRestoreNotification = (from: from, to: to, reason: reason)
-    }
-
-    /// 确认恢复已生效（current == preferred）后才投递挂起的通知。
-    private func completePendingRestoreNotification() {
-        guard let pending = pendingRestoreNotification else { return }
-
-        guard currentDevice?.uid == preferredMicrophoneUID else { return }
-
-        pendingRestoreNotification = nil
-
-        if protectionMode == .auto {
-            protectionEpisodeNotified = true
+        if protectionMode == .auto,
+           case .settling(let episode) = stabilityState
+        {
+            guard !episode.notificationSent else { return nil }
+            return PendingNotification(
+                from: from,
+                to: to,
+                episodeID: episode.id
+            )
         }
 
+        return PendingNotification(
+            from: from,
+            to: to,
+            episodeID: nil
+        )
+    }
+
+    private func commitNotification(
+        _ pending: PendingNotification?,
+        origin: ProgrammaticSwitchOrigin
+    ) {
+        guard let pending else { return }
+        guard case .protectionRestore(let reason) = origin else { return }
+
+        // 用户可能在事务确认前关闭通知；没有真正发送就不能消耗
+        // 当前 settle episode 的 notificationSent 去重额度。
         guard notificationsEnabled else { return }
+
+        // Auto notification 只修改它当前绑定的 episode。watchdog accepted retry
+        // 若开启了新的 episode，会先 rebind PendingNotification，再进入这里。
+        if let episodeID = pending.episodeID,
+           case .settling(var episode) = stabilityState,
+           episode.id == episodeID
+        {
+            guard !episode.notificationSent else { return }
+            episode.notificationSent = true
+            stabilityState = .settling(episode)
+        }
 
         Self.logger.info(
             "NOTIFICATION_SENT \(pending.from, privacy: .public) → \(pending.to, privacy: .public)"
         )
 
-        notifier.presentRestored(from: pending.from, to: pending.to, reason: pending.reason)
+        notifier.presentRestored(from: pending.from, to: pending.to, reason: reason)
     }
 
-    // MARK: - Settle Window
+    // MARK: - Stability State Machine
 
+    /// 返回当前拓扑是否稳定；timer 尚未获得执行机会但 deadline 已过时，
+    /// 这里也会同步完成状态转换，确保决策只依赖一个事实来源。
     private func isTopologySettled() -> Bool {
-        guard let lastTopologyChange else { return true }
-        return lastTopologyChange.duration(to: clock.now) >= .seconds(settleSeconds)
+        switch stabilityState {
+        case .stable:
+            return true
+
+        case .settling(let episode):
+            guard scheduler.now >= episode.deadline else { return false }
+            finishSettleEpisode(id: episode.id, revision: episode.revision)
+            return true
+        }
     }
 
+    /// 真实拓扑变化或一次 corrective restore 都会使拓扑进入/继续 settling。
+    /// 已存在 episode 时只延长同一 episode，保留 notificationSent。
     private func markTopologyUnsettled() {
-        Self.trace("TOPOLOGY_UNSETTLED settle=\(settleSeconds)")
-        lastTopologyChange = clock.now
-        protectionEpisodeActive = true
+        let now = scheduler.now
+        let deadline = now.advanced(by: .seconds(settleSeconds))
+        let episode: SettleEpisode
 
-        settleTask?.cancel()
+        switch stabilityState {
+        case .stable:
+            nextSettleEpisodeID &+= 1
+            episode = SettleEpisode(
+                id: nextSettleEpisodeID,
+                revision: 1,
+                lastActivity: now,
+                deadline: deadline,
+                notificationSent: false
+            )
 
-        let seconds = settleSeconds
-        settleTask = Task { [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(for: .seconds(seconds))
-            guard !Task.isCancelled else { return }
-            self.markTopologySettled()
+        case .settling(var current):
+            current.revision &+= 1
+            current.lastActivity = now
+            current.deadline = deadline
+            episode = current
         }
 
-        Self.logger.debug("TOPOLOGY_UNSETTLED settle=\(seconds, privacy: .public)")
+        stabilityState = .settling(episode)
+        scheduleSettleTask(for: episode)
+
+        Self.trace(
+            "TOPOLOGY_SETTLING episode=\(episode.id) revision=\(episode.revision) settle=\(settleSeconds)"
+        )
+        Self.logger.debug(
+            "TOPOLOGY_SETTLING episode=\(episode.id, privacy: .public) revision=\(episode.revision, privacy: .public) settle=\(self.settleSeconds, privacy: .public)"
+        )
     }
 
-    private func markTopologySettled() {
-        guard protectionEpisodeActive else { return }
+    /// settleSeconds 在 episode 运行中修改时，以最后一次 activity 为基点立即生效。
+    private func rescheduleActiveSettleEpisodeForConfigurationChange() {
+        guard case .settling(var episode) = stabilityState else { return }
 
-        Self.trace("TOPOLOGY_SETTLED")
-        protectionEpisodeActive = false
-        protectionEpisodeNotified = false
+        episode.revision &+= 1
+        episode.deadline = episode.lastActivity.advanced(by: .seconds(settleSeconds))
+
+        if scheduler.now >= episode.deadline {
+            stabilityState = .settling(episode)
+            finishSettleEpisode(id: episode.id, revision: episode.revision)
+            return
+        }
+
+        stabilityState = .settling(episode)
+        scheduleSettleTask(for: episode)
+
+        Self.trace(
+            "TOPOLOGY_SETTLING_RESCHEDULE episode=\(episode.id) revision=\(episode.revision) settle=\(settleSeconds)"
+        )
+    }
+
+    private func scheduleSettleTask(for episode: SettleEpisode) {
+        settleTask?.cancel()
+
+        let delay = scheduler.now.duration(to: episode.deadline)
+        settleTask = scheduler.schedule(after: delay) { [weak self] in
+            guard let self else { return }
+            self.finishSettleEpisode(id: episode.id, revision: episode.revision)
+        }
+    }
+
+    private func finishSettleEpisode(id: UInt64, revision: UInt64) {
+        guard case .settling(let episode) = stabilityState,
+              episode.id == id,
+              episode.revision == revision,
+              scheduler.now >= episode.deadline
+        else { return }
+
+        stabilityState = .stable
+        settleTask?.cancel()
         settleTask = nil
 
-        Self.logger.debug("TOPOLOGY_SETTLED")
+        Self.trace("TOPOLOGY_STABLE episode=\(id) revision=\(revision)")
+        Self.logger.debug(
+            "TOPOLOGY_STABLE episode=\(id, privacy: .public) revision=\(revision, privacy: .public)"
+        )
     }
 
     // MARK: - Notification Authorization
@@ -734,23 +1668,110 @@ final class AudioMonitor {
     // MARK: - Refresh
 
     private func refreshDeviceList(initial: Bool = false) {
-        let newDevices = provider.listInputDevices()
+        let snapshot: AudioInputDeviceSnapshot
+        do {
+            snapshot = try provider.listInputDevices()
+        } catch {
+            deviceEnumerationError = "Unable to enumerate input devices"
+            if initial {
+                startupTopologyRecoveryPending = true
+            }
+            Self.logger.error(
+                "DEVICE_LIST enumeration failed providerError=\(String(describing: error), privacy: .public)"
+            )
+            _ = refreshCurrentDevice(scheduleRecoveryOnFailure: !initial)
+            return
+        }
 
+        let newDevices = snapshot.devices
         devices = Self.sortedDevices(newDevices)
-        connectedUIDs = Set(newDevices.map(\.uid))
-
         recordDeviceNames(newDevices)
+
+        if !snapshot.isComplete {
+            deviceEnumerationError = "Some input device properties are temporarily unreadable"
+            if initial {
+                startupTopologyRecoveryPending = true
+            }
+            Self.logger.error(
+                "DEVICE_LIST partial snapshot incompleteDeviceIDs=\(String(describing: snapshot.incompleteDeviceIDs), privacy: .public) issues=\(String(describing: snapshot.issues), privacy: .public)"
+            )
+            _ = refreshCurrentDevice(scheduleRecoveryOnFailure: !initial)
+            return
+        }
+
+        deviceEnumerationError = nil
+
+        guard case .observed(let newCurrent) = refreshCurrentDevice(
+            scheduleRecoveryOnFailure: !initial
+        ) else {
+            if initial {
+                startupTopologyRecoveryPending = true
+            }
+            return
+        }
+        let newUIDs = Set(newDevices.map(\.uid))
+
+        // Devices / DefaultInput 不是原子 snapshot。首次启动时如果 current 不在本轮
+        // devices 中，不把这份联合采样当作可信 baseline；等 start() 后主动 recovery。
+        if initial,
+           let newCurrent,
+           !newUIDs.contains(newCurrent.uid)
+        {
+            startupTopologyRecoveryPending = true
+            deviceEnumerationError = "CoreAudio input device state is temporarily inconsistent"
+            Self.logger.error("DEVICE_LIST initial topology inconsistent")
+            return
+        }
+
+        trustedDevices = devices
+        connectedUIDs = newUIDs
 
         // 初始枚举：所有现存设备视为稳定，不开 settle window。
         if !initial, connectedUIDs.isEmpty {
             Self.logger.debug("DEVICE_LIST_EMPTY")
         }
-
-        refreshCurrentDevice()
     }
 
-    private func refreshCurrentDevice() {
-        currentDevice = provider.currentInputDevice()
+    /// Fresh install 的 preferred 只从可信 topology 初始化：优先内置麦克风；
+    /// 没有内置设备时，只有 current 本身也属于这份 topology 才允许 fallback。
+    private func initializeFirstRunPreferredIfNeeded(
+        devices: [AudioInputDevice],
+        current: AudioInputDevice?
+    ) {
+        guard preferredMicrophoneUID == nil else { return }
+
+        if let builtIn = devices.first(where: \.isBuiltIn) {
+            preferredMicrophoneUID = builtIn.uid
+            return
+        }
+
+        guard let current,
+              devices.contains(where: { $0.uid == current.uid })
+        else { return }
+
+        preferredMicrophoneUID = current.uid
+    }
+
+    /// 读取真实默认输入。失败时保留最后一次可信 current；调用方可选择安排 recovery。
+    /// 返回本次 fresh observation，禁止调用方用共享 cache 代替本次读取结果做确认。
+    @discardableResult
+    private func refreshCurrentDevice(
+        scheduleRecoveryOnFailure: Bool = true
+    ) -> CurrentDeviceObservation {
+        do {
+            let observedCurrent = try provider.currentInputDevice()
+            currentDevice = observedCurrent
+            return .observed(observedCurrent)
+        } catch {
+            deviceEnumerationError = "Unable to read current input device"
+            Self.logger.error(
+                "CURRENT_INPUT_READ_FAILED providerError=\(String(describing: error), privacy: .public)"
+            )
+            if scheduleRecoveryOnFailure {
+                scheduleTopologySampleRecovery()
+            }
+            return .failed
+        }
     }
 
     /// 更新并持久化最近已知设备名，离线设备在 UI 上仍可显示可读名字。

@@ -228,13 +228,60 @@ private struct AdvancedSettingsView: View {
                         .frame(minWidth: 52, alignment: .trailing)
                 }
 
-                Text("设备接入或移除后，MicLock 会等待该时间窗口稳定，再判断是否接受或恢复默认麦克风。")
+                Text("该时间同时用于设备接入或移除后的保护窗口，以及 Auto Mode 对稳定状态外部切换的确认窗口。保护窗口内的拓扑相关切换会被恢复；稳定状态下的外部切换持续保持该时长后，才会被接受为新的首选。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                if let retryState = monitor.protectionRetryState {
+                    protectionRetryRow(retryState)
+                }
             }
         }
         .formStyle(.grouped)
         .padding(16)
+    }
+
+    @ViewBuilder
+    private func protectionRetryRow(_ state: ProtectionRetryState) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label {
+                Text(retryTitle(for: state))
+                    .font(.caption)
+                    .fontWeight(.medium)
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            }
+
+            Text(retryDetail(for: state))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text("请检查首选麦克风是否仍已连接并可用、系统“声音 → 输入”的当前选择，以及是否有蓝牙设备或其他软件持续切换默认输入。MicLock 会继续退避重试，间隔最长为 64 秒。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func retryTitle(for state: ProtectionRetryState) -> String {
+        switch state {
+        case .awaitingConfirmation:
+            return "麦克风切换长时间未确认，保护仍在重试"
+        case .setterRejected:
+            return "系统暂时拒绝麦克风切换，保护仍在重试"
+        }
+    }
+
+    private func retryDetail(for state: ProtectionRetryState) -> String {
+        switch state {
+        case .awaitingConfirmation:
+            return "CoreAudio 已接受切换请求，但默认输入仍未变为首选麦克风。"
+        case .setterRejected:
+            return "最近一次切换请求未被 CoreAudio 接受；MicLock 会保留保护事务并继续尝试。"
+        }
     }
 }

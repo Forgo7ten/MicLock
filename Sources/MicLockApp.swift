@@ -312,13 +312,13 @@ struct MenuBarView: View {
                     Divider()
 
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Recent Events")
+                        Text("最近事件")
                             .font(.headline)
 
                         ForEach(Array(monitor.recentAudioEvents.prefix(5).enumerated()), id: \.element.id) { index, event in
                             VStack(alignment: .leading, spacing: 2) {
                                 HStack(spacing: 6) {
-                                    Text(index == 0 ? "Last Action" : event.titleText)
+                                    Text(index == 0 ? "最近操作 · \(event.titleText)" : event.titleText)
                                         .font(.subheadline)
                                         .fontWeight(index == 0 ? .semibold : .regular)
 
@@ -349,8 +349,8 @@ struct MenuBarView: View {
             }
 
             Group {
-                // 监听基础能力失败优先于一次性设备操作错误。
-                if let error = monitor.listenerError ?? monitor.lastError {
+                // CoreAudio 基础能力 / 枚举错误优先于一次性设备操作错误。
+                if let error = monitor.listenerError ?? monitor.deviceEnumerationError ?? monitor.lastError {
                     Text(error)
                         .font(.caption)
                         .foregroundStyle(.red)

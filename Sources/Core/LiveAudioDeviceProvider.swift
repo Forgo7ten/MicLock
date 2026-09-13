@@ -13,24 +13,40 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
 
     // MARK: - AudioDeviceProviding
 
-    func listInputDevices() -> [AudioInputDevice] {
-        allDevices().compactMap { deviceID -> AudioInputDevice? in
-            guard hasInputStreams(deviceID) else { return nil }
-            guard let uid = deviceUID(deviceID) else { return nil }
+    func listInputDevices() throws -> AudioInputDeviceSnapshot {
+        let deviceIDs = try allDevices()
+        var inputDevices: [AudioInputDevice] = []
+        var incompleteDeviceIDs: [AudioDeviceID] = []
+        var issues: [AudioDeviceProviderError] = []
 
-            return AudioInputDevice(
-                uid: uid,
-                deviceID: deviceID,
-                name: deviceName(deviceID) ?? "Unknown (\(deviceID))",
-                transportType: transportType(deviceID) ?? 0
-            )
+        for deviceID in deviceIDs {
+            do {
+                guard try hasInputStreams(deviceID) else { continue }
+                let uid = try requiredDeviceUID(deviceID)
+                inputDevices.append(AudioInputDevice(
+                    uid: uid,
+                    deviceID: deviceID,
+                    name: deviceName(deviceID) ?? "Unknown (\(deviceID))",
+                    transportType: transportType(deviceID) ?? 0
+                ))
+            } catch let error as AudioDeviceProviderError {
+                // 单个 HAL object 读失败时保留其余健康设备给 UI/诊断；
+                // 策略层会根据 incompleteDeviceIDs 冻结 removal/offline/Auto learning。
+                incompleteDeviceIDs.append(deviceID)
+                issues.append(error)
+            }
         }
+
+        return AudioInputDeviceSnapshot(
+            devices: inputDevices,
+            incompleteDeviceIDs: incompleteDeviceIDs,
+            issues: issues
+        )
     }
 
-    func currentInputDevice() -> AudioInputDevice? {
-        guard let deviceID = defaultInputDeviceID() else { return nil }
-
-        guard let uid = deviceUID(deviceID) else { return nil }
+    func currentInputDevice() throws -> AudioInputDevice? {
+        guard let deviceID = try defaultInputDeviceID() else { return nil }
+        let uid = try requiredDeviceUID(deviceID)
 
         return AudioInputDevice(
             uid: uid,
@@ -40,10 +56,8 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         )
     }
 
-    func setInputDevice(uid: String) -> Bool {
-        let target = allDevices().first { deviceUID($0) == uid }
-
-        guard let deviceID = target else { return false }
+    func setInputDevice(uid: String) throws {
+        let deviceID = try resolveDeviceID(uid: uid)
 
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultInputDevice,
@@ -52,20 +66,27 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         )
 
         var value = deviceID
-
-        return AudioObjectSetPropertyData(
+        let status = AudioObjectSetPropertyData(
             systemObject,
             &address,
             0,
             nil,
             UInt32(MemoryLayout<AudioDeviceID>.size),
             &value
-        ) == noErr
+        )
+
+        guard status == noErr else {
+            throw AudioDeviceProviderError.coreAudio(
+                operation: .setDefaultInputDevice,
+                objectID: systemObject,
+                status: status
+            )
+        }
     }
 
     // MARK: - CoreAudio Helpers
 
-    private func allDevices() -> [AudioDeviceID] {
+    private func allDevices() throws -> [AudioDeviceID] {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -75,7 +96,13 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         var size: UInt32 = 0
         var status = AudioObjectGetPropertyDataSize(systemObject, &address, 0, nil, &size)
 
-        guard status == noErr else { return [] }
+        guard status == noErr else {
+            throw AudioDeviceProviderError.coreAudio(
+                operation: .enumerateDeviceListSize,
+                objectID: systemObject,
+                status: status
+            )
+        }
 
         let count = Int(size) / MemoryLayout<AudioDeviceID>.size
         guard count > 0 else { return [] }
@@ -87,12 +114,18 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
             return AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, baseAddress)
         }
 
-        guard status == noErr else { return [] }
+        guard status == noErr else {
+            throw AudioDeviceProviderError.coreAudio(
+                operation: .enumerateDeviceListData,
+                objectID: systemObject,
+                status: status
+            )
+        }
 
         return devices
     }
 
-    private func hasInputStreams(_ deviceID: AudioDeviceID) -> Bool {
+    private func hasInputStreams(_ deviceID: AudioDeviceID) throws -> Bool {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreams,
             mScope: kAudioObjectPropertyScopeInput,
@@ -102,10 +135,18 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         var size: UInt32 = 0
         let status = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size)
 
-        return status == noErr && size > 0
+        guard status == noErr else {
+            throw AudioDeviceProviderError.coreAudio(
+                operation: .queryInputStreams,
+                objectID: deviceID,
+                status: status
+            )
+        }
+
+        return size > 0
     }
 
-    private func deviceUID(_ deviceID: AudioDeviceID) -> String? {
+    private func requiredDeviceUID(_ deviceID: AudioDeviceID) throws -> String {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyDeviceUID,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -119,9 +160,41 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
             AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, pointer)
         }
 
-        guard status == noErr else { return nil }
+        guard status == noErr,
+              let uid = value?.takeUnretainedValue() as String?
+        else {
+            throw AudioDeviceProviderError.coreAudio(
+                operation: .queryDeviceUID,
+                objectID: deviceID,
+                status: status
+            )
+        }
 
-        return value?.takeUnretainedValue() as String?
+        return uid
+    }
+
+    private func resolveDeviceID(uid: String) throws -> AudioDeviceID {
+        let deviceIDs = try allDevices()
+        var incompleteDeviceIDs: [AudioDeviceID] = []
+
+        for deviceID in deviceIDs {
+            do {
+                if try requiredDeviceUID(deviceID) == uid {
+                    return deviceID
+                }
+            } catch {
+                incompleteDeviceIDs.append(deviceID)
+            }
+        }
+
+        if !incompleteDeviceIDs.isEmpty {
+            throw AudioDeviceProviderError.targetDeviceLookupIncomplete(
+                uid: uid,
+                incompleteDeviceIDs: incompleteDeviceIDs
+            )
+        }
+
+        throw AudioDeviceProviderError.targetDeviceNotFound(uid: uid)
     }
 
     private func deviceName(_ deviceID: AudioDeviceID) -> String? {
@@ -160,20 +233,27 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         return value
     }
 
-    private func defaultInputDeviceID() -> AudioDeviceID? {
+    private func defaultInputDeviceID() throws -> AudioDeviceID? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultInputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
 
-        var deviceID = AudioDeviceID(0)
+        var deviceID = AudioDeviceID(kAudioObjectUnknown)
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
 
         let status = AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, &deviceID)
 
-        guard status == noErr else { return nil }
+        guard status == noErr else {
+            throw AudioDeviceProviderError.coreAudio(
+                operation: .queryDefaultInputDevice,
+                objectID: systemObject,
+                status: status
+            )
+        }
 
+        guard deviceID != kAudioObjectUnknown else { return nil }
         return deviceID
     }
 }
