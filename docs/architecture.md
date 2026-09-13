@@ -226,10 +226,11 @@ Self.logger.info(
 ./Tests/run.sh
 ```
 
-与 App 相同的 Core/Services 源一起编译（不含 `@main` 入口），注入 `FakeAudioDeviceProvider`（内存设备表 + 可控 setter 失败/延迟/枚举失败状态 + 调用记录）与 `RecordingNotifier`（通知计数），直接调用 `handleDefaultInputChanged()` / `handleDeviceListChanged()` 模拟 CoreAudio wake-up，`UserDefaults` 用随机命名的独立 suite 隔离。当前 51 个用例 / 247 个断言：
+与 App 相同的 Core/Services 源一起编译（不含 `@main` 入口），注入 `FakeAudioDeviceProvider`（内存设备表 + 可控 setter 失败/延迟/枚举失败状态 + 调用记录）与 `RecordingNotifier`（通知计数），直接调用 `handleDefaultInputChanged()` / `handleDeviceListChanged()` 模拟 CoreAudio wake-up，`UserDefaults` 用随机命名的独立 suite 隔离。时间敏感状态机统一依赖 `AudioMonitorScheduling`；`schedule(after:action:)` 在返回前完成 timer 登记，生产实现再用 `ContinuousClock + Task.sleep` 等待，测试则注入 `ManualAudioMonitorScheduler` 同步登记 action 并手动推进单调时间，因此多级 watchdog 不依赖 `Task.yield()` 调度时机，也不必真实等待 8/16/32/64 秒。当前 52 个用例 / 250 个断言：
 
 | 场景 | 断言要点 |
 |---|---|
+| Manual scheduler | schedule 同步登记、单次 advance 可按 deadline 执行 action 内新建的下一档 timer、cancel 同步移除待执行 action |
 | M1–M3（Manual） | 外部切换立即恢复、preferred 离线不动、MicLock 内选择立即生效且回调不误判 |
 | Programmatic transaction | origin 是事务唯一语义来源；MicLock UI 主动选择的 setter 失败不覆盖 preferred，长期 retry 也不暴露 Protection 状态；Protection restore 的 setter rejection 保留 transaction 并继续 retry，accepted retry 与 Auto protection 的真实 target confirmation 都会重新锚定 settle；`current == target` 在枚举失败时仍可确认、`sourceUID == nil` 可 supersede、stuck source 会由 watchdog 主动持续重试且跨过退避阈值后也不会被 Auto 反向学习、超过旧 1s 阈值后的晚确认仍成功 |
 | CoreAudio reconcile / A1–A4（Auto） | callback 正序/反序、属性分阶段变化与 `current ∉ devices` 矛盾采样都不会直接误学 preferred；关键 identity 查询失败保留上一份有效 topology；candidate 复用 settleSeconds 且 target 必须存在于可信 topology |

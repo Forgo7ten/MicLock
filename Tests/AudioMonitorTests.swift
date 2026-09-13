@@ -6,6 +6,7 @@ import Foundation
 
 @MainActor
 func runAllTests() async {
+    await testManualSchedulerRunsChainedTimersDeterministically()
     testM1_ManualRestore()
     testM2_PreferredOffline()
     testM3_TrustedUserSelection()
@@ -57,6 +58,36 @@ func runAllTests() async {
     testPreferencesFreshInstall()
     testPreferencesSettleClamp()
     await testRecentEventsKeepLatestTen()
+}
+
+// MARK: - Test Scheduler
+
+/// Manual scheduler 的核心契约：schedule 返回前 timer 已登记；action 内新建的下一档
+/// timer 必须能在同一次 advance 中按原 deadline 继续执行，取消也必须同步生效。
+@MainActor
+private func testManualSchedulerRunsChainedTimersDeterministically() async {
+    test("manual scheduler runs chained timers deterministically")
+
+    let scheduler = ManualAudioMonitorScheduler()
+    var events: [Int] = []
+
+    scheduler.schedule(after: .milliseconds(500)) {
+        events.append(1)
+        scheduler.schedule(after: .seconds(1)) {
+            events.append(2)
+        }
+    }
+
+    expect(events.isEmpty, "scheduling does not execute actions before time advances")
+    await scheduler.advance(by: .seconds(1.5))
+    expect(events == [1, 2], "one advance executes synchronously chained timers at 0.5s and 1.5s")
+
+    let cancelled = scheduler.schedule(after: .milliseconds(100)) {
+        events.append(3)
+    }
+    cancelled.cancel()
+    await scheduler.advance(by: .milliseconds(100))
+    expect(events == [1, 2], "cancel removes a scheduled action before it can run")
 }
 
 // MARK: - Manual Mode (§57)
@@ -217,11 +248,13 @@ private func testRestoreWaitsForRealConfirmation() {
 private func testRestoreSetterRejectionKeepsRetrying() async {
     test("restore setter rejection keeps retrying")
 
+    let scheduler = ManualAudioMonitorScheduler()
     let (monitor, provider, notifier) = makeMonitor(
         devices: [builtInMic, airpodsMic],
         current: builtInMic,
         preferred: builtInMic.uid,
-        mode: .manual
+        mode: .manual,
+        scheduler: scheduler
     )
 
     provider.forceSetFailure = true
@@ -239,7 +272,7 @@ private func testRestoreSetterRejectionKeepsRetrying() async {
     expect(notifier.presentCount == 0, "rejected restore has no notification")
 
     provider.forceSetFailure = false
-    try? await Task.sleep(for: .milliseconds(700))
+    await scheduler.advance(by: .milliseconds(500))
 
     expect(provider.setCalls.count == 2, "exactly one watchdog task performs the first retry")
     expect(monitor.currentDevice?.uid == builtInMic.uid, "later accepted retry reaches the preferred target")
@@ -256,11 +289,13 @@ private func testRestoreSetterRejectionKeepsRetrying() async {
 private func testProtectionRetryStatusTransitionsAfterSetterRejection() async {
     test("protection retry status transitions after setter rejection")
 
+    let scheduler = ManualAudioMonitorScheduler()
     let (monitor, provider, _) = makeMonitor(
         devices: [builtInMic, airpodsMic],
         current: builtInMic,
         preferred: builtInMic.uid,
-        mode: .manual
+        mode: .manual,
+        scheduler: scheduler
     )
 
     provider.applySetImmediately = false
@@ -271,13 +306,13 @@ private func testProtectionRetryStatusTransitionsAfterSetterRejection() async {
     expect(monitor.protectionRetryState == .setterRejected, "initial rejected restore exposes setterRejected")
 
     provider.forceSetFailure = false
-    try? await Task.sleep(for: .milliseconds(700))
+    await scheduler.advance(by: .milliseconds(500))
 
     expect(provider.setCalls.count == 2, "first watchdog retry is accepted but remains unconfirmed")
     expect(monitor.protectionRetryState == nil, "accepted fast retry clears stale setterRejected state")
     expect(monitor.lastError == nil, "accepted fast retry clears stale rejected-setter wording")
 
-    try? await Task.sleep(for: .seconds(7.2))
+    await scheduler.advance(by: .seconds(7))
 
     expect(provider.setCalls.count == 5, "four fast retries complete before long-backoff stage")
     expect(monitor.protectionRetryState == .awaitingConfirmation, "long unconfirmed protection retry exposes awaitingConfirmation")
@@ -524,11 +559,13 @@ private func testManualRestoresWhenEnumerationFails() {
 private func testPendingSwitchWatchdogRetriesStuckSource() async {
     test("pending switch watchdog retries stuck source")
 
+    let scheduler = ManualAudioMonitorScheduler()
     let (monitor, provider, _) = makeMonitor(
         devices: [builtInMic, airpodsMic],
         current: builtInMic,
         preferred: builtInMic.uid,
-        mode: .manual
+        mode: .manual,
+        scheduler: scheduler
     )
 
     provider.applySetImmediately = false
@@ -536,7 +573,7 @@ private func testPendingSwitchWatchdogRetriesStuckSource() async {
     monitor.handleDefaultInputChanged()
     expect(provider.setCalls == [builtInMic.uid], "initial restore requested")
 
-    try? await Task.sleep(for: .milliseconds(700))
+    await scheduler.advance(by: .milliseconds(500))
 
     expect(provider.setCalls.count >= 2, "watchdog retries while current remains source")
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "watchdog never learns source as preferred")
@@ -549,12 +586,14 @@ private func testPendingSwitchWatchdogRetriesStuckSource() async {
 private func testPendingSwitchWatchdogDoesNotLearnSourceAfterRetryThreshold() async {
     test("pending switch watchdog does not learn source after retry threshold")
 
+    let scheduler = ManualAudioMonitorScheduler()
     let (monitor, provider, notifier) = makeMonitor(
         devices: [builtInMic, usbMic],
         current: builtInMic,
         preferred: builtInMic.uid,
         mode: .auto,
-        settle: 1.0
+        settle: 1.0,
+        scheduler: scheduler
     )
 
     provider.applySetImmediately = false
@@ -571,7 +610,7 @@ private func testPendingSwitchWatchdogDoesNotLearnSourceAfterRetryThreshold() as
 
     // 0.5s + 1s + 2s + 4s = 7.5s 到达旧实现的 retry exhaustion；
     // 再越过 1s stable candidate 窗口，旧实现会在约 8.5s 把 AirPods 学成 preferred。
-    try? await Task.sleep(for: .seconds(9.5))
+    await scheduler.advance(by: .seconds(9.5))
 
     expect(provider.setCalls.count == 5, "one watchdog chain completes four fast retries, then backs off to 8s")
     expect(monitor.currentDevice?.uid == airpodsMic.uid, "provider still reports the hijacking source")
@@ -603,12 +642,14 @@ private func testPendingSwitchWatchdogDoesNotLearnSourceAfterRetryThreshold() as
 private func testProtectionRetrySuccessReopensSettleAndRebindsNotification() async {
     test("protection retry success reopens settle and rebinds notification")
 
+    let scheduler = ManualAudioMonitorScheduler()
     let (monitor, provider, notifier) = makeMonitor(
         devices: [builtInMic],
         current: builtInMic,
         preferred: builtInMic.uid,
         mode: .auto,
-        settle: 1.0
+        settle: 1.0,
+        scheduler: scheduler
     )
 
     provider.applySetImmediately = false
@@ -620,12 +661,12 @@ private func testProtectionRetrySuccessReopensSettleAndRebindsNotification() asy
     expect(notifier.presentCount == 0, "pending restore has not notified")
 
     // 让最初 episode 结束，并让第一个 watchdog retry 仍保持未确认。
-    try? await Task.sleep(for: .seconds(1.7))
+    await scheduler.advance(by: .seconds(1.5))
     expect(provider.setCalls.count == 3, "watchdog has retried at 0.5s and 1.5s")
 
     // 下一档 2s retry 改为同步生效：accepted retry 应在确认前重新开启 settle。
     provider.applySetImmediately = true
-    try? await Task.sleep(for: .seconds(2.2))
+    await scheduler.advance(by: .seconds(2))
 
     expect(monitor.currentDevice?.uid == builtInMic.uid, "later accepted retry reaches preferred")
     expect(monitor.recentAudioEvents.first?.kind == .restored(.automaticHijack), "retry confirmation keeps original restore semantics")
@@ -653,12 +694,14 @@ private func testProtectionRetrySuccessReopensSettleAndRebindsNotification() asy
 private func testDelayedProtectionConfirmationReopensSettleAndRebindsNotification() async {
     test("delayed protection confirmation reopens settle and rebinds notification")
 
+    let scheduler = ManualAudioMonitorScheduler()
     let (monitor, provider, notifier) = makeMonitor(
         devices: [builtInMic],
         current: builtInMic,
         preferred: builtInMic.uid,
         mode: .auto,
-        settle: 1.0
+        settle: 1.0,
+        scheduler: scheduler
     )
 
     provider.applySetImmediately = false
@@ -670,12 +713,12 @@ private func testDelayedProtectionConfirmationReopensSettleAndRebindsNotificatio
 
     // 最近一次 watchdog retry 被拒绝，因此它不会延长 settle。
     provider.forceSetFailure = true
-    try? await Task.sleep(for: .milliseconds(700))
+    await scheduler.advance(by: .milliseconds(700))
     expect(provider.setCalls.count == 2, "first watchdog retry is rejected")
     expect(monitor.protectionRetryState == .setterRejected, "rejected retry is visible while transaction remains pending")
 
     // 越过初始 1s settle，但保持在下一档 1s watchdog（约 t=1.5s）之前。
-    try? await Task.sleep(for: .milliseconds(500))
+    await scheduler.advance(by: .milliseconds(500))
 
     // 模拟最初 accepted 的 CoreAudio 请求现在才真正生效。
     provider.current = builtInMic
@@ -706,12 +749,14 @@ private func testDelayedProtectionConfirmationReopensSettleAndRebindsNotificatio
 private func testTrustedSelectionRetryNeverExposesProtectionState() async {
     test("trusted selection retry never exposes protection state")
 
+    let scheduler = ManualAudioMonitorScheduler()
     let (monitor, provider, _) = makeMonitor(
         devices: [builtInMic, usbMic],
         current: builtInMic,
         preferred: builtInMic.uid,
         mode: .auto,
-        protection: false
+        protection: false,
+        scheduler: scheduler
     )
 
     provider.applySetImmediately = false
@@ -720,7 +765,7 @@ private func testTrustedSelectionRetryNeverExposesProtectionState() async {
     expect(monitor.preferredMicrophoneUID == usbMic.uid, "trusted selection commits preferred after accepted setter")
     expect(monitor.protectionRetryState == nil, "trusted selection never starts protection retry UI")
 
-    try? await Task.sleep(for: .seconds(7.7))
+    await scheduler.advance(by: .seconds(7.5))
 
     expect(provider.setCalls.count == 5, "trusted selection shares the same four fast watchdog retries")
     expect(monitor.protectionRetryState == nil, "long trusted selection retry still has no protection state")
@@ -1356,6 +1401,8 @@ private func testStartupEnforce() {
 private func testStartupEnumerationFailureRecoversWithoutExternalCallback() async {
     test("startup enumeration failure recovers without external callback")
 
+    let scheduler = ManualAudioMonitorScheduler()
+
     let suite = "MicLockTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
     defaults.removePersistentDomain(forName: suite)
@@ -1374,7 +1421,8 @@ private func testStartupEnumerationFailureRecoversWithoutExternalCallback() asyn
     let monitor = AudioMonitor(
         provider: provider,
         preferences: Preferences(defaults: defaults),
-        notifier: notifier
+        notifier: notifier,
+        scheduler: scheduler
     )
 
     expect(monitor.devices.isEmpty, "failed init enumeration does not invent an empty trusted topology")
@@ -1385,7 +1433,7 @@ private func testStartupEnumerationFailureRecoversWithoutExternalCallback() asyn
     provider.listInputDevicesError = nil
     monitor.evaluateStartupPolicy()
 
-    try? await Task.sleep(for: .milliseconds(700))
+    await scheduler.advance(by: .milliseconds(250))
 
     expect(monitor.deviceEnumerationError == nil, "startup recovery clears the enumeration error")
     expect(
@@ -1404,6 +1452,8 @@ private func testStartupEnumerationFailureRecoversWithoutExternalCallback() asyn
 private func testFreshInstallEnumerationFailurePrefersBuiltInOverCurrent() async {
     test("fresh install enumeration failure prefers built-in over current")
 
+    let scheduler = ManualAudioMonitorScheduler()
+
     let suite = "MicLockTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
     defaults.removePersistentDomain(forName: suite)
@@ -1418,14 +1468,15 @@ private func testFreshInstallEnumerationFailurePrefersBuiltInOverCurrent() async
     let monitor = AudioMonitor(
         provider: provider,
         preferences: Preferences(defaults: defaults),
-        notifier: RecordingNotifier()
+        notifier: RecordingNotifier(),
+        scheduler: scheduler
     )
 
     expect(monitor.preferredMicrophoneUID == nil, "untrusted init snapshot does not persist AirPods as first-run preferred")
 
     provider.listInputDevicesError = nil
     monitor.evaluateStartupPolicy()
-    try? await Task.sleep(for: .milliseconds(700))
+    await scheduler.advance(by: .milliseconds(250))
 
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "trusted recovery baseline initializes BuiltIn preferred")
     expect(defaults.string(forKey: Preferences.preferredMicrophoneUIDKey) == builtInMic.uid, "recovered first-run preferred is persisted")
@@ -1436,6 +1487,8 @@ private func testFreshInstallEnumerationFailurePrefersBuiltInOverCurrent() async
 @MainActor
 private func testFreshInstallEnumerationFailureWithNilCurrentPrefersBuiltIn() async {
     test("fresh install enumeration failure with nil current prefers built-in")
+
+    let scheduler = ManualAudioMonitorScheduler()
 
     let suite = "MicLockTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
@@ -1451,7 +1504,8 @@ private func testFreshInstallEnumerationFailureWithNilCurrentPrefersBuiltIn() as
     let monitor = AudioMonitor(
         provider: provider,
         preferences: Preferences(defaults: defaults),
-        notifier: RecordingNotifier()
+        notifier: RecordingNotifier(),
+        scheduler: scheduler
     )
 
     expect(monitor.preferredMicrophoneUID == nil, "failed init with nil current leaves preferred undecided")
@@ -1459,7 +1513,7 @@ private func testFreshInstallEnumerationFailureWithNilCurrentPrefersBuiltIn() as
     provider.listInputDevicesError = nil
     provider.current = airpodsMic
     monitor.evaluateStartupPolicy()
-    try? await Task.sleep(for: .milliseconds(700))
+    await scheduler.advance(by: .milliseconds(250))
 
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "trusted recovery baseline initializes BuiltIn even after nil init current")
 }

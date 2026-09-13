@@ -3,6 +3,60 @@ import CoreAudio
 import OSLog
 import Observation
 
+/// AudioMonitor 的单调时钟 / 延迟调度抽象。
+/// timer 必须在 `schedule` 返回前完成登记；这样测试时钟可以确定性推进多级 watchdog，
+/// 不依赖新建 Task 何时获得执行机会。
+@MainActor
+protocol AudioMonitorScheduledTask: AnyObject {
+    func cancel()
+}
+
+@MainActor
+protocol AudioMonitorScheduling: AnyObject {
+    var now: ContinuousClock.Instant { get }
+
+    @discardableResult
+    func schedule(
+        after delay: Duration,
+        action: @escaping @MainActor () -> Void
+    ) -> AudioMonitorScheduledTask
+}
+
+@MainActor
+final class ContinuousAudioMonitorScheduler: AudioMonitorScheduling {
+    private let clock = ContinuousClock()
+
+    var now: ContinuousClock.Instant {
+        clock.now
+    }
+
+    @discardableResult
+    func schedule(
+        after delay: Duration,
+        action: @escaping @MainActor () -> Void
+    ) -> AudioMonitorScheduledTask {
+        let token = ContinuousScheduledTask()
+        token.task = Task { @MainActor in
+            if delay > .zero {
+                try? await Task.sleep(for: delay)
+            }
+            guard !Task.isCancelled else { return }
+            action()
+        }
+        return token
+    }
+
+    @MainActor
+    private final class ContinuousScheduledTask: AudioMonitorScheduledTask {
+        var task: Task<Void, Never>?
+
+        func cancel() {
+            task?.cancel()
+            task = nil
+        }
+    }
+}
+
 /// 麦克风保护状态机（Auto / Manual）。
 ///
 /// 职责：设备拓扑 settle window、self-induced 回调识别、
@@ -153,11 +207,11 @@ final class AudioMonitor {
     private let provider: AudioDeviceProviding
     private let preferences: Preferences
     private let notifier: NotificationPresenting
+    private let scheduler: AudioMonitorScheduling
 
     // MARK: - Settle State Machine
 
-    /// 时间间隔判断使用 monotonic clock。
-    private let clock = ContinuousClock()
+    /// 时间判断和延迟任务共用同一个 monotonic scheduler，避免状态机出现双时钟。
 
     private struct SettleEpisode {
         let id: UInt64
@@ -172,10 +226,10 @@ final class AudioMonitor {
         case settling(SettleEpisode)
     }
 
-    /// Auto Mode 的稳定性状态是策略事实来源；Task 只负责唤醒，不承载业务状态。
+    /// Auto Mode 的稳定性状态是策略事实来源；scheduler timer 只负责唤醒，不承载业务状态。
     @ObservationIgnored private var stabilityState: StabilityState = .stable
     @ObservationIgnored private var nextSettleEpisodeID: UInt64 = 0
-    @ObservationIgnored private var settleTask: Task<Void, Never>?
+    @ObservationIgnored private var settleTask: AudioMonitorScheduledTask?
 
     @ObservationIgnored private var connectedUIDs: Set<String> = []
 
@@ -193,10 +247,10 @@ final class AudioMonitor {
 
     @ObservationIgnored private var stableExternalSwitchCandidate: StableExternalSwitchCandidate?
     @ObservationIgnored private var nextStableExternalSwitchCandidateID: UInt64 = 0
-    @ObservationIgnored private var stableExternalSwitchCandidateTask: Task<Void, Never>?
+    @ObservationIgnored private var stableExternalSwitchCandidateTask: AudioMonitorScheduledTask?
 
     /// CoreAudio topology 采样失败/矛盾时主动重试；与 settle / switch confirmation 独立。
-    @ObservationIgnored private var topologyRecoveryTask: Task<Void, Never>?
+    @ObservationIgnored private var topologyRecoveryTask: AudioMonitorScheduledTask?
     @ObservationIgnored private var topologyRecoveryAttempt = 0
     /// 初始化阶段设备枚举失败后，第一份可信 topology 必须作为启动基线处理，
     /// 不能把“从空缓存恢复”为普通设备接入事件，也不能丢失 startup restore 语义。
@@ -237,7 +291,7 @@ final class AudioMonitor {
 
     /// MicLock 自己发起的切换事务；目标、解释事件与通知必须原子地属于同一笔事务。
     @ObservationIgnored private var programmaticSwitchState: ProgrammaticSwitchState = .idle
-    @ObservationIgnored private var programmaticSwitchWatchdogTask: Task<Void, Never>?
+    @ObservationIgnored private var programmaticSwitchWatchdogTask: AudioMonitorScheduledTask?
 
     @ObservationIgnored private var nextProgrammaticSwitchID: UInt64 = 0
 
@@ -364,11 +418,13 @@ final class AudioMonitor {
     init(
         provider: AudioDeviceProviding,
         preferences: Preferences,
-        notifier: NotificationPresenting
+        notifier: NotificationPresenting,
+        scheduler: AudioMonitorScheduling? = nil
     ) {
         self.provider = provider
         self.preferences = preferences
         self.notifier = notifier
+        self.scheduler = scheduler ?? ContinuousAudioMonitorScheduler()
 
         preferredMicrophoneUID = preferences.preferredMicrophoneUID
         protectionEnabled = preferences.protectionEnabled
@@ -812,9 +868,8 @@ final class AudioMonitor {
             ? .startupRecovery
             : .topologyRecovery
         topologyRecoveryAttempt += 1
-        topologyRecoveryTask = Task { [weak self] in
-            try? await Task.sleep(for: delay)
-            guard !Task.isCancelled, let self else { return }
+        topologyRecoveryTask = scheduler.schedule(after: delay) { [weak self] in
+            guard let self else { return }
             self.topologyRecoveryTask = nil
             self.reconcileCoreAudioState(trigger: trigger)
         }
@@ -845,7 +900,7 @@ final class AudioMonitor {
         cancelStableExternalSwitchCandidate()
 
         nextStableExternalSwitchCandidateID &+= 1
-        let now = clock.now
+        let now = scheduler.now
         let candidate = StableExternalSwitchCandidate(
             id: nextStableExternalSwitchCandidateID,
             oldPreferredUID: preferred.uid,
@@ -871,13 +926,9 @@ final class AudioMonitor {
         _ candidate: StableExternalSwitchCandidate
     ) {
         stableExternalSwitchCandidateTask?.cancel()
-        let delay = clock.now.duration(to: candidate.deadline)
-
-        stableExternalSwitchCandidateTask = Task { [weak self] in
-            if delay > .zero {
-                try? await Task.sleep(for: delay)
-            }
-            guard !Task.isCancelled, let self else { return }
+        let delay = scheduler.now.duration(to: candidate.deadline)
+        stableExternalSwitchCandidateTask = scheduler.schedule(after: delay) { [weak self] in
+            guard let self else { return }
 
             // 标记本次 timer 已消费；如果此次确认因无效 topology sample 无法完成，
             // 后续同 candidate 的 wake-up 可以重新安排一次确认。
@@ -1102,9 +1153,8 @@ final class AudioMonitor {
         let index = min(pending.retryAttempt, Self.programmaticSwitchRetryDelays.count - 1)
         let delay = Self.programmaticSwitchRetryDelays[index]
         let transactionID = pending.id
-        programmaticSwitchWatchdogTask = Task { [weak self] in
-            try? await Task.sleep(for: delay)
-            guard !Task.isCancelled, let self else { return }
+        programmaticSwitchWatchdogTask = scheduler.schedule(after: delay) { [weak self] in
+            guard let self else { return }
             guard case .awaitingConfirmation(let currentPending) = self.programmaticSwitchState,
                   currentPending.id == transactionID
             else { return }
@@ -1291,7 +1341,7 @@ final class AudioMonitor {
             return true
 
         case .settling(let episode):
-            guard clock.now >= episode.deadline else { return false }
+            guard scheduler.now >= episode.deadline else { return false }
             finishSettleEpisode(id: episode.id, revision: episode.revision)
             return true
         }
@@ -1300,7 +1350,7 @@ final class AudioMonitor {
     /// 真实拓扑变化或一次 corrective restore 都会使拓扑进入/继续 settling。
     /// 已存在 episode 时只延长同一 episode，保留 notificationSent。
     private func markTopologyUnsettled() {
-        let now = clock.now
+        let now = scheduler.now
         let deadline = now.advanced(by: .seconds(settleSeconds))
         let episode: SettleEpisode
 
@@ -1340,7 +1390,7 @@ final class AudioMonitor {
         episode.revision &+= 1
         episode.deadline = episode.lastActivity.advanced(by: .seconds(settleSeconds))
 
-        if clock.now >= episode.deadline {
+        if scheduler.now >= episode.deadline {
             stabilityState = .settling(episode)
             finishSettleEpisode(id: episode.id, revision: episode.revision)
             return
@@ -1357,13 +1407,9 @@ final class AudioMonitor {
     private func scheduleSettleTask(for episode: SettleEpisode) {
         settleTask?.cancel()
 
-        let delay = clock.now.duration(to: episode.deadline)
-        settleTask = Task { [weak self] in
+        let delay = scheduler.now.duration(to: episode.deadline)
+        settleTask = scheduler.schedule(after: delay) { [weak self] in
             guard let self else { return }
-            if delay > .zero {
-                try? await Task.sleep(for: delay)
-            }
-            guard !Task.isCancelled else { return }
             self.finishSettleEpisode(id: episode.id, revision: episode.revision)
         }
     }
@@ -1372,7 +1418,7 @@ final class AudioMonitor {
         guard case .settling(let episode) = stabilityState,
               episode.id == id,
               episode.revision == revision,
-              clock.now >= episode.deadline
+              scheduler.now >= episode.deadline
         else { return }
 
         stabilityState = .stable
