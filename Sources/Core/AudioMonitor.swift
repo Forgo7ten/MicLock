@@ -518,10 +518,13 @@ final class AudioMonitor {
                 restorePreferred(from: current, to: preferred, reason: .automaticHijack)
             } else {
                 // 设备已稳定 + 非 self-induced → 用户主动切换，接受。
+                // Recent Event 的 from 取旧 preferred，而不是缓存的 previous current：
+                // CoreAudio 的 devices callback 可能先刷新 currentDevice，再到 default callback；
+                // 此时 previous 已经是新设备，但 preferred 仍准确代表策略迁移前的设备。
                 preferredMicrophoneUID = current.uid
                 recordRecentAudioEvent(RecentAudioEvent(
                     kind: .acceptedUserSwitch,
-                    fromDeviceName: previous?.name,
+                    fromDeviceName: preferred.name,
                     toDeviceName: current.name,
                     occurredAt: Date()
                 ))

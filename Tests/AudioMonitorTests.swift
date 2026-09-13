@@ -15,6 +15,7 @@ func runAllTests() async {
     testIntermediateCallbackWhileExpectedDoesNotRestoreAgain()
     testA1_NewDeviceHijack()
     testA2_SettledUserSwitch()
+    testA2_RecentEventUsesOldPreferredAfterNoDeltaDeviceCallback()
     testA3_ManualSwitchInsideSettleWindow()
     await testA4_NewDeviceSettlesThenAccepted()
     testBurst()
@@ -259,6 +260,31 @@ private func testA2_SettledUserSwitch() {
     expect(monitor.preferredMicrophoneUID == usbMic.uid, "preferred learned = USB")
     expect(notifier.presentCount == 0, "no notification on accept")
     expect(monitor.recentAudioEvents.first?.kind == .acceptedUserSwitch, "recent event explains accepted switch")
+    expect(monitor.recentAudioEvents.first?.fromDeviceName == builtInMic.name, "accepted switch event starts from old preferred")
+}
+
+/// A2 回归：devices callback 可能先刷新 current；Recent Event 仍应从旧 preferred 解释迁移。
+@MainActor
+private func testA2_RecentEventUsesOldPreferredAfterNoDeltaDeviceCallback() {
+    test("A2 recent event uses old preferred after no-delta devices callback")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto
+    )
+
+    // 外部切到 USB 后，CoreAudio 先送一个 devices callback；设备集合没有变化，
+    // 但 handleDeviceListChanged 会刷新 currentDevice。
+    provider.current = usbMic
+    monitor.handleDeviceListChanged()
+    monitor.handleDefaultInputChanged()
+
+    let event = monitor.recentAudioEvents.first
+    expect(event?.kind == .acceptedUserSwitch, "accepted switch event is recorded")
+    expect(event?.fromDeviceName == builtInMic.name, "event source remains old preferred")
+    expect(event?.toDeviceName == usbMic.name, "event target is new current device")
 }
 
 /// A3：settle window 内的外部切换 → 按启发式恢复（预期行为，非 bug）。

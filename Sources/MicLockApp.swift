@@ -312,13 +312,13 @@ struct MenuBarView: View {
                     Divider()
 
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Recent Events")
+                        Text("最近事件")
                             .font(.headline)
 
                         ForEach(Array(monitor.recentAudioEvents.prefix(5).enumerated()), id: \.element.id) { index, event in
                             VStack(alignment: .leading, spacing: 2) {
                                 HStack(spacing: 6) {
-                                    Text(index == 0 ? "Last Action" : event.titleText)
+                                    Text(index == 0 ? "最近操作 · \(event.titleText)" : event.titleText)
                                         .font(.subheadline)
                                         .fontWeight(index == 0 ? .semibold : .regular)
 
