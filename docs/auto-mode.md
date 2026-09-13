@@ -42,32 +42,33 @@ flowchart LR
 
 ## CoreAudio 统一收敛流程
 
-`kAudioHardwarePropertyDevices` 与 `kAudioHardwarePropertyDefaultInputDevice` 是两个独立属性，MicLock **不依赖两个 listener 的跨属性投递顺序**。两个 listener 都只作为 wake-up 信号，统一进入 `reconcileCoreAudioState()`；每次都重新读取同一轮完整 snapshot：
+`kAudioHardwarePropertyDevices` 与 `kAudioHardwarePropertyDefaultInputDevice` 是两个独立属性，MicLock **不依赖两个 listener 的跨属性投递顺序**。两个 listener 都只作为 wake-up 信号，统一进入 `reconcileCoreAudioState()`；每次都会重新读取 devices 与 current，但这只是一次一致化采样，**不是 CoreAudio 提供的原子 snapshot 保证**。HAL 仍可能先改变 DefaultInput、稍后才更新 Devices。
 
 ```swift
-newDevices = provider.listInputDevices()
 newCurrent = provider.currentInputDevice()
+newDevices = try provider.listInputDevices()
 ```
 
-随后固定按以下顺序处理：
+只有设备枚举成功时，本轮 snapshot 才可用于 topology/policy：枚举失败会保留上一份有效 `devices / connectedUIDs`，只更新可独立读取的 `currentDevice`，避免把瞬时 HAL 错误当成“真实空设备列表”。枚举成功后固定按以下顺序处理：
 
 1. 用 `newDevices` 与 `connectedUIDs` 求 topology delta；有真实 delta 时先进入/延长 `settling`
 2. 更新 `devices / connectedUIDs / currentDevice`
 3. 处理 `PendingSwitch` 的确认、取消或 supersede
 4. 最后运行 Auto / Manual policy
 
-因此无论系统先投递 Devices callback 还是 DefaultInput callback，第一次 wake-up 都能看到当时 CoreAudio 的完整真实状态：新设备抢麦不会因为 Default callback 先到而被误学为 preferred；preferred 被拔出时也会先识别它已经离线，再决定是否处理系统 fallback。
+对于 **Auto + stable + 外部 default 变化**，即使本轮 `devices` 暂时仍显示旧 preferred 在线，也不会立刻学习新的 preferred，而是建立短暂的 `StableExternalSwitchCandidate`。`currentDevice` 会立即更新供 UI 展示；若随后出现 topology delta，candidate 立即取消并按 topology 事实处理；若短暂分类窗口内 topology 始终不变且 current 仍保持 candidate 目标，才确认这是 stable external switch 并学习新的 preferred。这个 candidate 只延迟“学习 preferred”，不会延迟 corrective restore。
 
 ```mermaid
 flowchart TD
-    A["Devices 或 DefaultInput callback"] --> B["读取 devices + current 完整 snapshot"]
-    B --> C["先计算并应用 topology delta"]
+    A["Devices 或 DefaultInput callback"] --> B["读取 current + 尝试枚举 devices"]
+    B -->|枚举失败| B1["仅更新 current；保留上次有效 topology；本轮停止 policy"]
+    B -->|枚举成功| C["先计算并应用 topology delta"]
     C --> D["再更新真实 current"]
     D --> E{"存在 PendingSwitch？"}
     E -->|target 已成为 current| E1["确认事务：提交 Recent Event / 通知"]
     E -->|target 已离线| E2["失败旧事务，继续 policy"]
-    E -->|current 既非 source 也非 target| E3["外部事实 supersede 旧事务，继续 policy"]
-    E -->|仍是 source| E4["继续等待，不重复 setter"]
+    E -->|仍是明确 source| E4["继续等待，不重复 setter"]
+    E -->|其他非 target current| E3["外部事实 supersede 旧事务，继续 policy"]
     E -->|否| F{"保护开启？"}
     E2 --> F
     E3 --> F
@@ -79,12 +80,12 @@ flowchart TD
     G -->|在线且 current != preferred| H{"模式"}
     H -->|manual| R[立即发起 restore transaction]
     H -->|auto + settling| R
-    H -->|auto + stable| U[接受外部切换并学习 preferred]
+    H -->|auto + stable| U[建立 / 确认 StableExternalSwitchCandidate]
 ```
 
 这里有三个关键约束：
 
-- **完整 snapshot 优先**：callback 只表示“值得重新检查”，策略不把某一个 listener 的局部状态当作事实。
+- **有效采样优先**：callback 只表示“值得重新检查”；devices/current 的联合读取不是原子事务，枚举失败或分阶段属性变化都不能被当成完整 topology 事实。
 - **程序化事务优先**：MicLock 自己的写入回声必须在 Auto/Manual 判定之前吸收，否则会形成 setter 循环。
 - **保护关闭不学习**：关闭保护期间的临时系统选择不会悄悄覆盖 preferred。
 
@@ -153,13 +154,14 @@ awaitingConfirmation(PendingSwitch)
 
 `setInputDevice()` 返回成功只表示 CoreAudio 接受了写请求，不代表默认输入已经真实变化。HAL 也没有给出“必须在 1 秒或任何固定秒数内完成”的正确性保证，因此 PendingSwitch 不再设置 confirmation timeout。
 
-后续每次完整 snapshot 用事实推进事务：
+后续每次**有效 topology snapshot** 用事实推进事务：
 
 1. `current.uid == targetUID`：确认成功，提交 Recent Event，并在满足通知条件时投递通知
-2. `targetUID` 已不在在线设备集合中：目标已明确不可达，事务失败并继续对当前 snapshot 运行 policy
-3. `current` 既不是 `sourceUID` 也不是 `targetUID`：出现了更新的外部事实，旧事务被 supersede，随后用当前 snapshot 重新跑 policy
-4. `current` 仍是 `sourceUID`：没有足够证据判断失败，继续等待后续 CoreAudio wake-up，不重复 setter
-5. 模式切换、保护关闭或新的 Trusted User Action：属于明确的新用户意图，直接取消/取代旧事务
+2. `targetUID` 已不在成功枚举得到的在线设备集合中：目标已明确不可达，事务失败并继续运行 policy
+3. `sourceUID != nil && current.uid == sourceUID`：仍停留在明确 source，没有足够证据判断失败，继续等待且不重复 setter
+4. 其余非 target current：出现了更新的外部事实，旧事务被 supersede，随后重新运行 policy；特别地，`sourceUID == nil` 时任何实际出现的非 target current 都属于这种新事实
+5. 设备枚举失败：本轮不使用 topology 推进事务，保留上一份有效 topology，等待后续 wake-up
+6. 模式切换、保护关闭或新的 Trusted User Action：属于明确的新用户意图，直接取消/取代旧事务
 
 因此仅仅经过 1.2 秒、5 秒甚至更久都不会产生“Unable to confirm”的伪失败；只要之后 HAL 真实切到 target，仍会正常确认并记录事件/通知。
 

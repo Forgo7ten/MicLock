@@ -86,9 +86,11 @@ CoreAudio 的 `AudioDeviceID` 是运行时数值，重启或重插后会变；`k
 | `kAudioHardwarePropertyDevices`（设备拓扑） | `handleDeviceListChanged()`：只作为 wake-up，进入统一 `reconcileCoreAudioState()` |
 | `kAudioHardwarePropertyDefaultInputDevice`（默认输入） | `handleDefaultInputChanged()`：只作为 wake-up，进入统一 `reconcileCoreAudioState()` |
 
-每次 reconcile 都重新读取完整的设备列表 + 默认输入 snapshot，并严格先处理 topology delta，再更新 current，最后才处理 pending transaction 与 Auto / Manual policy。这样不依赖两个独立 CoreAudio property listener 的跨属性投递顺序；burst / 重复 callback 通过 snapshot 差集与状态机保持幂等。
+每次 reconcile 都重新读取默认输入并尝试枚举设备列表，但这不是 HAL 提供的原子 snapshot：DefaultInput 与 Devices 两个属性本身仍可能分阶段收敛。只有设备枚举成功时才更新 `devices / connectedUIDs` 并运行 topology/policy；枚举失败时保留上一份有效 topology，只更新可独立读取的 `currentDevice`。burst / 重复 callback 通过差集与状态机保持幂等。
 
-**self-induced 回声**：MicLock 自己 set `DefaultInputDevice` 同样会触发监听。现在用 `ProgrammaticSwitchState.awaitingConfirmation(PendingSwitch)` 原子保存 transaction ID、source UID、目标 UID、待提交 Recent Event 与通知。只有重新读取到真实 `currentDevice.uid == targetUID` 才确认成功；仍停留 source 时继续等待且不重复 setter；target 离线或出现第三个 current 时由可观察事实结束/取代旧事务。新事务会整体 supersede 旧事务，因此不同操作之间不会出现 source / target / event / notification 串线。
+**stable external switch candidate**：Auto + stable 下的外部 default 变化不会立刻覆盖 preferred，而是建立一个短暂 candidate。UI 的 `currentDevice` 立即更新；若随后出现 topology delta，candidate 取消并按 topology 事实处理；只有分类窗口内 topology 不变且 current 仍为 candidate 目标时才学习新的 preferred。它只延迟 preferred 学习，不延迟 corrective restore。
+
+**self-induced 回声**：MicLock 自己 set `DefaultInputDevice` 同样会触发监听。现在用 `ProgrammaticSwitchState.awaitingConfirmation(PendingSwitch)` 原子保存 transaction ID、source UID、目标 UID、待提交 Recent Event 与通知。只有重新读取到真实 `currentDevice.uid == targetUID` 才确认成功；若 `sourceUID != nil` 且 current 仍等于 source 才继续等待；`sourceUID == nil` 时任何实际出现的非 target current 都会 supersede 旧事务并继续 policy。新事务会整体 supersede 旧事务，因此不同操作之间不会出现 source / target / event / notification 串线。
 
 **Auto 稳定性**：`StabilityState` 与程序化切换事务正交存在，仅有 `stable` / `settling(SettleEpisode)` 两态。每个 episode 保存唯一 ID、revision、`lastActivity`、deadline 与通知去重状态；timer 醒来必须同时匹配 episode ID + revision + deadline 才能把状态变成 stable。详见 [auto-mode.md](auto-mode.md)。
 
@@ -116,7 +118,12 @@ sequenceDiagram
             HAL--)AM: 等待后续 CoreAudio wake-up，不按固定时间宣告失败
         end
     else auto=stable
-        AM->>AM: 接受外部切换，学习 preferred = current
+        AM->>AM: 建立 StableExternalSwitchCandidate
+        alt 随后出现 topology delta
+            AM->>AM: 取消 candidate，按 topology 事实处理
+        else 分类窗口内 topology 不变且 current 未变
+            AM->>AM: 确认 candidate，学习 preferred = current
+        end
     end
 ```
 
@@ -136,7 +143,7 @@ Manual 抢麦恢复、Auto 抢麦恢复、重连恢复、启动对齐全部走 `
 1. 创建一笔 `PendingSwitch`，原子保存 transaction ID、source UID、目标 UID、Recent Event draft 与本次通知 draft
 2. `provider.setInputDevice(preferred.uid)`——恢复路径统一只写 `DefaultInputDevice`；用户在 MicLock 中主动选择设备时由 `selectDevice(_:)` 发起同类程序化事务
 3. setter 立即失败：只失败当前 transaction，记录 `lastError`，不提交成功事件/通知
-4. setter 被接受：延长当前 settle episode，重新读取真实 `currentDevice`；若已经达到 target 则确认，否则保持 pending，等待后续完整 snapshot
+4. setter 被接受：延长当前 settle episode，重新读取真实 `currentDevice`；若已经达到 target 则确认，否则保持 pending，等待后续有效 topology snapshot
 5. 后续 snapshot 中 target 命中则确认；target 离线则明确失败；current 变成 source/target 之外的第三状态则旧事务被 supersede 并重新运行 policy
 6. 确认时原子提交 Recent Event，并按创建通知时携带的 episode ID 做去重后投递通知
 
@@ -218,13 +225,13 @@ Self.logger.info(
 ./Tests/run.sh
 ```
 
-与 App 相同的 Core/Services 源一起编译（不含 `@main` 入口），注入 `FakeAudioDeviceProvider`（内存设备表 + 可控 setter 失败/延迟状态 + 调用记录）与 `RecordingNotifier`（通知计数），直接调用 `handleDefaultInputChanged()` / `handleDeviceListChanged()` 模拟 CoreAudio wake-up，`UserDefaults` 用随机命名的独立 suite 隔离。当前 32 个用例 / 127 个断言：
+与 App 相同的 Core/Services 源一起编译（不含 `@main` 入口），注入 `FakeAudioDeviceProvider`（内存设备表 + 可控 setter 失败/延迟/枚举失败状态 + 调用记录）与 `RecordingNotifier`（通知计数），直接调用 `handleDefaultInputChanged()` / `handleDeviceListChanged()` 模拟 CoreAudio wake-up，`UserDefaults` 用随机命名的独立 suite 隔离。当前 35 个用例 / 150 个断言：
 
 | 场景 | 断言要点 |
 |---|---|
 | M1–M3（Manual） | 外部切换立即恢复、preferred 离线不动、MicLock 内选择立即生效且回调不误判 |
-| Programmatic transaction | setter 失败不覆盖 preferred、异步确认前不通知/不写 Recent Event、中间 callback 不重复 setter、模式切换原子 supersede、超过旧 1s 阈值后的晚确认仍成功 |
-| CoreAudio reconcile / A1–A4（Auto） | Devices/Default callback 正序与反序都先应用完整 topology snapshot；新设备抢麦立即恢复、preferred 拔出保留 UID、stable 后切换才被学习 |
+| Programmatic transaction | setter 失败不覆盖 preferred、异步确认前不通知/不写 Recent Event、中间 callback 不重复 setter、模式切换原子 supersede、`sourceUID == nil` 的非 target current 能 supersede、超过旧 1s 阈值后的晚确认仍成功 |
+| CoreAudio reconcile / A1–A4（Auto） | callback 正序/反序与属性分阶段变化都不会误学 fallback；枚举失败保留上一份有效 topology；新设备抢麦立即恢复、preferred 拔出保留 UID、stable 外部切换经短暂 candidate 后才学习 |
 | Recent Events | accepted switch 来源取旧 preferred、失败动作不记录、历史最多十条且最新优先 |
 | Stability / notification episode | burst 下 setter 不循环、episode 最多实际发送一条通知、关闭通知的 confirmation 不消耗额度、修改 settleSeconds 后旧 timer 不得提前结束 episode |
 | 重连 | preferred 断开保留 UID、同 UID 复现自动恢复、系统已自动恢复时不重复 setter |
