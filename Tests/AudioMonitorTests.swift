@@ -14,6 +14,7 @@ func runAllTests() async {
     testRestoreWaitsForRealConfirmation()
     await testDelayedConfirmationBeyondLegacyTimeoutSucceeds()
     testPendingSwitchFailsWhenTargetDisappears()
+    testPendingSwitchFailsWhenTargetDisappearsAndCurrentIsNil()
     testPendingRestoreIsAtomicallySupersededByModeChange()
     testIntermediateCallbackWhileExpectedDoesNotRestoreAgain()
     testA1_NewDeviceHijack()
@@ -253,6 +254,34 @@ private func testPendingSwitchFailsWhenTargetDisappears() {
     expect(monitor.lastError == "Target input device is no longer available", "target disappearance fails pending transaction")
     expect(monitor.recentAudioEvents.isEmpty, "failed pending transaction has no success event")
     expect(notifier.presentCount == 0, "failed pending transaction has no notification")
+}
+
+/// target 与 current 同时消失时，也必须先用 topology 事实结束 pending；
+/// 不能因为 current == nil 提前 return 而留下悬挂事务。
+@MainActor
+private func testPendingSwitchFailsWhenTargetDisappearsAndCurrentIsNil() {
+    test("pending switch fails when target disappears and current is nil")
+
+    let (monitor, provider, notifier) = makeMonitor(
+        devices: [builtInMic, airpodsMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual
+    )
+
+    provider.applySetImmediately = false
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    provider.devices = []
+    provider.current = nil
+    monitor.handleDeviceListChanged()
+
+    expect(monitor.currentDevice == nil, "full snapshot records no current input")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "preferred UID remains preserved")
+    expect(monitor.lastError == "Target input device is no longer available", "target disappearance resolves pending even without current")
+    expect(monitor.recentAudioEvents.isEmpty, "no false success event when all devices disappear")
+    expect(notifier.presentCount == 0, "no notification when pending target disappears")
 }
 
 /// 新事务必须原子取代旧事务：Auto 恢复未确认时切到 Manual，

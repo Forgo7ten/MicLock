@@ -479,11 +479,26 @@ final class AudioMonitor {
 
         // 2. 使用同一份 CoreAudio snapshot 更新真实 current。
         currentDevice = newCurrent
+
+        // target 是否仍在线不依赖 current 存在；即使所有输入设备都消失，
+        // 也要先用这个明确事实结束不可达的 pending transaction。
+        if case .awaitingConfirmation(let pending) = programmaticSwitchState,
+           !connectedUIDs.contains(pending.targetUID)
+        {
+            failProgrammaticSwitch(
+                id: pending.id,
+                error: "Target input device is no longer available"
+            )
+            Self.logger.error(
+                "PROGRAMMATIC_SWITCH target disappeared id=\(pending.id, privacy: .public) uid=\(pending.targetUID, privacy: .public)"
+            )
+        }
+
         guard let current = currentDevice else { return }
 
         // 3. MicLock 自己触发的变化优先于 Auto / Manual policy。
         // PendingSwitch 不再因为固定时间到点而失败，只根据可观察事实推进：
-        // target 出现 => 成功；target 离线 => 明确失败；第三个 current => 被外部变化取代。
+        // target 出现 => 成功；第三个 current => 被外部变化取代；仍是 source => 等待。
         if case .awaitingConfirmation(let pending) = programmaticSwitchState {
             Self.trace(
                 "CORE_AUDIO_RECONCILE current=\(current.name) source=\(pending.sourceUID ?? "nil") target=\(pending.targetUID)"
@@ -496,17 +511,8 @@ final class AudioMonitor {
                 return
             }
 
-            if !connectedUIDs.contains(pending.targetUID) {
-                failProgrammaticSwitch(
-                    id: pending.id,
-                    error: "Target input device is no longer available"
-                )
-                Self.logger.error(
-                    "PROGRAMMATIC_SWITCH target disappeared id=\(pending.id, privacy: .public) uid=\(pending.targetUID, privacy: .public)"
-                )
-                // 继续用当前完整 snapshot 运行 policy；例如 preferred 离线时保留 UID。
-            } else if let sourceUID = pending.sourceUID,
-                      current.uid != sourceUID
+            if let sourceUID = pending.sourceUID,
+               current.uid != sourceUID
             {
                 cancelProgrammaticSwitch()
                 Self.logger.info(
