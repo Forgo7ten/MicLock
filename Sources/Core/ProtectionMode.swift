@@ -18,6 +18,16 @@ enum RestoreReason: Equatable {
     case startup
 }
 
+/// Protection restore 长时间未完成时暴露给设置界面的结构化状态。
+/// 不复用 `lastError` 文本，避免 UI 依赖错误字符串解析。
+enum ProtectionRetryState: Equatable {
+    /// CoreAudio 接受了 setter，但真实 default input 仍未到达 target。
+    case awaitingConfirmation
+
+    /// 最近一次 setter 请求本身被 CoreAudio 拒绝；watchdog 仍会继续退避重试。
+    case setterRejected
+}
+
 /// 最近一次已经确认生效的关键麦克风事件。
 struct RecentAudioEvent: Identifiable, Equatable {
     enum Kind: Equatable {

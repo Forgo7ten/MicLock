@@ -90,7 +90,7 @@ CoreAudio 的 `AudioDeviceID` 是运行时数值，重启或重插后会变；`k
 
 **stable external switch candidate**：Auto + stable 下的外部 default 变化不会立刻覆盖 preferred，而是建立 candidate。UI 的 `currentDevice` 立即更新；candidate 分类窗口复用 `settleSeconds`，若期间出现 topology delta 就取消；窗口结束时只有 target 仍存在于可信 `connectedUIDs` 且 current 未变化才学习新的 preferred。它只延迟 preferred 学习，不延迟 corrective restore；本质仍是时间启发式而非 HAL 原子性保证。
 
-**self-induced 回声**：MicLock 自己 set `DefaultInputDevice` 同样会触发监听。现在用 `ProgrammaticSwitchState.awaitingConfirmation(PendingSwitch)` 原子保存 transaction ID、source UID、目标 UID、待提交 Recent Event 与通知。`current == target` 可在没有 topology 的情况下直接确认；若 current 仍是明确 source，watchdog 会按 500ms → 1s → 2s → 4s 重读并重试 setter。单笔 transaction 达到有限重试上限后释放旧事务并让 protection policy 重新评估，而不是靠固定超时宣告失败或永久 pending。`sourceUID == nil` 时任何实际出现的非 target current 都会 supersede 旧事务。
+**self-induced 回声**：MicLock 自己 set `DefaultInputDevice` 同样会触发监听。现在用 `ProgrammaticSwitchState.awaitingConfirmation(PendingSwitch)` 原子保存 transaction ID、source UID、目标 UID、待提交 Recent Event 与通知。`current == target` 可在没有 topology 的情况下直接确认；若 current 仍是明确 source，watchdog 会按 500ms → 1s → 2s → 4s → 8s → 16s → 32s → 64s 重读并重试 setter，之后保持 64s capped interval 持续主动 retry。完成前四档快速重试后只显示 `protection is retrying`，不会释放仍停在 source 的 transaction 给 Auto 重新分类。事务只由可观察事实或新的用户意图结束：到达 target、可信 topology 确认 target 离线、出现第三个 non-target current、用户重新选择设备、切换模式或关闭保护。`sourceUID == nil` 时任何实际出现的 non-target current 都会 supersede 旧事务。
 
 **Auto 稳定性**：`StabilityState` 与程序化切换事务正交存在，仅有 `stable` / `settling(SettleEpisode)` 两态。每个 episode 保存唯一 ID、revision、`lastActivity`、deadline 与通知去重状态；timer 醒来必须同时匹配 episode ID + revision + deadline 才能把状态变成 stable。详见 [auto-mode.md](auto-mode.md)。
 
@@ -131,7 +131,7 @@ sequenceDiagram
 
 1. 读取偏好 → 枚举设备 → 读取当前默认输入（`AudioMonitor.init`）
 2. 首次运行且无 preferred：默认选内置麦克风（否则当前设备）
-3. App 完成启动后安装监听并执行启动对齐（`start()` → `evaluateStartupPolicy()`）：保护开启且 preferred 在线且 current ≠ preferred → 恢复（不通知）
+3. App 完成启动后安装监听并执行启动对齐（`start()` → `evaluateStartupPolicy()`）：保护开启且 preferred 在线且 current ≠ preferred → 恢复（不通知）。若 init 阶段 topology 枚举失败，则此时启动独立 startup recovery；第一份可信快照作为启动基线写入，不把“空缓存 → 全量设备”误判为 topology added，再继续以 `.startup` 语义完成对齐
 4. 通知已开启时，启动约 0.5 秒后检查（必要时请求）通知授权
 
 授权请求必须放在 App 完成启动之后——App 构造阶段调用 `requestAuthorization` 会被系统静默忽略，弹窗根本不出现。
@@ -142,10 +142,10 @@ Manual 抢麦恢复、Auto 抢麦恢复、重连恢复、启动对齐全部走 `
 
 1. 创建一笔 `PendingSwitch`，原子保存 transaction ID、source UID、目标 UID、Recent Event draft 与本次通知 draft
 2. `provider.setInputDevice(preferred.uid)`——恢复路径统一只写 `DefaultInputDevice`；用户在 MicLock 中主动选择设备时由 `selectDevice(_:)` 发起同类程序化事务
-3. setter 立即失败：只失败当前 transaction，记录 `lastError`，不提交成功事件/通知
+3. 用户在 MicLock 中主动选择设备且 setter 立即失败：该次 Trusted User Action 失败，不覆盖 preferred；Protection restore 的 setter 若被拒绝，则保留 transaction、显示 `Unable to set default input device; protection will keep retrying`，由 watchdog 继续退避重试
 4. setter 被接受：延长当前 settle episode，重新读取真实 `currentDevice`；若已经达到 target 则立即确认，否则保持 pending
-5. PendingSwitch watchdog 按 500ms → 1s → 2s → 4s 重读 current 并在仍停在 source 时重试 setter；单笔事务达到有限重试上限后释放旧事务，让 protection policy 重新评估
-6. `current == target` 可独立于 topology 直接确认；target offline 只有在 topology sample 有效且跨属性一致时才可判定；第三状态会 supersede 旧事务
+5. PendingSwitch watchdog 按 500ms → 1s → 2s → 4s → 8s → 16s → 32s → 64s 重读 current 并在仍停在 source 时重试 setter；完成前四档快速重试后显示 `protection is retrying`，之后继续指数退避，最终固定每 64s retry，但不因时间经过释放 transaction
+6. `current == target` 可独立于 topology 直接确认；target offline 只有在 topology sample 有效且跨属性一致时才可判定；第三状态会 supersede 旧事务；模式切换、保护关闭或新的 Trusted User Action 也会明确取消/取代旧事务，并清理 retrying 瞬态错误
 7. 确认时原子提交 Recent Event，并按创建通知时携带的 episode ID 做去重后投递通知
 
 程序化切换**不使用固定 confirmation timeout**。经过多少秒本身不是失败证据；watchdog 的时间只用于 recheck / retry，不直接宣告 HAL failure。`settleTask` 仍只负责 Auto 稳定窗口；业务事实分别保存在 `StabilityState` 与 `ProgrammaticSwitchState` 中。运行中修改 `settleSeconds` 会同时重排当前 settle episode 与 stable external switch candidate 的 deadline。
@@ -226,18 +226,18 @@ Self.logger.info(
 ./Tests/run.sh
 ```
 
-与 App 相同的 Core/Services 源一起编译（不含 `@main` 入口），注入 `FakeAudioDeviceProvider`（内存设备表 + 可控 setter 失败/延迟/枚举失败状态 + 调用记录）与 `RecordingNotifier`（通知计数），直接调用 `handleDefaultInputChanged()` / `handleDeviceListChanged()` 模拟 CoreAudio wake-up，`UserDefaults` 用随机命名的独立 suite 隔离。当前 42 个用例 / 174 个断言：
+与 App 相同的 Core/Services 源一起编译（不含 `@main` 入口），注入 `FakeAudioDeviceProvider`（内存设备表 + 可控 setter 失败/延迟/枚举失败状态 + 调用记录）与 `RecordingNotifier`（通知计数），直接调用 `handleDefaultInputChanged()` / `handleDeviceListChanged()` 模拟 CoreAudio wake-up，`UserDefaults` 用随机命名的独立 suite 隔离。当前 45 个用例 / 207 个断言：
 
 | 场景 | 断言要点 |
 |---|---|
 | M1–M3（Manual） | 外部切换立即恢复、preferred 离线不动、MicLock 内选择立即生效且回调不误判 |
-| Programmatic transaction | setter 失败不覆盖 preferred、`current == target` 在枚举失败时仍可确认、`sourceUID == nil` 可 supersede、stuck source 会由 watchdog 重试且不会永久压住 policy、超过旧 1s 阈值后的晚确认仍成功 |
+| Programmatic transaction | MicLock UI 主动选择的 setter 失败不覆盖 preferred；Protection restore 的 setter rejection 保留 transaction 并继续 retry；`current == target` 在枚举失败时仍可确认、`sourceUID == nil` 可 supersede、stuck source 会由 watchdog 主动持续重试且跨过退避阈值后也不会被 Auto 反向学习、超过旧 1s 阈值后的晚确认仍成功 |
 | CoreAudio reconcile / A1–A4（Auto） | callback 正序/反序、属性分阶段变化与 `current ∉ devices` 矛盾采样都不会直接误学 preferred；关键 identity 查询失败保留上一份有效 topology；candidate 复用 settleSeconds 且 target 必须存在于可信 topology |
 | Recent Events | accepted switch 来源取旧 preferred、失败动作不记录、历史最多十条且最新优先 |
 | Stability / notification episode | burst 下 setter 不循环、episode 最多实际发送一条通知、关闭通知的 confirmation 不消耗额度、修改 settleSeconds 后旧 timer 不得提前结束 episode |
 | 重连 | preferred 断开保留 UID、同 UID 复现自动恢复、系统已自动恢复时不重复 setter |
 | 窗口内 Trusted 选择 | 立即生效且不被回声恢复 |
-| 保护关闭 / 启动对齐 / 幂等 / 首次运行 / 钳制 | 各边界行为 |
+| 保护关闭 / 启动对齐 / 幂等 / 首次运行 / 钳制 | 各边界行为；init topology 枚举失败时无需外部 callback 也会主动恢复，并保持 `.startup` / 不通知语义 |
 
 ## 隐私与安全约束
 

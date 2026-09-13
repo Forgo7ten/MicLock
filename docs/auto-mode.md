@@ -158,13 +158,15 @@ awaitingConfirmation(PendingSwitch)
 
 1. `current.uid == targetUID`：这是独立于 topology 的充分成功证据；即使同一轮设备枚举失败，也立即确认、提交 Recent Event，并在满足通知条件时投递通知
 2. 只有在 topology sample 有效且跨属性一致时，`targetUID` 不在线才可作为目标明确不可达的失败证据
-3. `sourceUID != nil && current.uid == sourceUID`：说明写入尚未反映；watchdog 按 500ms → 1s → 2s → 4s 重新读取并重试 setter
-4. 单笔 transaction 达到有限重试上限后，不把“时间经过”解释为 HAL failure；而是释放旧 transaction、显示 `protection is retrying` 状态，并让 protection policy 重新评估，需要恢复时开启一笔新事务
+3. `sourceUID != nil && current.uid == sourceUID`：说明写入尚未反映；watchdog 按 500ms → 1s → 2s → 4s → 8s → 16s → 32s → 64s 重新读取并重试 setter，之后固定 64s 一次
+4. 完成前四档快速重试后，不把“时间经过”解释为 HAL failure，也不释放仍停留在 source 的 transaction；显示 `protection is retrying`，后续继续指数退避到 64s cap，避免 Auto 把原本正在抵抗的 source 反向学习成新的 preferred
 5. 其余非 target current：出现了更新的外部事实，旧事务被 supersede，随后重新运行 policy；特别地，`sourceUID == nil` 时任何实际出现的非 target current 都属于这种新事实
 6. topology sample 无效：不能做 target-offline 判定；保留上一份有效 topology，并通过独立 recovery retry 重新采样
-7. 模式切换、保护关闭或新的 Trusted User Action：属于明确的新用户意图，直接取消/取代旧事务
+7. 模式切换、保护关闭或新的 Trusted User Action：属于明确的新用户意图，直接取消/取代旧事务；如果 UI 正显示 `protection is retrying`，同时清理这条只属于旧事务的瞬态状态
 
-因此不会恢复旧的“固定 1 秒后宣告失败”语义：时间只触发重新检查/重试，不直接决定成功或失败；另一方面，一笔 transaction 也不会永久 pending 并压住保护策略。
+因此不会恢复旧的“固定 1 秒后宣告失败”语义：时间只触发重新检查/重试，不直接决定成功或失败。允许一笔 transaction 在 source 持续不变时长期 pending，但这种 pending 会按 capped interval 主动执行 setter；真正结束事务必须来自 target confirmed、target 确定离线、第三个 current 或新的用户意图，而不是单纯等待够久。
+
+Protection restore 中还区分两类未完成状态：setter 返回 `true` 但 `current != target` 表示“请求已接受、等待确认”；watchdog 某次 setter 返回 `false` 则表示“请求本身被拒绝”。后者显示 `Unable to set default input device; protection will keep retrying`，前者在进入长期 retry 阶段后显示 `Unable to confirm default input change; protection is retrying`。任一后续成功确认都会由 `finishProgrammaticSwitchIfConfirmed()` 清空这些瞬态错误。设置窗口的「高级 → 设备切换」会显示对应的结构化警告，并提示检查首选麦克风、系统「声音 → 输入」以及是否存在持续抢占默认输入的蓝牙设备或其他软件；同时明确最长 retry 间隔为 64 秒。MicLock UI 中用户主动选择设备若首个 setter 就失败，仍按该次 Trusted User Action 失败处理，不擅自改写 preferred。
 
 Recent Event 的 `occurredAt` 使用**确认时间**，而不是 setter 请求时间。
 
