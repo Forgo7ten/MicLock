@@ -49,25 +49,25 @@ newCurrent = provider.currentInputDevice()
 newDevices = try provider.listInputDevices()
 ```
 
-只有设备枚举成功时，本轮 snapshot 才可用于 topology/policy：枚举失败会保留上一份有效 `devices / connectedUIDs`，只更新可独立读取的 `currentDevice`，避免把瞬时 HAL 错误当成“真实空设备列表”。枚举成功后固定按以下顺序处理：
+只有 topology 采样有效且与 `current` 不矛盾时，本轮结果才可用于 topology/Auto policy：全局枚举失败、关键单设备 identity 查询失败，或 `current.uid` 根本不在本轮 `devices` 中，都会把这轮采样视为 inconclusive。此时保留上一份有效 `devices / connectedUIDs`，仍更新可独立读取的 `currentDevice`，并安排短暂 recovery retry。`current == pending.target` 这种不依赖 topology 的确定事实仍可立即确认；Manual 也可使用上一份有效 topology 继续严格恢复。有效采样后固定按以下顺序处理：
 
 1. 用 `newDevices` 与 `connectedUIDs` 求 topology delta；有真实 delta 时先进入/延长 `settling`
 2. 更新 `devices / connectedUIDs / currentDevice`
 3. 处理 `PendingSwitch` 的确认、取消或 supersede
 4. 最后运行 Auto / Manual policy
 
-对于 **Auto + stable + 外部 default 变化**，即使本轮 `devices` 暂时仍显示旧 preferred 在线，也不会立刻学习新的 preferred，而是建立短暂的 `StableExternalSwitchCandidate`。`currentDevice` 会立即更新供 UI 展示；若随后出现 topology delta，candidate 立即取消并按 topology 事实处理；若短暂分类窗口内 topology 始终不变且 current 仍保持 candidate 目标，才确认这是 stable external switch 并学习新的 preferred。若 candidate 的确认采样恰好遇到设备枚举失败，则保留 candidate；后续有效 wake-up 可以重新安排确认。这个 candidate 只延迟“学习 preferred”，不会延迟 corrective restore。
+对于 **Auto + stable + 外部 default 变化**，即使本轮 `devices` 暂时仍显示旧 preferred 在线，也不会立刻学习新的 preferred，而是建立 `StableExternalSwitchCandidate`。`currentDevice` 会立即更新供 UI 展示；candidate 的分类窗口复用用户配置的 `settleSeconds`，不再使用额外的隐藏 200ms 常量。若窗口内出现 topology delta，candidate 立即取消并按 topology 事实处理；窗口结束时只有 topology sample 仍有效、`current` 未变化且 candidate target 仍存在于 `connectedUIDs`，才确认这是 stable external switch 并学习新的 preferred。若确认采样无效，则保留 candidate，等待 recovery / 后续 wake-up。这个 candidate 只延迟“学习 preferred”，不会延迟 corrective restore。
 
 ```mermaid
 flowchart TD
-    A["Devices 或 DefaultInput callback"] --> B["读取 current + 尝试枚举 devices"]
-    B -->|枚举失败| B1["仅更新 current；保留上次有效 topology；本轮停止 policy"]
-    B -->|枚举成功| C["先计算并应用 topology delta"]
-    C --> D["再更新真实 current"]
-    D --> E{"存在 PendingSwitch？"}
-    E -->|target 已成为 current| E1["确认事务：提交 Recent Event / 通知"]
+    A["Devices 或 DefaultInput callback"] --> B["先读取真实 current，再尝试枚举 devices"]
+    B --> C{"current == pending target？"}
+    C -->|是| E1["确认事务：提交 Recent Event / 通知"]
+    C -->|否| D{"topology sample 有效且与 current 一致？"}
+    D -->|否| D1["保留上次有效 topology；Manual 可继续恢复；Auto 冻结分类；安排 recovery"]
+    D -->|是| E["应用 topology delta，再处理 PendingSwitch / policy"]
     E -->|target 已离线| E2["失败旧事务，继续 policy"]
-    E -->|仍是明确 source| E4["继续等待，不重复 setter"]
+    E -->|仍是明确 source| E4["watchdog recheck / retry"]
     E -->|其他非 target current| E3["外部事实 supersede 旧事务，继续 policy"]
     E -->|否| F{"保护开启？"}
     E2 --> F
@@ -154,18 +154,17 @@ awaitingConfirmation(PendingSwitch)
 
 `setInputDevice()` 返回成功只表示 CoreAudio 接受了写请求，不代表默认输入已经真实变化。HAL 也没有给出“必须在 1 秒或任何固定秒数内完成”的正确性保证，因此 PendingSwitch 不再设置 confirmation timeout。
 
-后续每次**有效 topology snapshot** 用事实推进事务：
+后续用可靠的可观察事实推进事务：
 
-1. `current.uid == targetUID`：确认成功，提交 Recent Event，并在满足通知条件时投递通知
-2. `targetUID` 已不在成功枚举得到的在线设备集合中：目标已明确不可达，事务失败并继续运行 policy
-3. `sourceUID != nil && current.uid == sourceUID`：仍停留在明确 source，没有足够证据判断失败，继续等待且不重复 setter
-4. 其余非 target current：出现了更新的外部事实，旧事务被 supersede，随后重新运行 policy；特别地，`sourceUID == nil` 时任何实际出现的非 target current 都属于这种新事实
-5. 设备枚举失败：本轮不使用 topology 推进事务，保留上一份有效 topology，等待后续 wake-up
-6. 模式切换、保护关闭或新的 Trusted User Action：属于明确的新用户意图，直接取消/取代旧事务
+1. `current.uid == targetUID`：这是独立于 topology 的充分成功证据；即使同一轮设备枚举失败，也立即确认、提交 Recent Event，并在满足通知条件时投递通知
+2. 只有在 topology sample 有效且跨属性一致时，`targetUID` 不在线才可作为目标明确不可达的失败证据
+3. `sourceUID != nil && current.uid == sourceUID`：说明写入尚未反映；watchdog 按 500ms → 1s → 2s → 4s 重新读取并重试 setter
+4. 单笔 transaction 达到有限重试上限后，不把“时间经过”解释为 HAL failure；而是释放旧 transaction、显示 `protection is retrying` 状态，并让 protection policy 重新评估，需要恢复时开启一笔新事务
+5. 其余非 target current：出现了更新的外部事实，旧事务被 supersede，随后重新运行 policy；特别地，`sourceUID == nil` 时任何实际出现的非 target current 都属于这种新事实
+6. topology sample 无效：不能做 target-offline 判定；保留上一份有效 topology，并通过独立 recovery retry 重新采样
+7. 模式切换、保护关闭或新的 Trusted User Action：属于明确的新用户意图，直接取消/取代旧事务
 
-因此仅仅经过 1.2 秒、5 秒甚至更久都不会产生“Unable to confirm”的伪失败；只要之后 HAL 真实切到 target，仍会正常确认并记录事件/通知。
-
-这个设计有一个刻意取舍：如果某个驱动对 setter 返回成功、target 始终在线、current 永远停留在 source，并且此后再也没有任何 CoreAudio 状态变化，事务会保持 pending，而不是凭任意时间阈值猜测失败。后续明确的 topology/current/user-intent 事件会继续推进或取代它。
+因此不会恢复旧的“固定 1 秒后宣告失败”语义：时间只触发重新检查/重试，不直接决定成功或失败；另一方面，一笔 transaction 也不会永久 pending 并压住保护策略。
 
 Recent Event 的 `occurredAt` 使用**确认时间**，而不是 setter 请求时间。
 
@@ -219,6 +218,7 @@ sequenceDiagram
 
 - **settle window 内的真实用户外部切换仍可能被恢复**：CoreAudio 没有提供可靠的「是谁修改默认输入」来源。窗口内想明确更换首选，请使用 MicLock 菜单。
 - **窗口结束后的系统延迟切换仍可能被接受**：稳定以后 MicLock 选择“允许用户意图”优先，无法证明一个外部变化一定来自人类操作。
+- **StableExternalSwitchCandidate 仍是时间启发式**：candidate 复用 `settleSeconds` 吸收常见的跨属性分阶段更新，并要求 target UID 存在于可信 topology；如果 CoreAudio 的 topology 更新延迟超过整个分类窗口，仍可能把系统 fallback 误判为稳定后的外部切换。这是 Auto 允许外部切换自动成为 preferred 所带来的产品 trade-off，而不是原子性保证。
 - **个别虚拟驱动静默回弹**：若驱动接受 setter 后又静默回弹且完全不产生属性事件，事件驱动模型无法立即感知。
 - **preferred 离线期间**：保留原 UID，不学习系统 fallback，等待同 UID 重连。
 
