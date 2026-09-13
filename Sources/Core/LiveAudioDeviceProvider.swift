@@ -13,18 +13,35 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
 
     // MARK: - AudioDeviceProviding
 
-    func listInputDevices() throws -> [AudioInputDevice] {
-        try allDevices().compactMap { deviceID -> AudioInputDevice? in
-            guard try hasInputStreams(deviceID) else { return nil }
-            let uid = try requiredDeviceUID(deviceID)
+    func listInputDevices() throws -> AudioInputDeviceSnapshot {
+        let deviceIDs = try allDevices()
+        var inputDevices: [AudioInputDevice] = []
+        var incompleteDeviceIDs: [AudioDeviceID] = []
+        var issues: [AudioDeviceProviderError] = []
 
-            return AudioInputDevice(
-                uid: uid,
-                deviceID: deviceID,
-                name: deviceName(deviceID) ?? "Unknown (\(deviceID))",
-                transportType: transportType(deviceID) ?? 0
-            )
+        for deviceID in deviceIDs {
+            do {
+                guard try hasInputStreams(deviceID) else { continue }
+                let uid = try requiredDeviceUID(deviceID)
+                inputDevices.append(AudioInputDevice(
+                    uid: uid,
+                    deviceID: deviceID,
+                    name: deviceName(deviceID) ?? "Unknown (\(deviceID))",
+                    transportType: transportType(deviceID) ?? 0
+                ))
+            } catch let error as AudioDeviceProviderError {
+                // 单个 HAL object 读失败时保留其余健康设备给 UI/诊断；
+                // 策略层会根据 incompleteDeviceIDs 冻结 removal/offline/Auto learning。
+                incompleteDeviceIDs.append(deviceID)
+                issues.append(error)
+            }
         }
+
+        return AudioInputDeviceSnapshot(
+            devices: inputDevices,
+            incompleteDeviceIDs: incompleteDeviceIDs,
+            issues: issues
+        )
     }
 
     func currentInputDevice() throws -> AudioInputDevice? {

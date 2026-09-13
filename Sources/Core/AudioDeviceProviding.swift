@@ -32,10 +32,20 @@ enum AudioDeviceProviderError: Error, CustomStringConvertible {
     }
 }
 
+struct AudioInputDeviceSnapshot {
+    let devices: [AudioInputDevice]
+    let incompleteDeviceIDs: [AudioDeviceID]
+    let issues: [AudioDeviceProviderError]
+
+    var isComplete: Bool {
+        incompleteDeviceIDs.isEmpty
+    }
+}
+
 /// CoreAudio 访问抽象：策略层只依赖本协议，测试注入 Fake 实现。
 protocol AudioDeviceProviding: AnyObject {
-    /// 当前所有输入设备。失败与“成功但列表为空”必须区分。
-    func listInputDevices() throws -> [AudioInputDevice]
+    /// 当前输入设备快照。全局枚举失败抛错；单个对象关键属性失败则返回 partial snapshot。
+    func listInputDevices() throws -> AudioInputDeviceSnapshot
 
     /// 当前默认输入设备。只有 CoreAudio 明确返回 kAudioObjectUnknown 时才返回 nil；
     /// property read / UID read 失败必须抛错。

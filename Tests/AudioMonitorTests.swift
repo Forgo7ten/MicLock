@@ -22,6 +22,7 @@ func runAllTests() async {
     await testDelayedOlderTrustedSelectionCannotCancelLatestChoice()
     await testNilSourcePendingSwitchWatchdogRetriesWithoutCurrent()
     testEnumerationFailureDoesNotApplyEmptyTopology()
+    testPartialTopologyUpdatesUIButFreezesPolicyFacts()
     testPendingSwitchConfirmsWhenEnumerationFailsButCurrentReachedTarget()
     testManualRestoresWhenEnumerationFails()
     await testPendingSwitchWatchdogRetriesStuckSource()
@@ -542,6 +543,46 @@ private func testEnumerationFailureDoesNotApplyEmptyTopology() {
     expect(monitor.deviceEnumerationError == nil, "successful enumeration clears enumeration error")
     expect(monitor.recentAudioEvents.first?.kind == .restored(.manualLock), "pending restore confirms after enumeration recovers")
     expect(notifier.presentCount == 1, "confirmation still notifies after enumeration recovers")
+}
+
+/// 单个 HAL object 的关键属性读取失败时，健康设备仍应出现在 UI snapshot；
+/// 但 partial snapshot 不能应用 removal / target-offline / Auto learning 等不可逆策略事实。
+@MainActor
+private func testPartialTopologyUpdatesUIButFreezesPolicyFacts() {
+    test("partial topology updates UI but freezes policy facts")
+
+    let scheduler = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic, airpodsMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto,
+        scheduler: scheduler
+    )
+
+    // USB 对象的关键属性暂时不可读；其余健康对象仍能组成 partial snapshot。
+    provider.devices = [builtInMic, airpodsMic]
+    provider.incompleteDeviceIDs = [usbMic.deviceID]
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(
+        monitor.devices.map(\.uid).sorted() == [airpodsMic.uid, builtInMic.uid].sorted(),
+        "partial snapshot still updates healthy devices for UI"
+    )
+    expect(monitor.currentDevice?.uid == airpodsMic.uid, "current UI still reflects independently readable state")
+    expect(monitor.deviceEnumerationError != nil, "partial topology is surfaced for diagnostics")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "Auto does not learn from a partial topology")
+    expect(provider.setCalls.isEmpty, "partial topology does not treat omitted USB as a removal event")
+
+    // 同一可见列表随后成为完整 snapshot：现在 USB removal 才是可信事实，
+    // Auto 进入 settling 并恢复原 preferred。
+    provider.incompleteDeviceIDs = []
+    monitor.handleDeviceListChanged()
+
+    expect(monitor.deviceEnumerationError == nil, "complete snapshot clears partial-topology diagnostics")
+    expect(provider.setCalls == [builtInMic.uid], "only a complete snapshot may apply removal and trigger protection")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "preferred remains protected after complete recovery")
 }
 
 /// PendingSwitch 已真实到达 target 时，current 本身就是充分成功证据；

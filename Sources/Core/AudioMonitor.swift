@@ -231,6 +231,9 @@ final class AudioMonitor {
     @ObservationIgnored private var nextSettleEpisodeID: UInt64 = 0
     @ObservationIgnored private var settleTask: AudioMonitorScheduledTask?
 
+    /// 最近一份“完整且与 current 不矛盾”的可信 topology；策略判断只使用它。
+    /// `devices` 则可展示 partial snapshot 中仍可读取的健康设备。
+    @ObservationIgnored private var trustedDevices: [AudioInputDevice] = []
     @ObservationIgnored private var connectedUIDs: Set<String> = []
 
     /// Auto + stable 下观察到的外部 default 变化先进入候选态。
@@ -493,7 +496,7 @@ final class AudioMonitor {
     /// 离线 preferred 的展示名（nil = preferred 在线或未选择）。
     var offlinePreferredName: String? {
         guard let uid = preferredMicrophoneUID,
-              !devices.contains(where: { $0.uid == uid })
+              !connectedUIDs.contains(uid)
         else { return nil }
 
         return lastKnownDeviceNames[uid] ?? "Unknown device"
@@ -501,7 +504,7 @@ final class AudioMonitor {
 
     var isPreferredMicrophoneAvailable: Bool {
         guard let uid = preferredMicrophoneUID else { return false }
-        return devices.contains { $0.uid == uid }
+        return connectedUIDs.contains(uid)
     }
 
     /// 用户在 MicLock UI 主动选择设备：Trusted User Action。
@@ -557,7 +560,7 @@ final class AudioMonitor {
 
         guard protectionEnabled,
               let preferredUID = preferredMicrophoneUID,
-              let preferred = devices.first(where: { $0.uid == preferredUID }),
+              let preferred = trustedDevices.first(where: { $0.uid == preferredUID }),
               let current = currentDevice,
               current.uid != preferred.uid
         else { return }
@@ -613,13 +616,35 @@ final class AudioMonitor {
             Self.logger.debug("PROGRAMMATIC_SWITCH confirmed from current state")
         }
 
-        let newDevices: [AudioInputDevice]
+        let snapshot: AudioInputDeviceSnapshot
         do {
-            newDevices = try provider.listInputDevices()
+            snapshot = try provider.listInputDevices()
         } catch {
             markTopologySampleInvalid(
                 message: "Unable to enumerate input devices",
                 trigger: trigger
+            )
+
+            if confirmedProgrammaticSwitch { return }
+            if reconcilePendingSwitchUsingCurrentOnly(trigger: trigger) { return }
+            reconcileWithoutTrustedTopology(previous: previous, current: newCurrent)
+            return
+        }
+
+        let newDevices = snapshot.devices
+
+        // partial snapshot 仍可服务 UI/诊断，但绝不能推进 removal / target-offline / Auto learning。
+        // 策略事实继续使用 trustedDevices / connectedUIDs 的最后一份完整快照。
+        devices = Self.sortedDevices(newDevices)
+        recordDeviceNames(newDevices)
+
+        if !snapshot.isComplete {
+            markTopologySampleInvalid(
+                message: "Some input device properties are temporarily unreadable",
+                trigger: trigger
+            )
+            Self.logger.error(
+                "CORE_AUDIO_RECONCILE partial topology trigger=\(trigger.rawValue, privacy: .public) incompleteDeviceIDs=\(String(describing: snapshot.incompleteDeviceIDs), privacy: .public) issues=\(String(describing: snapshot.issues), privacy: .public)"
             )
 
             if confirmedProgrammaticSwitch { return }
@@ -655,6 +680,7 @@ final class AudioMonitor {
             deviceEnumerationError = nil
 
             devices = Self.sortedDevices(newDevices)
+            trustedDevices = devices
             connectedUIDs = newUIDs
             recordDeviceNames(newDevices)
             startupTopologyRecoveryPending = false
@@ -692,8 +718,9 @@ final class AudioMonitor {
         let removed = connectedUIDs.subtracting(newUIDs)
         let topologyChanged = !added.isEmpty || !removed.isEmpty
 
-        // 只有有效且跨属性一致的 topology sample 才能更新策略事实。
+        // 只有完整且跨属性一致的 topology sample 才能更新策略事实。
         devices = Self.sortedDevices(newDevices)
+        trustedDevices = devices
         connectedUIDs = newUIDs
         recordDeviceNames(newDevices)
 
@@ -746,7 +773,7 @@ final class AudioMonitor {
 
         // preferred 设备重新出现：无论 Auto / Manual 都立即恢复。
         if added.contains(preferredUID),
-           let preferred = devices.first(where: { $0.uid == preferredUID }),
+           let preferred = trustedDevices.first(where: { $0.uid == preferredUID }),
            current.uid != preferred.uid
         {
             restorePreferred(from: current, to: preferred, reason: .preferredReconnected)
@@ -758,7 +785,7 @@ final class AudioMonitor {
             return
         }
 
-        guard let preferred = devices.first(where: { $0.uid == preferredUID }) else {
+        guard let preferred = trustedDevices.first(where: { $0.uid == preferredUID }) else {
             cancelStableExternalSwitchCandidate()
             Self.logger.info(
                 "PREFERRED_OFFLINE keep=\(preferredUID, privacy: .public) current=\(current.name, privacy: .public)"
@@ -818,7 +845,7 @@ final class AudioMonitor {
         }
 
         guard protectionMode == .manual,
-              let preferred = devices.first(where: { $0.uid == preferredUID })
+              let preferred = trustedDevices.first(where: { $0.uid == preferredUID })
         else {
             // Auto 需要可信 topology 才能做不可逆分类；等待 recovery retry。
             return
@@ -1489,10 +1516,9 @@ final class AudioMonitor {
     // MARK: - Refresh
 
     private func refreshDeviceList(initial: Bool = false) {
-        let newDevices: [AudioInputDevice]
+        let snapshot: AudioInputDeviceSnapshot
         do {
-            newDevices = try provider.listInputDevices()
-            deviceEnumerationError = nil
+            snapshot = try provider.listInputDevices()
         } catch {
             deviceEnumerationError = "Unable to enumerate input devices"
             if initial {
@@ -1504,6 +1530,24 @@ final class AudioMonitor {
             _ = refreshCurrentDevice(scheduleRecoveryOnFailure: !initial)
             return
         }
+
+        let newDevices = snapshot.devices
+        devices = Self.sortedDevices(newDevices)
+        recordDeviceNames(newDevices)
+
+        if !snapshot.isComplete {
+            deviceEnumerationError = "Some input device properties are temporarily unreadable"
+            if initial {
+                startupTopologyRecoveryPending = true
+            }
+            Self.logger.error(
+                "DEVICE_LIST partial snapshot incompleteDeviceIDs=\(String(describing: snapshot.incompleteDeviceIDs), privacy: .public) issues=\(String(describing: snapshot.issues), privacy: .public)"
+            )
+            _ = refreshCurrentDevice(scheduleRecoveryOnFailure: !initial)
+            return
+        }
+
+        deviceEnumerationError = nil
 
         guard refreshCurrentDevice(scheduleRecoveryOnFailure: !initial) else {
             if initial {
@@ -1527,9 +1571,8 @@ final class AudioMonitor {
             return
         }
 
-        devices = Self.sortedDevices(newDevices)
+        trustedDevices = devices
         connectedUIDs = newUIDs
-        recordDeviceNames(newDevices)
 
         // 初始枚举：所有现存设备视为稳定，不开 settle window。
         if !initial, connectedUIDs.isEmpty {

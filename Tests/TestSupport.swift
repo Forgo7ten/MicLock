@@ -22,14 +22,21 @@ final class FakeAudioDeviceProvider: AudioDeviceProviding {
     /// 模拟设备枚举失败；nil 表示枚举成功（即使 devices == [] 也属于成功空列表）。
     var listInputDevicesError: Error?
 
+    /// 模拟单个 HAL object 的关键属性读取失败；非空时返回 partial snapshot。
+    var incompleteDeviceIDs: [AudioDeviceID] = []
+
     /// 模拟默认输入读取失败；失败时不能把 monitor 最后一次可信 current 覆盖成 nil。
     var currentInputDeviceError: Error?
 
-    func listInputDevices() throws -> [AudioInputDevice] {
+    func listInputDevices() throws -> AudioInputDeviceSnapshot {
         if let listInputDevicesError {
             throw listInputDevicesError
         }
-        return devices
+        return AudioInputDeviceSnapshot(
+            devices: devices,
+            incompleteDeviceIDs: incompleteDeviceIDs,
+            issues: []
+        )
     }
 
     func currentInputDevice() throws -> AudioInputDevice? {
