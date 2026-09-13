@@ -518,7 +518,9 @@ final class AudioMonitor {
             notification: nil
         )
 
-        if provider.setInputDevice(uid: device.uid) {
+        do {
+            try provider.setInputDevice(uid: device.uid)
+
             // setter 成功只代表 CoreAudio 接受了写操作；preferred 可以提交，
             // 但 currentDevice 仍必须来自 provider 的真实读取。
             preferredMicrophoneUID = device.uid
@@ -532,12 +534,14 @@ final class AudioMonitor {
             } else if case .awaitingConfirmation(let pending) = programmaticSwitchState {
                 scheduleProgrammaticSwitchWatchdog(for: pending)
             }
-        } else {
+        } catch {
             failProgrammaticSwitch(
                 id: transactionID,
                 error: "Unable to set default input device"
             )
-            Self.logger.error("USER_SELECT failed uid=\(device.uid, privacy: .public)")
+            Self.logger.error(
+                "USER_SELECT failed uid=\(device.uid, privacy: .public) providerError=\(String(describing: error), privacy: .public)"
+            )
         }
     }
 
@@ -586,8 +590,21 @@ final class AudioMonitor {
 
     private func reconcileCoreAudioState(trigger: CoreAudioWakeReason) {
         let previous = currentDevice
-        let newCurrent = provider.currentInputDevice()
-        currentDevice = newCurrent
+        let newCurrent: AudioInputDevice?
+
+        do {
+            newCurrent = try provider.currentInputDevice()
+            currentDevice = newCurrent
+        } catch {
+            markTopologySampleInvalid(
+                message: "Unable to read current input device",
+                trigger: trigger
+            )
+            Self.logger.error(
+                "CURRENT_INPUT_READ_FAILED trigger=\(trigger.rawValue, privacy: .public) providerError=\(String(describing: error), privacy: .public)"
+            )
+            return
+        }
 
         // current == target 是独立于 topology 的充分成功证据。即使本轮设备枚举失败，
         // 也必须先完成 transaction，避免已经成功的切换永久停在 pending。
@@ -997,17 +1014,16 @@ final class AudioMonitor {
             )
         )
 
-        let ok = provider.setInputDevice(uid: preferred.uid)
-
-        guard ok else {
-            // Protection restore 与一次性的 UI 选择不同：目标仍在线时，setter 被拒绝
-            // 只说明“本次请求没被接受”，不是应当放弃保护的事实。保留 PendingSwitch，
-            // 让 watchdog 后续按退避节奏继续尝试；target 离线/第三个 current/新用户意图
-            // 仍会通过统一事务规则结束它。
+        do {
+            try provider.setInputDevice(uid: preferred.uid)
+        } catch {
+            // Protection restore 与一次性的 UI 选择不同：目标仍在线时，一次 setter 失败
+            // 只说明本次请求没有完成，不足以放弃保护。保留 PendingSwitch，让 watchdog
+            // 继续退避重试；具体 lookup / HAL / OSStatus 原因保留在结构化日志中。
             lastError = Self.protectionSwitchSetterRejectedRetryingError
             protectionRetryState = .setterRejected
             Self.logger.error(
-                "RESTORE_SETTER_REJECTED_RETRYING reason=\(reason, privacy: .public) target=\(preferred.name, privacy: .public)"
+                "RESTORE_SETTER_REJECTED_RETRYING reason=\(reason, privacy: .public) target=\(preferred.name, privacy: .public) providerError=\(String(describing: error), privacy: .public)"
             )
             if case .awaitingConfirmation(let pending) = programmaticSwitchState,
                pending.id == transactionID
@@ -1176,7 +1192,16 @@ final class AudioMonitor {
         }
         programmaticSwitchState = .awaitingConfirmation(currentPending)
 
-        let accepted = provider.setInputDevice(uid: currentPending.targetUID)
+        let accepted: Bool
+        let setterError: Error?
+        do {
+            try provider.setInputDevice(uid: currentPending.targetUID)
+            accepted = true
+            setterError = nil
+        } catch {
+            accepted = false
+            setterError = error
+        }
 
         // 只有 protection restore 被 CoreAudio 接受时才重新开启/延长 settle。
         // Trusted User Action 不制造 protection episode。若 transaction 本来就携带
@@ -1198,8 +1223,9 @@ final class AudioMonitor {
             return
         }
 
+        let setterErrorDescription = setterError.map { String(describing: $0) } ?? "none"
         Self.logger.warning(
-            "PROGRAMMATIC_SWITCH retry id=\(currentPending.id, privacy: .public) attempt=\(currentPending.retryAttempt, privacy: .public) setterAccepted=\(accepted, privacy: .public)"
+            "PROGRAMMATIC_SWITCH retry id=\(currentPending.id, privacy: .public) attempt=\(currentPending.retryAttempt, privacy: .public) setterAccepted=\(accepted, privacy: .public) providerError=\(setterErrorDescription, privacy: .public)"
         )
 
         updateProgrammaticSwitchRetryStatus(
@@ -1455,13 +1481,21 @@ final class AudioMonitor {
             if initial {
                 startupTopologyRecoveryPending = true
             }
-            Self.logger.error("DEVICE_LIST enumeration failed")
-            refreshCurrentDevice()
+            Self.logger.error(
+                "DEVICE_LIST enumeration failed providerError=\(String(describing: error), privacy: .public)"
+            )
+            _ = refreshCurrentDevice(scheduleRecoveryOnFailure: !initial)
             return
         }
 
-        let newCurrent = provider.currentInputDevice()
-        currentDevice = newCurrent
+        guard refreshCurrentDevice(scheduleRecoveryOnFailure: !initial) else {
+            if initial {
+                startupTopologyRecoveryPending = true
+            }
+            return
+        }
+
+        let newCurrent = currentDevice
         let newUIDs = Set(newDevices.map(\.uid))
 
         // Devices / DefaultInput 不是原子 snapshot。首次启动时如果 current 不在本轮
@@ -1506,8 +1540,22 @@ final class AudioMonitor {
         preferredMicrophoneUID = current.uid
     }
 
-    private func refreshCurrentDevice() {
-        currentDevice = provider.currentInputDevice()
+    /// 读取真实默认输入。失败时保留最后一次可信 current；调用方可选择安排 recovery。
+    @discardableResult
+    private func refreshCurrentDevice(scheduleRecoveryOnFailure: Bool = true) -> Bool {
+        do {
+            currentDevice = try provider.currentInputDevice()
+            return true
+        } catch {
+            deviceEnumerationError = "Unable to read current input device"
+            Self.logger.error(
+                "CURRENT_INPUT_READ_FAILED providerError=\(String(describing: error), privacy: .public)"
+            )
+            if scheduleRecoveryOnFailure {
+                scheduleTopologySampleRecovery()
+            }
+            return false
+        }
     }
 
     /// 更新并持久化最近已知设备名，离线设备在 UI 上仍可显示可读名字。

@@ -22,6 +22,9 @@ final class FakeAudioDeviceProvider: AudioDeviceProviding {
     /// 模拟设备枚举失败；nil 表示枚举成功（即使 devices == [] 也属于成功空列表）。
     var listInputDevicesError: Error?
 
+    /// 模拟默认输入读取失败；失败时不能把 monitor 最后一次可信 current 覆盖成 nil。
+    var currentInputDeviceError: Error?
+
     func listInputDevices() throws -> [AudioInputDevice] {
         if let listInputDevicesError {
             throw listInputDevicesError
@@ -29,27 +32,31 @@ final class FakeAudioDeviceProvider: AudioDeviceProviding {
         return devices
     }
 
-    func currentInputDevice() -> AudioInputDevice? {
-        current
+    func currentInputDevice() throws -> AudioInputDevice? {
+        if let currentInputDeviceError {
+            throw currentInputDeviceError
+        }
+        return current
     }
 
-    @discardableResult
-    func setInputDevice(uid: String) -> Bool {
+    func setInputDevice(uid: String) throws {
         setCalls.append(uid)
 
-        guard !forceSetFailure else {
-            return false
+        if forceSetFailure {
+            throw AudioDeviceProviderError.coreAudio(
+                operation: .setDefaultInputDevice,
+                objectID: nil,
+                status: -1
+            )
         }
 
         guard let device = devices.first(where: { $0.uid == uid }) else {
-            return false
+            throw AudioDeviceProviderError.targetDeviceNotFound(uid: uid)
         }
 
         if applySetImmediately {
             current = device
         }
-
-        return true
     }
 }
 

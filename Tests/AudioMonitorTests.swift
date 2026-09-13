@@ -49,6 +49,8 @@ func runAllTests() async {
     testUserSelectionInsideSettleWindow()
     testProtectionOff()
     testStartupEnforce()
+    await testStartupCurrentReadFailureRecoversWithoutExternalCallback()
+    await testRuntimeCurrentReadFailurePreservesLastTrustedCurrent()
     await testStartupEnumerationFailureRecoversWithoutExternalCallback()
     await testFreshInstallEnumerationFailurePrefersBuiltInOverCurrent()
     await testFreshInstallEnumerationFailureWithNilCurrentPrefersBuiltIn()
@@ -487,7 +489,7 @@ private func testEnumerationFailureDoesNotApplyEmptyTopology() {
 
     expect(provider.setCalls == [builtInMic.uid], "restore is pending before enumeration failure")
 
-    provider.listInputDevicesError = AudioDeviceProviderError.inputDeviceEnumerationFailed
+    provider.listInputDevicesError = AudioDeviceProviderError.coreAudio(operation: .enumerateDeviceListData, objectID: nil, status: -1)
     monitor.handleDefaultInputChanged()
 
     expect(monitor.currentDevice?.uid == airpodsMic.uid, "current still refreshes when enumeration fails")
@@ -524,7 +526,7 @@ private func testPendingSwitchConfirmsWhenEnumerationFailsButCurrentReachedTarge
     expect(provider.setCalls == [builtInMic.uid], "restore starts pending")
 
     provider.current = builtInMic
-    provider.listInputDevicesError = AudioDeviceProviderError.inputDeviceEnumerationFailed
+    provider.listInputDevicesError = AudioDeviceProviderError.coreAudio(operation: .enumerateDeviceListData, objectID: nil, status: -1)
     monitor.handleDefaultInputChanged()
 
     expect(monitor.currentDevice?.uid == builtInMic.uid, "current target is reflected immediately")
@@ -544,7 +546,7 @@ private func testManualRestoresWhenEnumerationFails() {
         mode: .manual
     )
 
-    provider.listInputDevicesError = AudioDeviceProviderError.inputDeviceEnumerationFailed
+    provider.listInputDevicesError = AudioDeviceProviderError.coreAudio(operation: .enumerateDeviceListData, objectID: nil, status: -1)
     provider.current = airpodsMic
     monitor.handleDefaultInputChanged()
 
@@ -849,7 +851,7 @@ private func testCandidateRecoversAfterEnumerationFailure() async {
     provider.current = usbMic
     monitor.handleDefaultInputChanged()
 
-    provider.listInputDevicesError = AudioDeviceProviderError.inputDeviceEnumerationFailed
+    provider.listInputDevicesError = AudioDeviceProviderError.coreAudio(operation: .enumerateDeviceListData, objectID: nil, status: -1)
     await waitPastStableExternalSwitchClassification()
 
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "invalid confirmation snapshot does not learn candidate")
@@ -1394,6 +1396,86 @@ private func testStartupEnforce() {
     expect(notifier.presentCount == 0, "startup restore does not notify")
 }
 
+/// init 时设备枚举成功，但默认输入读取瞬时失败：不能把失败解释成“没有默认输入”。
+/// start() 进入启动策略后应主动重采样；不依赖任何外部 callback 也要最终恢复 persisted preferred。
+@MainActor
+private func testStartupCurrentReadFailureRecoversWithoutExternalCallback() async {
+    test("startup current read failure recovers without external callback")
+
+    let scheduler = ManualAudioMonitorScheduler()
+    let suite = "MicLockTests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.removePersistentDomain(forName: suite)
+    defaults.set(builtInMic.uid, forKey: Preferences.preferredMicrophoneUIDKey)
+    defaults.set(true, forKey: Preferences.protectionEnabledKey)
+    defaults.set(ProtectionMode.auto.rawValue, forKey: Preferences.protectionModeKey)
+    defaults.set(true, forKey: Preferences.notificationsEnabledKey)
+    defaults.set(1.0, forKey: Preferences.settleSecondsKey)
+
+    let provider = FakeAudioDeviceProvider()
+    provider.devices = [builtInMic, airpodsMic]
+    provider.current = airpodsMic
+    provider.currentInputDeviceError = AudioDeviceProviderError.coreAudio(
+        operation: .queryDefaultInputDevice,
+        objectID: nil,
+        status: -1
+    )
+
+    let notifier = RecordingNotifier()
+    let monitor = AudioMonitor(
+        provider: provider,
+        preferences: Preferences(defaults: defaults),
+        notifier: notifier,
+        scheduler: scheduler
+    )
+
+    expect(monitor.currentDevice == nil, "failed initial current read does not invent a real no-default state")
+    expect(monitor.deviceEnumerationError != nil, "current read failure is surfaced")
+
+    // 模拟 start()：listeners 已就绪后启动 recovery；期间没有任何 CoreAudio callback。
+    monitor.evaluateStartupPolicy()
+    provider.currentInputDeviceError = nil
+    await scheduler.advance(by: .milliseconds(250))
+
+    expect(provider.setCalls == [builtInMic.uid], "startup recovery restores preferred after current read recovers")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "startup recovery confirms the restored current")
+    expect(monitor.recentAudioEvents.first?.kind == .restored(.startup), "startup semantics are preserved")
+    expect(notifier.presentCount == 0, "startup recovery stays silent")
+}
+
+/// 运行中 current property read 失败时，最后一次可信 current 必须保留；
+/// recovery 成功后再根据新事实执行策略。
+@MainActor
+private func testRuntimeCurrentReadFailurePreservesLastTrustedCurrent() async {
+    test("runtime current read failure preserves last trusted current")
+
+    let scheduler = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, airpodsMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual,
+        scheduler: scheduler
+    )
+
+    provider.current = airpodsMic
+    provider.currentInputDeviceError = AudioDeviceProviderError.coreAudio(
+        operation: .queryDefaultInputDevice,
+        objectID: nil,
+        status: -1
+    )
+    monitor.handleDefaultInputChanged()
+
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "failed read preserves the last trusted current")
+    expect(provider.setCalls.isEmpty, "policy does not act on an unreadable current sample")
+
+    provider.currentInputDeviceError = nil
+    await scheduler.advance(by: .milliseconds(250))
+
+    expect(provider.setCalls == [builtInMic.uid], "recovery observes AirPods and restores BuiltIn")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "recovery converges back to the preferred current")
+}
+
 /// init 时 topology 枚举瞬时失败，且之后没有任何外部 CoreAudio callback：
 /// 启动阶段必须主动恢复枚举，并把第一份可信快照作为 startup baseline，
 /// 最终使用 .startup 语义恢复 preferred，且不发送通知。
@@ -1415,7 +1497,7 @@ private func testStartupEnumerationFailureRecoversWithoutExternalCallback() asyn
     let provider = FakeAudioDeviceProvider()
     provider.devices = [builtInMic, airpodsMic]
     provider.current = airpodsMic
-    provider.listInputDevicesError = AudioDeviceProviderError.inputDeviceEnumerationFailed
+    provider.listInputDevicesError = AudioDeviceProviderError.coreAudio(operation: .enumerateDeviceListData, objectID: nil, status: -1)
 
     let notifier = RecordingNotifier()
     let monitor = AudioMonitor(
@@ -1463,7 +1545,7 @@ private func testFreshInstallEnumerationFailurePrefersBuiltInOverCurrent() async
     let provider = FakeAudioDeviceProvider()
     provider.devices = [builtInMic, airpodsMic]
     provider.current = airpodsMic
-    provider.listInputDevicesError = AudioDeviceProviderError.inputDeviceEnumerationFailed
+    provider.listInputDevicesError = AudioDeviceProviderError.coreAudio(operation: .enumerateDeviceListData, objectID: nil, status: -1)
 
     let monitor = AudioMonitor(
         provider: provider,
@@ -1499,7 +1581,7 @@ private func testFreshInstallEnumerationFailureWithNilCurrentPrefersBuiltIn() as
     let provider = FakeAudioDeviceProvider()
     provider.devices = [builtInMic, airpodsMic]
     provider.current = nil
-    provider.listInputDevicesError = AudioDeviceProviderError.inputDeviceEnumerationFailed
+    provider.listInputDevicesError = AudioDeviceProviderError.coreAudio(operation: .enumerateDeviceListData, objectID: nil, status: -1)
 
     let monitor = AudioMonitor(
         provider: provider,
