@@ -292,6 +292,15 @@ final class AudioMonitor {
         case awaitingConfirmation(PendingSwitch)
     }
 
+    /// pending transaction 对本轮 reconciliation 的消费语义。
+    /// Trusted watchdog expiry 需要单独表示：transaction 已经结束，但 synthetic
+    /// watchdog observation 不能自动获得 Auto external-switch evidence 资格。
+    private enum PendingReconcileResult {
+        case consumed
+        case trustedSelectionExpired
+        case continuePolicy
+    }
+
     /// MicLock 自己发起的切换事务；目标、解释事件与通知必须原子地属于同一笔事务。
     @ObservationIgnored private var programmaticSwitchState: ProgrammaticSwitchState = .idle
     @ObservationIgnored private var programmaticSwitchWatchdogTask: AudioMonitorScheduledTask?
@@ -690,7 +699,7 @@ final class AudioMonitor {
             )
 
             if confirmedProgrammaticSwitch { return }
-            if reconcilePendingSwitchUsingCurrentOnly(observedCurrent: newCurrent, trigger: trigger) { return }
+            if shouldStopAfterPendingReconcile(observedCurrent: newCurrent, trigger: trigger) { return }
             reconcileWithoutTrustedTopology(previous: previous, current: newCurrent)
             return
         }
@@ -712,7 +721,7 @@ final class AudioMonitor {
             )
 
             if confirmedProgrammaticSwitch { return }
-            if reconcilePendingSwitchUsingCurrentOnly(observedCurrent: newCurrent, trigger: trigger) { return }
+            if shouldStopAfterPendingReconcile(observedCurrent: newCurrent, trigger: trigger) { return }
             reconcileWithoutTrustedTopology(previous: previous, current: newCurrent)
             return
         }
@@ -731,7 +740,7 @@ final class AudioMonitor {
             )
 
             if confirmedProgrammaticSwitch { return }
-            if reconcilePendingSwitchUsingCurrentOnly(observedCurrent: newCurrent, trigger: trigger) { return }
+            if shouldStopAfterPendingReconcile(observedCurrent: newCurrent, trigger: trigger) { return }
             reconcileWithoutTrustedTopology(previous: previous, current: newCurrent)
             return
         }
@@ -770,7 +779,7 @@ final class AudioMonitor {
                 )
             }
 
-            if reconcilePendingSwitchUsingCurrentOnly(observedCurrent: newCurrent, trigger: trigger) { return }
+            if shouldStopAfterPendingReconcile(observedCurrent: newCurrent, trigger: trigger) { return }
             evaluateStartupPolicy()
             return
         }
@@ -818,7 +827,7 @@ final class AudioMonitor {
             )
         }
 
-        if reconcilePendingSwitchUsingCurrentOnly(observedCurrent: newCurrent, trigger: trigger) { return }
+        if shouldStopAfterPendingReconcile(observedCurrent: newCurrent, trigger: trigger) { return }
         guard let current = currentDevice else { return }
 
         Self.trace(
@@ -919,17 +928,38 @@ final class AudioMonitor {
         restorePreferred(from: current, to: preferred, reason: .manualLock)
     }
 
+    /// 统一决定 pending transaction 是否应截断本轮 reconciliation。
+    /// Trusted watchdog expiry 在 Auto 下必须停在这里：该 observation 是 MicLock 自己
+    /// 的 synthetic re-read，不能据此创建 StableExternalSwitchCandidate；Manual 则仍需
+    /// 继续 normal protection policy，以便必要时 restore 最新 preferred。
+    private func shouldStopAfterPendingReconcile(
+        observedCurrent: AudioInputDevice?,
+        trigger: CoreAudioWakeReason
+    ) -> Bool {
+        switch reconcilePendingSwitchUsingCurrentOnly(
+            observedCurrent: observedCurrent,
+            trigger: trigger
+        ) {
+        case .consumed:
+            return true
+        case .trustedSelectionExpired:
+            return trigger == .programmaticSwitchWatchdog
+                && protectionMode == .auto
+        case .continuePolicy:
+            return false
+        }
+    }
+
     /// PendingSwitch 的 current-only 语义：target 已在调用方通过本轮 fresh observation 确认。
     /// Trusted User Selection 只关心“最新 MicLock target 是否已确认”，不根据 source、
     /// third current 或 callback 类型推断 writer/provenance；Protection Restore 则保留
     /// 原有 source/third-state 语义与 persistent retry。
-    @discardableResult
     private func reconcilePendingSwitchUsingCurrentOnly(
         observedCurrent: AudioInputDevice?,
         trigger: CoreAudioWakeReason
-    ) -> Bool {
+    ) -> PendingReconcileResult {
         guard case .awaitingConfirmation(let pending) = programmaticSwitchState else {
-            return false
+            return .continuePolicy
         }
 
         if case .trustedUserSelection = pending.origin {
@@ -940,7 +970,7 @@ final class AudioMonitor {
             // 非 target callback 无法说明是谁写入；在短 Trusted 窗口内只保持 latest target，
             // 等 watchdog fresh-read/retry，不做 external-vs-old-write provenance 推断。
             scheduleProgrammaticSwitchWatchdog(for: pending)
-            return true
+            return .consumed
         }
 
         guard let current = observedCurrent else {
@@ -949,7 +979,7 @@ final class AudioMonitor {
             } else {
                 scheduleProgrammaticSwitchWatchdog(for: pending)
             }
-            return true
+            return .consumed
         }
 
         Self.trace(
@@ -964,7 +994,7 @@ final class AudioMonitor {
             } else {
                 scheduleProgrammaticSwitchWatchdog(for: pending)
             }
-            return true
+            return .consumed
         }
 
         // Protection restore 的第三状态属于更新事实：结束旧 transaction，
@@ -973,21 +1003,24 @@ final class AudioMonitor {
         Self.logger.info(
             "PROGRAMMATIC_SWITCH superseded id=\(pending.id, privacy: .public) current=\(current.uid, privacy: .public) trigger=\(trigger.rawValue, privacy: .public)"
         )
-        return false
+        return .continuePolicy
     }
 
     /// Trusted User Selection 的唯一 watchdog 生命周期：一次 fast retry + 一次最终确认。
-    /// 返回 false 表示 transaction 已到期，调用方可继续运行本轮正常 policy。
+    /// expiry 单独返回 `.trustedSelectionExpired`，由调用方根据 trigger / mode 决定
+    /// synthetic watchdog observation 是否有资格继续进入 normal policy。
     @discardableResult
-    private func handleTrustedUserSelectionWatchdog(_ pending: PendingSwitch) -> Bool {
+    private func handleTrustedUserSelectionWatchdog(
+        _ pending: PendingSwitch
+    ) -> PendingReconcileResult {
         guard case .awaitingConfirmation(let currentPending) = programmaticSwitchState,
               currentPending.id == pending.id,
               case .trustedUserSelection = currentPending.origin
-        else { return false }
+        else { return .continuePolicy }
 
         if currentPending.retryAttempt < Self.trustedUserSelectionMaxRetryAttempts {
             retryProgrammaticSwitch(currentPending)
-            return true
+            return .consumed
         }
 
         cancelProgrammaticSwitch()
@@ -995,7 +1028,7 @@ final class AudioMonitor {
         Self.logger.warning(
             "PROGRAMMATIC_SWITCH trusted selection expired id=\(currentPending.id, privacy: .public) target=\(currentPending.targetUID, privacy: .public)"
         )
-        return false
+        return .trustedSelectionExpired
     }
 
     /// Trusted confirmation timeout 只描述“当时未能确认”，不是永久错误。

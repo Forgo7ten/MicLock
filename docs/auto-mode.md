@@ -164,7 +164,7 @@ awaitingConfirmation(PendingSwitch)
 2. 只有在 topology sample 有效且跨属性一致时，`targetUID` 不在线才可作为目标明确不可达的失败证据
 3. Protection Restore：`sourceUID != nil && current.uid == sourceUID` 表示写入尚未反映；watchdog 按 500ms → 1s → 2s → 4s → 8s → 16s → 32s → 64s 重新读取并重试 setter，之后固定 64s 一次。任何 accepted retry 都会重新开启/延长 settle，并可更新 `ProtectionRetryState`
 4. Protection Restore 的其余第三状态仍按“更新事实”处理：旧 restore transaction 被 supersede，再由当前 protection policy 决定后续
-5. Trusted User Selection 不解释 source / third current / callback 类型的 provenance。只要 fresh current 还不是最新 target，就继续保持最新 MicLock target；500ms watchdog 做唯一一次 fast retry，再给 500ms 最终确认窗口。若约 1 秒后仍未确认，则结束 Trusted transaction，立刻把当前状态交回正常 policy，不进入 1/2/4/.../64s 的后台 retry
+5. Trusted User Selection 不解释 source / third current / callback 类型的 provenance。只要 fresh current 还不是最新 target，就继续保持最新 MicLock target；500ms watchdog 做唯一一次 fast retry，再给 500ms 最终确认窗口。若约 1 秒后仍未确认，则结束 Trusted transaction，不进入 1/2/4/.../64s 的后台 retry。若 expiry 来自 `programmaticSwitchWatchdog`，这次 synthetic observation 在 Auto 下到此结束，不能作为 external-switch learning 的证据；Manual 则仍可继续 normal protection policy
 6. topology sample 无效或 partial：不能做 target-offline 判定；策略继续使用上一份完整可信 topology，partial 中健康设备仍可更新 UI，并通过独立 recovery retry 重新采样
 7. Trusted User Selection 为 latest-wins：新的 MicLock 点击立即取消旧 Trusted transaction、建立新 transaction 并 `set(newTarget)`。旧 setter 若稍后回声为旧 target，只会更新 current UI；它既不能完成也不能取消最新 transaction。只有最新 target 的 fresh confirmation 才能提交 Recent Event
 

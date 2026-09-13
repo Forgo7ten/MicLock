@@ -27,8 +27,10 @@ func runAllTests() async {
     await testLateSupersededTrustedCallbackDoesNotCancelLatest()
     testRapidTrustedSelectionsTrackOnlyLatestTransaction()
     await testTrustedSelectionExpiresAfterSingleFastRetry()
+    await testTrustedTimeoutDoesNotCreateAutoExternalSwitchCandidate()
     await testLateTrustedSuccessClearsConfirmationError()
-    await testAcceptedExternalSwitchClearsExpiredTrustedConfirmationError()
+    await testRealExternalSwitchAfterTrustedTimeoutIsAccepted()
+    await testTrustedTimeoutStillFallsThroughToManualProtection()
     await testTrustedSelectionExpirySurvivesCurrentReadFailure()
     await testNilSourcePendingSwitchWatchdogRetriesWithoutCurrent()
     testEnumerationFailureDoesNotApplyEmptyTopology()
@@ -698,6 +700,45 @@ private func testTrustedSelectionExpiresAfterSingleFastRetry() async {
     expect(provider.setCalls == [usbMic.uid, usbMic.uid], "expired trusted command never enters background 64s retry")
 }
 
+/// Auto + Protection ON 下，Trusted final watchdog 是 synthetic observation。
+/// timeout 只能结束 Trusted command，不能把未变化的 current 反向学习成 external switch。
+@MainActor
+private func testTrustedTimeoutDoesNotCreateAutoExternalSwitchCandidate() async {
+    test("trusted timeout does not create auto external switch candidate")
+
+    let scheduler = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto,
+        protection: true,
+        settle: 1.0,
+        scheduler: scheduler
+    )
+
+    provider.applySetImmediately = false
+    monitor.selectDevice(usbMic)
+    await scheduler.advance(by: .seconds(1))
+
+    expect(provider.setCalls == [usbMic.uid, usbMic.uid], "trusted command performs only initial set plus one fast retry")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "current remains BuiltIn when trusted command expires")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "trusted timeout preserves the user's latest preferred USB")
+    expect(monitor.lastError == "Unable to confirm default input change", "trusted timeout reports confirmation failure")
+    expect(
+        !monitor.recentAudioEvents.contains(where: { $0.kind == .acceptedUserSwitch }),
+        "synthetic trusted timeout does not fabricate an accepted external switch"
+    )
+
+    await scheduler.advance(by: .seconds(5))
+
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "no later candidate timer can learn unchanged BuiltIn as preferred")
+    expect(
+        !monitor.recentAudioEvents.contains(where: { $0.kind == .acceptedUserSwitch }),
+        "no accepted external switch appears without a real callback"
+    )
+}
+
 /// Trusted 已 timeout 后，HAL 仍可能稍晚完成之前 accepted 的 setter。
 /// fresh current 一旦证明 current == preferred，就必须清掉已经被解决的 confirmation error。
 @MainActor
@@ -732,15 +773,15 @@ private func testLateTrustedSuccessClearsConfirmationError() async {
     expect(provider.setCalls == [usbMic.uid, usbMic.uid], "late callback only clears transient error and does not issue another setter")
 }
 
-/// Auto 可能在 Trusted timeout 后接受当前设备为新的 preferred。candidate 提交使用的是
-/// fresh current，因此 preferred 更新后同样应清掉已经不再成立的 Trusted confirmation error。
+/// Trusted timeout 只屏蔽产生 timeout 的 synthetic watchdog；之后真正的 default-input
+/// callback 仍然是新的外部事实，可以正常进入 Auto candidate 并在 settle 后被接受。
 @MainActor
-private func testAcceptedExternalSwitchClearsExpiredTrustedConfirmationError() async {
-    test("accepted external switch clears expired trusted confirmation error")
+private func testRealExternalSwitchAfterTrustedTimeoutIsAccepted() async {
+    test("real external switch after trusted timeout is accepted")
 
     let scheduler = ManualAudioMonitorScheduler()
     let (monitor, provider, _) = makeMonitor(
-        devices: [builtInMic, usbMic],
+        devices: [builtInMic, usbMic, airpodsMic],
         current: builtInMic,
         preferred: builtInMic.uid,
         mode: .auto,
@@ -753,15 +794,51 @@ private func testAcceptedExternalSwitchClearsExpiredTrustedConfirmationError() a
     monitor.selectDevice(usbMic)
     await scheduler.advance(by: .seconds(1))
 
-    expect(monitor.preferredMicrophoneUID == usbMic.uid, "expired trusted command still prefers USB before Auto candidate settles")
-    expect(monitor.lastError == "Unable to confirm default input change", "expired trusted command exposes confirmation error while candidate is pending")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "trusted timeout preserves USB as the user's latest preferred")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "current remains BuiltIn after trusted timeout")
 
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
     await scheduler.advance(by: .seconds(1))
 
-    expect(monitor.currentDevice?.uid == builtInMic.uid, "current remains BuiltIn through candidate confirmation")
-    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "stable external candidate accepts current BuiltIn as preferred")
-    expect(monitor.lastError == nil, "candidate preferred commit clears the resolved trusted confirmation error")
-    expect(provider.setCalls == [usbMic.uid, usbMic.uid], "candidate acceptance does not issue another trusted setter")
+    expect(monitor.currentDevice?.uid == airpodsMic.uid, "real external callback updates current to AirPods")
+    expect(monitor.preferredMicrophoneUID == airpodsMic.uid, "Auto accepts the real external switch after settle")
+    expect(
+        monitor.recentAudioEvents.contains {
+            $0.kind == .acceptedUserSwitch
+                && $0.fromDeviceName == usbMic.name
+                && $0.toDeviceName == airpodsMic.name
+        },
+        "accepted external event records USB to AirPods"
+    )
+}
+
+/// Manual 不做 external-switch learning；Trusted timeout 后仍应继续 normal Manual policy，
+/// 因而 current != preferred 时会启动 Protection Restore，而不是被 timeout 结果截断。
+@MainActor
+private func testTrustedTimeoutStillFallsThroughToManualProtection() async {
+    test("trusted timeout still falls through to manual protection")
+
+    let scheduler = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual,
+        protection: true,
+        scheduler: scheduler
+    )
+
+    provider.applySetImmediately = false
+    monitor.selectDevice(usbMic)
+    await scheduler.advance(by: .seconds(1))
+
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "Trusted timeout keeps USB as preferred in Manual mode")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "current remains BuiltIn when Trusted command expires")
+    expect(
+        provider.setCalls == [usbMic.uid, usbMic.uid, usbMic.uid],
+        "Manual policy immediately starts a Protection Restore after Trusted expiry"
+    )
 }
 
 /// current read failure 不能绕过 Trusted 的 bounded lifetime；否则 final watchdog 的早退
