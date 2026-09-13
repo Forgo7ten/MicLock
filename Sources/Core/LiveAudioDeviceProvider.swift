@@ -15,8 +15,8 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
 
     func listInputDevices() throws -> [AudioInputDevice] {
         try allDevices().compactMap { deviceID -> AudioInputDevice? in
-            guard hasInputStreams(deviceID) else { return nil }
-            guard let uid = deviceUID(deviceID) else { return nil }
+            guard try hasInputStreams(deviceID) else { return nil }
+            let uid = try requiredDeviceUID(deviceID)
 
             return AudioInputDevice(
                 uid: uid,
@@ -29,8 +29,7 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
 
     func currentInputDevice() -> AudioInputDevice? {
         guard let deviceID = defaultInputDeviceID() else { return nil }
-
-        guard let uid = deviceUID(deviceID) else { return nil }
+        guard let uid = try? requiredDeviceUID(deviceID) else { return nil }
 
         return AudioInputDevice(
             uid: uid,
@@ -42,7 +41,9 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
 
     func setInputDevice(uid: String) -> Bool {
         guard let allDevices = try? allDevices() else { return false }
-        let target = allDevices.first { deviceUID($0) == uid }
+        let target = allDevices.first { deviceID in
+            (try? requiredDeviceUID(deviceID)) == uid
+        }
 
         guard let deviceID = target else { return false }
 
@@ -97,7 +98,7 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         return devices
     }
 
-    private func hasInputStreams(_ deviceID: AudioDeviceID) -> Bool {
+    private func hasInputStreams(_ deviceID: AudioDeviceID) throws -> Bool {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreams,
             mScope: kAudioObjectPropertyScopeInput,
@@ -107,10 +108,14 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         var size: UInt32 = 0
         let status = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size)
 
-        return status == noErr && size > 0
+        guard status == noErr else {
+            throw AudioDeviceProviderError.inputStreamQueryFailed(deviceID)
+        }
+
+        return size > 0
     }
 
-    private func deviceUID(_ deviceID: AudioDeviceID) -> String? {
+    private func requiredDeviceUID(_ deviceID: AudioDeviceID) throws -> String {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyDeviceUID,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -124,9 +129,13 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
             AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, pointer)
         }
 
-        guard status == noErr else { return nil }
+        guard status == noErr,
+              let uid = value?.takeUnretainedValue() as String?
+        else {
+            throw AudioDeviceProviderError.deviceUIDQueryFailed(deviceID)
+        }
 
-        return value?.takeUnretainedValue() as String?
+        return uid
     }
 
     private func deviceName(_ deviceID: AudioDeviceID) -> String? {

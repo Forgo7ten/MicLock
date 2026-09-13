@@ -16,8 +16,14 @@ func runAllTests() async {
     testPendingSwitchFailsWhenTargetDisappears()
     testPendingSwitchFailsWhenTargetDisappearsAndCurrentIsNil()
     testNilSourcePendingSwitchIsSupersededByNonTargetCurrent()
+    await testNilSourcePendingSwitchWatchdogRetriesWithoutCurrent()
     testEnumerationFailureDoesNotApplyEmptyTopology()
+    testPendingSwitchConfirmsWhenEnumerationFailsButCurrentReachedTarget()
+    testManualRestoresWhenEnumerationFails()
+    await testPendingSwitchWatchdogRetriesStuckSource()
     await testCandidateRecoversAfterEnumerationFailure()
+    await testPreferredRemovalBeyondLegacyCandidateDelay()
+    await testCurrentMissingFromTopologyIsInconclusive()
     testPendingRestoreIsAtomicallySupersededByModeChange()
     testIntermediateCallbackWhileExpectedDoesNotRestoreAgain()
     testA1_NewDeviceHijack()
@@ -320,6 +326,28 @@ private func testNilSourcePendingSwitchIsSupersededByNonTargetCurrent() {
     )
 }
 
+/// sourceUID == nil 且 current 仍为 nil 时，watchdog 也必须主动重试 setter；
+/// 不能因为没有 source/current 可比较而永久 pending。
+@MainActor
+private func testNilSourcePendingSwitchWatchdogRetriesWithoutCurrent() async {
+    test("nil-source pending switch watchdog retries without current")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [usbMic],
+        current: nil,
+        preferred: nil,
+        mode: .manual
+    )
+
+    provider.applySetImmediately = false
+    monitor.selectDevice(usbMic)
+    expect(provider.setCalls == [usbMic.uid], "nil-source transaction starts with one setter")
+
+    try? await Task.sleep(for: .milliseconds(700))
+
+    expect(provider.setCalls.count >= 2, "watchdog retries even while current remains nil")
+}
+
 /// 设备枚举失败与成功空列表必须区分。枚举失败时只刷新可独立读取的 current，
 /// 不得把 [] 当成真实 topology、不得失败 pending transaction。
 @MainActor
@@ -355,6 +383,135 @@ private func testEnumerationFailureDoesNotApplyEmptyTopology() {
     expect(monitor.deviceEnumerationError == nil, "successful enumeration clears enumeration error")
     expect(monitor.recentAudioEvents.first?.kind == .restored(.manualLock), "pending restore confirms after enumeration recovers")
     expect(notifier.presentCount == 1, "confirmation still notifies after enumeration recovers")
+}
+
+/// PendingSwitch 已真实到达 target 时，current 本身就是充分成功证据；
+/// 即使同一轮 topology 枚举失败，也必须完成 transaction。
+@MainActor
+private func testPendingSwitchConfirmsWhenEnumerationFailsButCurrentReachedTarget() {
+    test("pending switch confirms when enumeration fails but current reached target")
+
+    let (monitor, provider, notifier) = makeMonitor(
+        devices: [builtInMic, airpodsMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual
+    )
+
+    provider.applySetImmediately = false
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+    expect(provider.setCalls == [builtInMic.uid], "restore starts pending")
+
+    provider.current = builtInMic
+    provider.listInputDevicesError = AudioDeviceProviderError.inputDeviceEnumerationFailed
+    monitor.handleDefaultInputChanged()
+
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "current target is reflected immediately")
+    expect(monitor.recentAudioEvents.first?.kind == .restored(.manualLock), "target confirmation does not depend on topology enumeration")
+    expect(notifier.presentCount == 1, "confirmed restore still notifies")
+}
+
+/// Manual 是严格锁定：topology 枚举瞬时失败时，仍可依赖上一份有效设备表恢复 preferred。
+@MainActor
+private func testManualRestoresWhenEnumerationFails() {
+    test("manual restores when enumeration fails")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, airpodsMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual
+    )
+
+    provider.listInputDevicesError = AudioDeviceProviderError.inputDeviceEnumerationFailed
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls == [builtInMic.uid], "Manual restore still runs with last valid topology")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "immediate provider confirmation restores current")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "preferred remains locked")
+}
+
+/// setter accepted 但 current 长时间停在 source 时，watchdog 必须重新 setter；
+/// 不能让一笔 pending transaction 永久压住保护策略。
+@MainActor
+private func testPendingSwitchWatchdogRetriesStuckSource() async {
+    test("pending switch watchdog retries stuck source")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, airpodsMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual
+    )
+
+    provider.applySetImmediately = false
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+    expect(provider.setCalls == [builtInMic.uid], "initial restore requested")
+
+    try? await Task.sleep(for: .milliseconds(700))
+
+    expect(provider.setCalls.count >= 2, "watchdog retries while current remains source")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "watchdog never learns source as preferred")
+}
+
+/// 旧 200ms candidate 无法覆盖更慢的 HAL 属性分阶段变化。
+/// candidate 现在复用 settleSeconds，因此 350ms 后 topology removal 仍可取消学习。
+@MainActor
+private func testPreferredRemovalBeyondLegacyCandidateDelay() async {
+    test("preferred removal beyond legacy candidate delay")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: usbMic,
+        preferred: usbMic.uid,
+        mode: .auto,
+        settle: 1.0
+    )
+
+    provider.current = builtInMic
+    monitor.handleDefaultInputChanged()
+
+    try? await Task.sleep(for: .milliseconds(350))
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "legacy 200ms boundary no longer commits fallback")
+
+    provider.devices = [builtInMic]
+    monitor.handleDeviceListChanged()
+    await waitPastStableExternalSwitchClassification()
+
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "later topology removal preserves offline preferred")
+}
+
+/// current 不存在于成功枚举的 devices 时，联合采样自相矛盾。
+/// UI 可以显示真实 current，但 Auto 不能学习它，也不能应用假的 removal。
+@MainActor
+private func testCurrentMissingFromTopologyIsInconclusive() async {
+    test("current missing from topology is inconclusive")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto,
+        settle: 1.0
+    )
+
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(monitor.currentDevice?.uid == airpodsMic.uid, "UI follows current even when topology is inconsistent")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "inconsistent sample cannot learn preferred")
+    expect(monitor.devices.map(\.uid) == [builtInMic.uid], "last valid topology remains unchanged")
+
+    try? await Task.sleep(for: .milliseconds(350))
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "recovery retry cannot commit missing current UID")
+
+    provider.devices = [builtInMic, airpodsMic]
+    monitor.handleDeviceListChanged()
+
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "topology catch-up enters settling instead of accepting AirPods")
 }
 
 /// stable candidate 的确认若恰好遇到设备枚举失败，不应永久悬挂。

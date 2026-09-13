@@ -136,7 +136,8 @@ func waitPastSettleWindow() async {
     try? await Task.sleep(for: .seconds(1.4))
 }
 
-/// 等待 stable external switch candidate 的短暂分类窗口结束。
+/// 等待 stable external switch candidate 分类窗口结束。
+/// candidate 复用 settleSeconds；测试默认 settle=1s，因此等待 1.4s。
 func waitPastStableExternalSwitchClassification() async {
-    try? await Task.sleep(for: .milliseconds(350))
+    try? await Task.sleep(for: .seconds(1.4))
 }

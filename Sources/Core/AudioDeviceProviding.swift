@@ -1,5 +1,9 @@
+import CoreAudio
+
 enum AudioDeviceProviderError: Error {
     case inputDeviceEnumerationFailed
+    case inputStreamQueryFailed(AudioDeviceID)
+    case deviceUIDQueryFailed(AudioDeviceID)
 }
 
 /// CoreAudio 访问抽象：策略层只依赖本协议，测试注入 Fake 实现。
