@@ -483,7 +483,7 @@ private func testA1_NewDeviceHijack() {
 }
 
 /// A1 反序回归：DefaultInput callback 先于 Devices callback 时，
-/// 第一次 wake-up 也必须从 CoreAudio 重读完整 snapshot 并识别新增设备抢麦。
+/// 第一次 wake-up 会重新读取当时可观察到的 devices/current，并在 topology 已同步时识别新增设备抢麦。
 @MainActor
 private func testA1_DefaultCallbackBeforeDeviceAddedCallback() {
     test("A1 default callback before device-added callback")
