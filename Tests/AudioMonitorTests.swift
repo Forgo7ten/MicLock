@@ -17,6 +17,7 @@ func runAllTests() async {
     testPendingSwitchFailsWhenTargetDisappearsAndCurrentIsNil()
     testNilSourcePendingSwitchIsSupersededByNonTargetCurrent()
     testEnumerationFailureDoesNotApplyEmptyTopology()
+    await testCandidateRecoversAfterEnumerationFailure()
     testPendingRestoreIsAtomicallySupersededByModeChange()
     testIntermediateCallbackWhileExpectedDoesNotRestoreAgain()
     testA1_NewDeviceHijack()
@@ -354,6 +355,37 @@ private func testEnumerationFailureDoesNotApplyEmptyTopology() {
     expect(monitor.deviceEnumerationError == nil, "successful enumeration clears enumeration error")
     expect(monitor.recentAudioEvents.first?.kind == .restored(.manualLock), "pending restore confirms after enumeration recovers")
     expect(notifier.presentCount == 1, "confirmation still notifies after enumeration recovers")
+}
+
+/// stable candidate 的确认若恰好遇到设备枚举失败，不应永久悬挂。
+/// 后续有效 wake-up 应能重新安排确认并最终学习 preferred。
+@MainActor
+private func testCandidateRecoversAfterEnumerationFailure() async {
+    test("candidate recovers after enumeration failure")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto
+    )
+
+    provider.current = usbMic
+    monitor.handleDefaultInputChanged()
+
+    provider.listInputDevicesError = AudioDeviceProviderError.inputDeviceEnumerationFailed
+    await waitPastStableExternalSwitchClassification()
+
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "invalid confirmation snapshot does not learn candidate")
+    expect(monitor.deviceEnumerationError != nil, "enumeration failure is visible after candidate confirmation attempt")
+
+    provider.listInputDevicesError = nil
+    monitor.handleDefaultInputChanged()
+    await waitPastStableExternalSwitchClassification()
+
+    expect(monitor.deviceEnumerationError == nil, "valid wake-up clears enumeration error")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "same candidate can be confirmed after enumeration recovers")
+    expect(monitor.recentAudioEvents.first?.kind == .acceptedUserSwitch, "recovered candidate records accepted switch")
 }
 
 /// 新事务必须原子取代旧事务：Auto 恢复未确认时切到 Manual，

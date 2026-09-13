@@ -642,6 +642,9 @@ final class AudioMonitor {
            candidate.oldPreferredUID == preferred.uid,
            candidate.newCurrentUID == current.uid
         {
+            if stableExternalSwitchCandidateTask == nil {
+                scheduleStableExternalSwitchCandidateConfirmation(candidate)
+            }
             return
         }
 
@@ -664,9 +667,21 @@ final class AudioMonitor {
             "STABLE_EXTERNAL_SWITCH_CANDIDATE id=\(candidate.id, privacy: .public) from=\(preferred.uid, privacy: .public) to=\(current.uid, privacy: .public)"
         )
 
+        scheduleStableExternalSwitchCandidateConfirmation(candidate)
+    }
+
+    private func scheduleStableExternalSwitchCandidateConfirmation(
+        _ candidate: StableExternalSwitchCandidate
+    ) {
+        stableExternalSwitchCandidateTask?.cancel()
         stableExternalSwitchCandidateTask = Task { [weak self] in
             try? await Task.sleep(for: Self.stableExternalSwitchClassificationDelay)
             guard !Task.isCancelled, let self else { return }
+
+            // 标记本次 timer 已消费；如果此次确认因枚举失败而无法完成，
+            // 后续同 candidate 的 wake-up 可以重新安排一次确认。
+            self.stableExternalSwitchCandidateTask = nil
+
             guard self.stableExternalSwitchCandidate?.id == candidate.id else { return }
             self.reconcileCoreAudioState(trigger: .stableExternalSwitchConfirmation)
         }

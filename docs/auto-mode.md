@@ -56,7 +56,7 @@ newDevices = try provider.listInputDevices()
 3. 处理 `PendingSwitch` 的确认、取消或 supersede
 4. 最后运行 Auto / Manual policy
 
-对于 **Auto + stable + 外部 default 变化**，即使本轮 `devices` 暂时仍显示旧 preferred 在线，也不会立刻学习新的 preferred，而是建立短暂的 `StableExternalSwitchCandidate`。`currentDevice` 会立即更新供 UI 展示；若随后出现 topology delta，candidate 立即取消并按 topology 事实处理；若短暂分类窗口内 topology 始终不变且 current 仍保持 candidate 目标，才确认这是 stable external switch 并学习新的 preferred。这个 candidate 只延迟“学习 preferred”，不会延迟 corrective restore。
+对于 **Auto + stable + 外部 default 变化**，即使本轮 `devices` 暂时仍显示旧 preferred 在线，也不会立刻学习新的 preferred，而是建立短暂的 `StableExternalSwitchCandidate`。`currentDevice` 会立即更新供 UI 展示；若随后出现 topology delta，candidate 立即取消并按 topology 事实处理；若短暂分类窗口内 topology 始终不变且 current 仍保持 candidate 目标，才确认这是 stable external switch 并学习新的 preferred。若 candidate 的确认采样恰好遇到设备枚举失败，则保留 candidate；后续有效 wake-up 可以重新安排确认。这个 candidate 只延迟“学习 preferred”，不会延迟 corrective restore。
 
 ```mermaid
 flowchart TD
