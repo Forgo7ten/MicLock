@@ -228,7 +228,7 @@ private struct AdvancedSettingsView: View {
                         .frame(minWidth: 52, alignment: .trailing)
                 }
 
-                Text("设备接入或移除后，MicLock 会等待该时间窗口稳定，再判断是否接受或恢复默认麦克风。")
+                Text("设备接入或移除后的稳定窗口内，外部麦克风切换会被视为系统抢麦并立即恢复；窗口结束后，外部切换会被视为用户操作并接受。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
