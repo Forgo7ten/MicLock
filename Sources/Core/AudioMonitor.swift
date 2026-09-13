@@ -99,6 +99,10 @@ final class AudioMonitor {
             preferences.protectionMode = protectionMode
             Self.logger.info("MODE=\(self.protectionMode.rawValue, privacy: .public)")
 
+            // 模式切换是新的用户意图：旧模式下尚未确认的程序化切换事务不应继续
+            // 携带旧 Recent Event / notification 元数据。
+            cancelProgrammaticSwitch()
+
             // auto → manual：保留 preferred，立即执行 manual enforce。
             if protectionMode == .manual {
                 evaluateStartupPolicy()
@@ -129,6 +133,7 @@ final class AudioMonitor {
                 return
             }
             preferences.settleSeconds = settleSeconds
+            rescheduleActiveSettleEpisodeForConfigurationChange()
         }
     }
 
@@ -143,8 +148,22 @@ final class AudioMonitor {
     /// 时间间隔判断使用 monotonic clock。
     private let clock = ContinuousClock()
 
-    @ObservationIgnored private var lastTopologyChange: ContinuousClock.Instant?
+    private struct SettleEpisode {
+        let id: UInt64
+        var revision: UInt64
+        var lastActivity: ContinuousClock.Instant
+        var deadline: ContinuousClock.Instant
+        var notificationSent: Bool
+    }
 
+    private enum StabilityState {
+        case stable
+        case settling(SettleEpisode)
+    }
+
+    /// Auto Mode 的稳定性状态是策略事实来源；Task 只负责唤醒，不承载业务状态。
+    @ObservationIgnored private var stabilityState: StabilityState = .stable
+    @ObservationIgnored private var nextSettleEpisodeID: UInt64 = 0
     @ObservationIgnored private var settleTask: Task<Void, Never>?
 
     @ObservationIgnored private var connectedUIDs: Set<String> = []
@@ -159,6 +178,7 @@ final class AudioMonitor {
         let from: String
         let to: String
         let reason: RestoreReason
+        let episodeID: UInt64?
     }
 
     private struct PendingSwitch {
@@ -182,11 +202,6 @@ final class AudioMonitor {
     @ObservationIgnored private var expectedSwitchTimeoutTask: Task<Void, Never>?
 
     private static let expectedSwitchConfirmationTimeout: Duration = .seconds(1.0)
-
-    /// Auto Mode 保护片段：一次设备拓扑变化期间的所有抢麦/恢复共享
-    /// 一个 episode，通知最多发一条。
-    @ObservationIgnored private var protectionEpisodeActive = false
-    @ObservationIgnored private var protectionEpisodeNotified = false
 
     /// 离线 preferred 设备的最近已知名称（跨启动持久化，用于 UI 展示）。
     @ObservationIgnored private var lastKnownDeviceNames: [String: String]
@@ -527,7 +542,7 @@ final class AudioMonitor {
 
         case .auto:
             let settled = isTopologySettled()
-            Self.trace("auto: settled=\(settled) lastTopologyChange=\(lastTopologyChange != nil)")
+            Self.trace("auto: settled=\(settled)")
             Self.logger.info(
                 "mode=auto settled=\(settled, privacy: .public)"
             )
@@ -718,17 +733,38 @@ final class AudioMonitor {
         guard notificationsEnabled else { return nil }
         guard reason != .startup else { return nil }
 
-        // Auto Mode：一个 protection episode 只通知一次。
-        if protectionMode == .auto, protectionEpisodeNotified { return nil }
+        if protectionMode == .auto,
+           case .settling(let episode) = stabilityState
+        {
+            guard !episode.notificationSent else { return nil }
+            return PendingNotification(
+                from: from,
+                to: to,
+                reason: reason,
+                episodeID: episode.id
+            )
+        }
 
-        return PendingNotification(from: from, to: to, reason: reason)
+        return PendingNotification(
+            from: from,
+            to: to,
+            reason: reason,
+            episodeID: nil
+        )
     }
 
     private func commitNotification(_ pending: PendingNotification?) {
         guard let pending else { return }
 
-        if protectionMode == .auto {
-            protectionEpisodeNotified = true
+        // Auto notification 只修改创建它的 episode；旧事务晚到的 confirmation
+        // 绝不能把一个更新的 episode 标记成已通知。
+        if let episodeID = pending.episodeID,
+           case .settling(var episode) = stabilityState,
+           episode.id == episodeID
+        {
+            guard !episode.notificationSent else { return }
+            episode.notificationSent = true
+            stabilityState = .settling(episode)
         }
 
         // 用户可能在事务确认前关闭通知；关闭后不应投递。
@@ -741,40 +777,108 @@ final class AudioMonitor {
         notifier.presentRestored(from: pending.from, to: pending.to, reason: pending.reason)
     }
 
-    // MARK: - Settle Window
+    // MARK: - Stability State Machine
 
+    /// 返回当前拓扑是否稳定；timer 尚未获得执行机会但 deadline 已过时，
+    /// 这里也会同步完成状态转换，确保决策只依赖一个事实来源。
     private func isTopologySettled() -> Bool {
-        guard let lastTopologyChange else { return true }
-        return lastTopologyChange.duration(to: clock.now) >= .seconds(settleSeconds)
+        switch stabilityState {
+        case .stable:
+            return true
+
+        case .settling(let episode):
+            guard clock.now >= episode.deadline else { return false }
+            finishSettleEpisode(id: episode.id, revision: episode.revision)
+            return true
+        }
     }
 
+    /// 真实拓扑变化或一次 corrective restore 都会使拓扑进入/继续 settling。
+    /// 已存在 episode 时只延长同一 episode，保留 notificationSent。
     private func markTopologyUnsettled() {
-        Self.trace("TOPOLOGY_UNSETTLED settle=\(settleSeconds)")
-        lastTopologyChange = clock.now
-        protectionEpisodeActive = true
+        let now = clock.now
+        let deadline = now.advanced(by: .seconds(settleSeconds))
+        let episode: SettleEpisode
 
-        settleTask?.cancel()
+        switch stabilityState {
+        case .stable:
+            nextSettleEpisodeID &+= 1
+            episode = SettleEpisode(
+                id: nextSettleEpisodeID,
+                revision: 1,
+                lastActivity: now,
+                deadline: deadline,
+                notificationSent: false
+            )
 
-        let seconds = settleSeconds
-        settleTask = Task { [weak self] in
-            guard let self else { return }
-            try? await Task.sleep(for: .seconds(seconds))
-            guard !Task.isCancelled else { return }
-            self.markTopologySettled()
+        case .settling(var current):
+            current.revision &+= 1
+            current.lastActivity = now
+            current.deadline = deadline
+            episode = current
         }
 
-        Self.logger.debug("TOPOLOGY_UNSETTLED settle=\(seconds, privacy: .public)")
+        stabilityState = .settling(episode)
+        scheduleSettleTask(for: episode)
+
+        Self.trace(
+            "TOPOLOGY_SETTLING episode=\(episode.id) revision=\(episode.revision) settle=\(settleSeconds)"
+        )
+        Self.logger.debug(
+            "TOPOLOGY_SETTLING episode=\(episode.id, privacy: .public) revision=\(episode.revision, privacy: .public) settle=\(self.settleSeconds, privacy: .public)"
+        )
     }
 
-    private func markTopologySettled() {
-        guard protectionEpisodeActive else { return }
+    /// settleSeconds 在 episode 运行中修改时，以最后一次 activity 为基点立即生效。
+    private func rescheduleActiveSettleEpisodeForConfigurationChange() {
+        guard case .settling(var episode) = stabilityState else { return }
 
-        Self.trace("TOPOLOGY_SETTLED")
-        protectionEpisodeActive = false
-        protectionEpisodeNotified = false
+        episode.revision &+= 1
+        episode.deadline = episode.lastActivity.advanced(by: .seconds(settleSeconds))
+
+        if clock.now >= episode.deadline {
+            stabilityState = .settling(episode)
+            finishSettleEpisode(id: episode.id, revision: episode.revision)
+            return
+        }
+
+        stabilityState = .settling(episode)
+        scheduleSettleTask(for: episode)
+
+        Self.trace(
+            "TOPOLOGY_SETTLING_RESCHEDULE episode=\(episode.id) revision=\(episode.revision) settle=\(settleSeconds)"
+        )
+    }
+
+    private func scheduleSettleTask(for episode: SettleEpisode) {
+        settleTask?.cancel()
+
+        let delay = clock.now.duration(to: episode.deadline)
+        settleTask = Task { [weak self] in
+            guard let self else { return }
+            if delay > .zero {
+                try? await Task.sleep(for: delay)
+            }
+            guard !Task.isCancelled else { return }
+            self.finishSettleEpisode(id: episode.id, revision: episode.revision)
+        }
+    }
+
+    private func finishSettleEpisode(id: UInt64, revision: UInt64) {
+        guard case .settling(let episode) = stabilityState,
+              episode.id == id,
+              episode.revision == revision,
+              clock.now >= episode.deadline
+        else { return }
+
+        stabilityState = .stable
+        settleTask?.cancel()
         settleTask = nil
 
-        Self.logger.debug("TOPOLOGY_SETTLED")
+        Self.trace("TOPOLOGY_STABLE episode=\(id) revision=\(revision)")
+        Self.logger.debug(
+            "TOPOLOGY_STABLE episode=\(id, privacy: .public) revision=\(revision, privacy: .public)"
+        )
     }
 
     // MARK: - Notification Authorization

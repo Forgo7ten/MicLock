@@ -20,6 +20,7 @@ func runAllTests() async {
     testA3_ManualSwitchInsideSettleWindow()
     await testA4_NewDeviceSettlesThenAccepted()
     testBurst()
+    await testSettleConfigurationChangeKeepsEpisodeNotificationDeduped()
     testPreferredReconnect()
     testPreferredReconnectAlreadyCurrentDoesNotSetAgain()
     testUserSelectionInsideSettleWindow()
@@ -419,6 +420,38 @@ private func testBurst() {
     expect(monitor.currentDevice?.uid == builtInMic.uid, "final current = preferred")
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "preferred stable")
     expect(notifier.presentCount == 1, "one notification per protection episode")
+}
+
+/// 运行中的 settleSeconds 修改必须立即重排当前 episode 的 deadline；
+/// 旧 timer 到点后不能提前结束 episode、重置通知去重状态。
+@MainActor
+private func testSettleConfigurationChangeKeepsEpisodeNotificationDeduped() async {
+    test("settle configuration change keeps episode notification deduped")
+
+    let (monitor, provider, notifier) = makeMonitor(
+        devices: [builtInMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto,
+        settle: 1.0
+    )
+
+    provider.devices = [builtInMic, airpodsMic]
+    monitor.handleDeviceListChanged()
+
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+    expect(notifier.presentCount == 1, "first hijack notifies once")
+
+    // 把当前 episode 从 1s 延长到 30s；等待超过旧 1s deadline。
+    monitor.settleSeconds = 30.0
+    await waitPastSettleWindow()
+
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls == [builtInMic.uid, builtInMic.uid], "second hijack is still restored inside extended episode")
+    expect(notifier.presentCount == 1, "old timer cannot reset notification dedupe")
 }
 
 // MARK: - Reconnect (§61)
