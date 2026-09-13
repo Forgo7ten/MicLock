@@ -19,8 +19,14 @@ final class FakeAudioDeviceProvider: AudioDeviceProviding {
     /// 关闭后由测试手动模拟稍后的 CoreAudio 状态传播。
     var applySetImmediately = true
 
-    func listInputDevices() -> [AudioInputDevice] {
-        devices
+    /// 模拟设备枚举失败；nil 表示枚举成功（即使 devices == [] 也属于成功空列表）。
+    var listInputDevicesError: Error?
+
+    func listInputDevices() throws -> [AudioInputDevice] {
+        if let listInputDevicesError {
+            throw listInputDevicesError
+        }
+        return devices
     }
 
     func currentInputDevice() -> AudioInputDevice? {

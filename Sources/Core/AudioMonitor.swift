@@ -61,6 +61,9 @@ final class AudioMonitor {
     /// CoreAudio 监听基础能力失败；独立于一次性设备操作错误。
     private(set) var listenerError: String?
 
+    /// 输入设备枚举失败；与“成功但没有输入设备”区分。
+    private(set) var deviceEnumerationError: String?
+
     /// 通知权限被系统拒绝时提示用户去系统设置开启。
     private(set) var notificationDenied = false
 
@@ -473,8 +476,24 @@ final class AudioMonitor {
 
     private func reconcileCoreAudioState(trigger: CoreAudioWakeReason) {
         let previous = currentDevice
-        let newDevices = provider.listInputDevices()
         let newCurrent = provider.currentInputDevice()
+
+        let newDevices: [AudioInputDevice]
+        do {
+            newDevices = try provider.listInputDevices()
+            deviceEnumerationError = nil
+        } catch {
+            // current getter 仍可独立成功，UI 应继续反映真实默认输入；但没有可信 topology
+            // 时不能更新 devices/connectedUIDs，也不能运行依赖 topology 的策略判定。
+            currentDevice = newCurrent
+            deviceEnumerationError = "Unable to enumerate input devices"
+            Self.trace("CORE_AUDIO_RECONCILE enumeration-failed trigger=\(trigger.rawValue)")
+            Self.logger.error(
+                "CORE_AUDIO_RECONCILE enumeration failed trigger=\(trigger.rawValue, privacy: .public)"
+            )
+            return
+        }
+
         let newUIDs = Set(newDevices.map(\.uid))
         let added = newUIDs.subtracting(connectedUIDs)
         let removed = connectedUIDs.subtracting(newUIDs)
@@ -979,7 +998,16 @@ final class AudioMonitor {
     // MARK: - Refresh
 
     private func refreshDeviceList(initial: Bool = false) {
-        let newDevices = provider.listInputDevices()
+        let newDevices: [AudioInputDevice]
+        do {
+            newDevices = try provider.listInputDevices()
+            deviceEnumerationError = nil
+        } catch {
+            deviceEnumerationError = "Unable to enumerate input devices"
+            Self.logger.error("DEVICE_LIST enumeration failed")
+            refreshCurrentDevice()
+            return
+        }
 
         devices = Self.sortedDevices(newDevices)
         connectedUIDs = Set(newDevices.map(\.uid))

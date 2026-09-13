@@ -13,8 +13,8 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
 
     // MARK: - AudioDeviceProviding
 
-    func listInputDevices() -> [AudioInputDevice] {
-        allDevices().compactMap { deviceID -> AudioInputDevice? in
+    func listInputDevices() throws -> [AudioInputDevice] {
+        try allDevices().compactMap { deviceID -> AudioInputDevice? in
             guard hasInputStreams(deviceID) else { return nil }
             guard let uid = deviceUID(deviceID) else { return nil }
 
@@ -41,7 +41,8 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
     }
 
     func setInputDevice(uid: String) -> Bool {
-        let target = allDevices().first { deviceUID($0) == uid }
+        guard let allDevices = try? allDevices() else { return false }
+        let target = allDevices.first { deviceUID($0) == uid }
 
         guard let deviceID = target else { return false }
 
@@ -65,7 +66,7 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
 
     // MARK: - CoreAudio Helpers
 
-    private func allDevices() -> [AudioDeviceID] {
+    private func allDevices() throws -> [AudioDeviceID] {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -75,7 +76,9 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         var size: UInt32 = 0
         var status = AudioObjectGetPropertyDataSize(systemObject, &address, 0, nil, &size)
 
-        guard status == noErr else { return [] }
+        guard status == noErr else {
+            throw AudioDeviceProviderError.inputDeviceEnumerationFailed
+        }
 
         let count = Int(size) / MemoryLayout<AudioDeviceID>.size
         guard count > 0 else { return [] }
@@ -87,7 +90,9 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
             return AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, baseAddress)
         }
 
-        guard status == noErr else { return [] }
+        guard status == noErr else {
+            throw AudioDeviceProviderError.inputDeviceEnumerationFailed
+        }
 
         return devices
     }

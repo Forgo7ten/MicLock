@@ -16,6 +16,7 @@ func runAllTests() async {
     testPendingSwitchFailsWhenTargetDisappears()
     testPendingSwitchFailsWhenTargetDisappearsAndCurrentIsNil()
     testNilSourcePendingSwitchIsSupersededByNonTargetCurrent()
+    testEnumerationFailureDoesNotApplyEmptyTopology()
     testPendingRestoreIsAtomicallySupersededByModeChange()
     testIntermediateCallbackWhileExpectedDoesNotRestoreAgain()
     testA1_NewDeviceHijack()
@@ -316,6 +317,43 @@ private func testNilSourcePendingSwitchIsSupersededByNonTargetCurrent() {
         monitor.currentDevice?.uid == airpodsMic.uid,
         "monitor keeps the real non-target current while replacement restore waits"
     )
+}
+
+/// 设备枚举失败与成功空列表必须区分。枚举失败时只刷新可独立读取的 current，
+/// 不得把 [] 当成真实 topology、不得失败 pending transaction。
+@MainActor
+private func testEnumerationFailureDoesNotApplyEmptyTopology() {
+    test("enumeration failure does not apply empty topology")
+
+    let (monitor, provider, notifier) = makeMonitor(
+        devices: [builtInMic, airpodsMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual
+    )
+
+    provider.applySetImmediately = false
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls == [builtInMic.uid], "restore is pending before enumeration failure")
+
+    provider.listInputDevicesError = AudioDeviceProviderError.inputDeviceEnumerationFailed
+    monitor.handleDefaultInputChanged()
+
+    expect(monitor.currentDevice?.uid == airpodsMic.uid, "current still refreshes when enumeration fails")
+    expect(monitor.devices.map(\.uid).sorted() == [airpodsMic.uid, builtInMic.uid].sorted(), "last valid topology is preserved")
+    expect(monitor.deviceEnumerationError != nil, "enumeration failure is surfaced separately")
+    expect(monitor.lastError == nil, "invalid topology snapshot does not fail pending target")
+    expect(provider.setCalls == [builtInMic.uid], "invalid snapshot does not run policy or repeat setter")
+
+    provider.listInputDevicesError = nil
+    provider.current = builtInMic
+    monitor.handleDefaultInputChanged()
+
+    expect(monitor.deviceEnumerationError == nil, "successful enumeration clears enumeration error")
+    expect(monitor.recentAudioEvents.first?.kind == .restored(.manualLock), "pending restore confirms after enumeration recovers")
+    expect(notifier.presentCount == 1, "confirmation still notifies after enumeration recovers")
 }
 
 /// 新事务必须原子取代旧事务：Auto 恢复未确认时切到 Manual，

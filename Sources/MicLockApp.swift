@@ -349,8 +349,8 @@ struct MenuBarView: View {
             }
 
             Group {
-                // 监听基础能力失败优先于一次性设备操作错误。
-                if let error = monitor.listenerError ?? monitor.lastError {
+                // CoreAudio 基础能力 / 枚举错误优先于一次性设备操作错误。
+                if let error = monitor.listenerError ?? monitor.deviceEnumerationError ?? monitor.lastError {
                     Text(error)
                         .font(.caption)
                         .foregroundStyle(.red)
