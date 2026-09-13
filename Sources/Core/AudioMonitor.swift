@@ -241,6 +241,8 @@ final class AudioMonitor {
         .seconds(2),
         .seconds(4),
     ]
+    private static let programmaticSwitchRetryingError =
+        "Unable to confirm default input change; protection is retrying"
 
     /// 离线 preferred 设备的最近已知名称（跨启动持久化，用于 UI 展示）。
     @ObservationIgnored private var lastKnownDeviceNames: [String: String]
@@ -889,7 +891,9 @@ final class AudioMonitor {
             return
         }
 
-        lastError = nil
+        if lastError != Self.programmaticSwitchRetryingError {
+            lastError = nil
+        }
 
         // 恢复后重新开启 settle window：
         // 系统/蓝牙子系统可能立刻再次抢麦，直到稳定前继续保护。
@@ -1024,7 +1028,7 @@ final class AudioMonitor {
         if currentPending.retryAttempt >= Self.programmaticSwitchRetryDelays.count {
             // 时间经过本身不宣告 HAL failure；这里只结束这一笔 transaction，
             // 释放状态机让 protection policy 重新评估并在仍需要时开启新事务。
-            lastError = "Unable to confirm default input change; protection is retrying"
+            lastError = Self.programmaticSwitchRetryingError
             cancelProgrammaticSwitch()
             reconcileCoreAudioState(trigger: .programmaticSwitchWatchdog)
             return
