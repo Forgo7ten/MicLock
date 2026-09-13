@@ -50,6 +50,10 @@ private func testM1_ManualRestore() {
     expect(provider.setCalls == [builtInMic.uid], "restore setter called once for BuiltIn")
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "preferred unchanged")
     expect(monitor.currentDevice?.uid == builtInMic.uid, "current restored to BuiltIn")
+    expect(
+        monitor.recentAudioAction?.kind == .restored(.manualLock),
+        "recent action records manual restore reason"
+    )
 }
 
 /// M2：preferred 离线，系统 fallback → 不 setter、不学习、保留 preferred。
@@ -87,6 +91,10 @@ private func testM3_TrustedUserSelection() {
     expect(monitor.preferredMicrophoneUID == usbMic.uid, "preferred = USB")
     expect(provider.setCalls == [usbMic.uid], "setter called for USB")
     expect(monitor.currentDevice?.uid == usbMic.uid, "current = USB")
+    expect(
+        monitor.recentAudioAction?.kind == .selectedInMicLock,
+        "recent action records trusted MicLock selection"
+    )
 
     // CoreAudio 对 MicLock 自己的 set 产生一次回调：
     // 不得再次 restore、不得误判用户切换。
@@ -121,6 +129,7 @@ private func testUserSelectionFailureDoesNotPersistPreferred() {
         "current remains real previous device"
     )
     expect(monitor.lastError != nil, "selection failure surfaces an error")
+    expect(monitor.recentAudioAction == nil, "failed selection is not recorded as completed")
 }
 
 /// setter 立即反映真实状态时，恢复仍应立即确认并通知。
@@ -254,6 +263,10 @@ private func testA2_SettledUserSwitch() {
     expect(provider.setCalls.isEmpty, "no restore for user-initiated switch")
     expect(monitor.preferredMicrophoneUID == usbMic.uid, "preferred learned = USB")
     expect(notifier.presentCount == 0, "no notification on accept")
+    expect(
+        monitor.recentAudioAction?.kind == .acceptedUserSwitch,
+        "recent action explains accepted Auto Mode user switch"
+    )
 }
 
 /// A3：settle window 内的外部切换 → 按启发式恢复（预期行为，非 bug）。

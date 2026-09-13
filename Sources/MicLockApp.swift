@@ -307,6 +307,24 @@ struct MenuBarView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
+
+                if let action = monitor.recentAudioAction {
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("最近一次操作")
+                            .font(.headline)
+
+                        Text(action.transitionText)
+                            .font(.subheadline)
+                            .lineLimit(1)
+
+                        Text(action.reasonText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             }
 
             Group {
