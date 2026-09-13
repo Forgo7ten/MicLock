@@ -829,7 +829,8 @@ final class AudioMonitor {
     }
 
     /// PendingSwitch 的 current-only 语义：target 已在调用方通过 current==target 确认。
-    /// 只有明确仍停在 source 才继续等待；其余非 target current supersede 旧事务。
+    /// Protection restore 的第三状态可视为更新外部事实；Trusted User Selection 则继续
+    /// 保留最新显式用户意图，直到 target confirmed / offline / 被新用户动作取代。
     @discardableResult
     private func reconcilePendingSwitchUsingCurrentOnly(trigger: CoreAudioWakeReason) -> Bool {
         guard case .awaitingConfirmation(let pending) = programmaticSwitchState else {
@@ -860,6 +861,22 @@ final class AudioMonitor {
             return true
         }
 
+        // 最新一次 MicLock 明确选择的优先级高于更早程序化写入的延迟回声。
+        // Trusted User Selection 只有 target confirmed、可信 topology 证明 target offline，
+        // 或新的用户动作/模式变化才能结束；第三状态只继续向最新 target 收敛。
+        if case .trustedUserSelection = pending.origin {
+            if trigger == .programmaticSwitchWatchdog {
+                retryProgrammaticSwitch(pending)
+            } else {
+                scheduleProgrammaticSwitchWatchdog(for: pending)
+            }
+            Self.logger.info(
+                "PROGRAMMATIC_SWITCH trusted selection retained id=\(pending.id, privacy: .public) current=\(current.uid, privacy: .public) target=\(pending.targetUID, privacy: .public)"
+            )
+            return true
+        }
+
+        // Protection restore 没有覆盖后续外部事实的资格：第三状态仍可 supersede。
         cancelProgrammaticSwitch()
         Self.logger.info(
             "PROGRAMMATIC_SWITCH superseded id=\(pending.id, privacy: .public) current=\(current.uid, privacy: .public)"

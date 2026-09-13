@@ -18,7 +18,8 @@ func runAllTests() async {
     await testDelayedConfirmationBeyondLegacyTimeoutSucceeds()
     testPendingSwitchFailsWhenTargetDisappears()
     testPendingSwitchFailsWhenTargetDisappearsAndCurrentIsNil()
-    testNilSourcePendingSwitchIsSupersededByNonTargetCurrent()
+    testNilSourceTrustedSelectionRetainsExplicitTarget()
+    await testDelayedOlderTrustedSelectionCannotCancelLatestChoice()
     await testNilSourcePendingSwitchWatchdogRetriesWithoutCurrent()
     testEnumerationFailureDoesNotApplyEmptyTopology()
     testPendingSwitchConfirmsWhenEnumerationFailsButCurrentReachedTarget()
@@ -416,11 +417,11 @@ private func testPendingSwitchFailsWhenTargetDisappearsAndCurrentIsNil() {
     expect(notifier.presentCount == 0, "no notification when pending target disappears")
 }
 
-/// sourceUID == nil 时，只要出现非 target 的真实 current，就说明旧事务已被新的外部事实取代。
-/// 不能因为没有 source 可比较而永久挡住后续 policy。
+/// sourceUID == nil 的 Trusted User Selection 同样代表明确用户意图。
+/// 非 target current 不能把它误当成外部 supersede；事务继续等待 / 重试 target。
 @MainActor
-private func testNilSourcePendingSwitchIsSupersededByNonTargetCurrent() {
-    test("nil-source pending switch is superseded by non-target current")
+private func testNilSourceTrustedSelectionRetainsExplicitTarget() {
+    test("nil-source trusted selection retains explicit target")
 
     let (monitor, provider, _) = makeMonitor(
         devices: [usbMic, airpodsMic],
@@ -438,14 +439,50 @@ private func testNilSourcePendingSwitchIsSupersededByNonTargetCurrent() {
     provider.current = airpodsMic
     monitor.handleDefaultInputChanged()
 
-    expect(
-        provider.setCalls == [usbMic.uid, usbMic.uid],
-        "non-target current supersedes nil-source transaction and manual policy continues"
+    expect(provider.setCalls == [usbMic.uid], "third-state callback does not cancel the trusted selection")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "latest explicit target remains preferred")
+    expect(monitor.currentDevice?.uid == airpodsMic.uid, "UI still reflects the real temporary current")
+}
+
+/// A -> B -> C 两次 MicLock 明确选择连续发生时，较早 B 写入的延迟回声不能取消最新 C。
+/// 最新 Trusted User Selection 应持续向 C 收敛，并阻止 B 被 Auto stable candidate 学成 preferred。
+@MainActor
+private func testDelayedOlderTrustedSelectionCannotCancelLatestChoice() async {
+    test("delayed older trusted selection cannot cancel latest choice")
+
+    let scheduler = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic, airpodsMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto,
+        scheduler: scheduler
     )
-    expect(
-        monitor.currentDevice?.uid == airpodsMic.uid,
-        "monitor keeps the real non-target current while replacement restore waits"
-    )
+
+    provider.applySetImmediately = false
+    monitor.selectDevice(usbMic)
+    monitor.selectDevice(airpodsMic)
+
+    expect(provider.setCalls == [usbMic.uid, airpodsMic.uid], "second trusted action supersedes the first transaction")
+    expect(monitor.preferredMicrophoneUID == airpodsMic.uid, "latest trusted target is preferred immediately")
+
+    // 第一笔 B 写入现在才反映到 HAL。
+    provider.current = usbMic
+    monitor.handleDefaultInputChanged()
+
+    expect(monitor.preferredMicrophoneUID == airpodsMic.uid, "delayed B callback cannot overwrite latest preferred C")
+    expect(provider.setCalls == [usbMic.uid, airpodsMic.uid], "callback only retains C transaction; it does not create a new policy restore")
+
+    // 最新 C 事务仍存活；watchdog 到点继续重试 C。
+    await scheduler.advance(by: .milliseconds(500))
+    expect(provider.setCalls == [usbMic.uid, airpodsMic.uid, airpodsMic.uid], "watchdog continues converging to latest target C")
+
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(monitor.currentDevice?.uid == airpodsMic.uid, "latest target eventually confirms")
+    expect(monitor.preferredMicrophoneUID == airpodsMic.uid, "confirmed latest target remains preferred")
+    expect(monitor.recentAudioEvents.first?.kind == .selectedInMicLock, "only the confirmed trusted selection is recorded")
 }
 
 /// sourceUID == nil 且 current 仍为 nil 时，watchdog 也必须主动重试 setter；
