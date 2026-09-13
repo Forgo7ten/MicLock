@@ -13,6 +13,7 @@ func runAllTests() async {
     testRestoreImmediateConfirmation()
     testRestoreWaitsForRealConfirmation()
     await testRestoreSetterRejectionKeepsRetrying()
+    await testProtectionRetryStatusTransitionsAfterSetterRejection()
     await testDelayedConfirmationBeyondLegacyTimeoutSucceeds()
     testPendingSwitchFailsWhenTargetDisappears()
     testPendingSwitchFailsWhenTargetDisappearsAndCurrentIsNil()
@@ -23,6 +24,9 @@ func runAllTests() async {
     testManualRestoresWhenEnumerationFails()
     await testPendingSwitchWatchdogRetriesStuckSource()
     await testPendingSwitchWatchdogDoesNotLearnSourceAfterRetryThreshold()
+    await testProtectionRetrySuccessReopensSettleAndRebindsNotification()
+    await testDelayedProtectionConfirmationReopensSettleAndRebindsNotification()
+    await testTrustedSelectionRetryNeverExposesProtectionState()
     await testCandidateRecoversAfterEnumerationFailure()
     await testPreferredRemovalBeyondLegacyCandidateDelay()
     await testCurrentMissingFromTopologyIsInconclusive()
@@ -45,6 +49,8 @@ func runAllTests() async {
     testProtectionOff()
     testStartupEnforce()
     await testStartupEnumerationFailureRecoversWithoutExternalCallback()
+    await testFreshInstallEnumerationFailurePrefersBuiltInOverCurrent()
+    await testFreshInstallEnumerationFailureWithNilCurrentPrefersBuiltIn()
     testIdempotentCallbacks()
     testFirstRunDefaultSelection()
     testDeviceNamePersistence()
@@ -241,6 +247,44 @@ private func testRestoreSetterRejectionKeepsRetrying() async {
     expect(monitor.protectionRetryState == nil, "successful retry clears settings retry state")
     expect(monitor.recentAudioEvents.first?.kind == .restored(.manualLock), "later retry commits the original restore event")
     expect(notifier.presentCount == 1, "notification is sent only after the restore is confirmed")
+}
+
+/// Protection retry 的结构化状态必须跟随“最近一次 setter 的事实”变化：
+/// rejected → 后续 accepted 但尚未进入长期阶段时清掉旧 rejected；
+/// 完成四档 fast retry 后仍未确认才进入 awaitingConfirmation。
+@MainActor
+private func testProtectionRetryStatusTransitionsAfterSetterRejection() async {
+    test("protection retry status transitions after setter rejection")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, airpodsMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual
+    )
+
+    provider.applySetImmediately = false
+    provider.forceSetFailure = true
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(monitor.protectionRetryState == .setterRejected, "initial rejected restore exposes setterRejected")
+
+    provider.forceSetFailure = false
+    try? await Task.sleep(for: .milliseconds(700))
+
+    expect(provider.setCalls.count == 2, "first watchdog retry is accepted but remains unconfirmed")
+    expect(monitor.protectionRetryState == nil, "accepted fast retry clears stale setterRejected state")
+    expect(monitor.lastError == nil, "accepted fast retry clears stale rejected-setter wording")
+
+    try? await Task.sleep(for: .seconds(7.2))
+
+    expect(provider.setCalls.count == 5, "four fast retries complete before long-backoff stage")
+    expect(monitor.protectionRetryState == .awaitingConfirmation, "long unconfirmed protection retry exposes awaitingConfirmation")
+    expect(
+        monitor.lastError == "Unable to confirm default input change; protection is retrying",
+        "long retry uses protection-specific wording"
+    )
 }
 
 /// HAL 没有承诺 setter 必须在固定时间内反映到真实 default。
@@ -549,6 +593,142 @@ private func testPendingSwitchWatchdogDoesNotLearnSourceAfterRetryThreshold() as
     expect(monitor.lastError == nil, "superseding current clears stale retrying status")
     expect(monitor.protectionRetryState == nil, "superseding current clears settings retry state")
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "supersede does not immediately rewrite preferred")
+}
+
+/// Auto hijack 的旧 settle 已结束后，后续 protection retry 一旦被 CoreAudio 接受，
+/// 必须重新开启 settle；该 retry 若确认成功并立即再次被 source 抢回，仍要再次 restore，
+/// 不能进入 stable external candidate，更不能把 source 学成 preferred。
+/// 同时原 transaction 的 notification 必须迁移到新 episode，确保 episode 内只通知一次。
+@MainActor
+private func testProtectionRetrySuccessReopensSettleAndRebindsNotification() async {
+    test("protection retry success reopens settle and rebinds notification")
+
+    let (monitor, provider, notifier) = makeMonitor(
+        devices: [builtInMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto,
+        settle: 1.0
+    )
+
+    provider.applySetImmediately = false
+    provider.devices = [builtInMic, airpodsMic]
+    provider.current = airpodsMic
+    monitor.handleDeviceListChanged()
+
+    expect(provider.setCalls == [builtInMic.uid], "initial topology hijack starts one restore")
+    expect(notifier.presentCount == 0, "pending restore has not notified")
+
+    // 让最初 episode 结束，并让第一个 watchdog retry 仍保持未确认。
+    try? await Task.sleep(for: .seconds(1.7))
+    expect(provider.setCalls.count == 3, "watchdog has retried at 0.5s and 1.5s")
+
+    // 下一档 2s retry 改为同步生效：accepted retry 应在确认前重新开启 settle。
+    provider.applySetImmediately = true
+    try? await Task.sleep(for: .seconds(2.2))
+
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "later accepted retry reaches preferred")
+    expect(monitor.recentAudioEvents.first?.kind == .restored(.automaticHijack), "retry confirmation keeps original restore semantics")
+    expect(notifier.presentCount == 1, "retry confirmation sends the episode notification once")
+
+    // 立刻再次被 AirPods 抢回。因为 retry 已重新开启 settle，这次必须再次 restore；
+    // notification 已在同一个 rebind 后 episode 消耗，不得重复发送。
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls.count == 5, "immediate re-hijack is restored instead of becoming a stable candidate")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "second hijack is corrected immediately")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "preferred remains BuiltIn across re-hijack")
+    expect(
+        !monitor.recentAudioEvents.contains(where: { $0.kind == .acceptedUserSwitch }),
+        "no accepted external switch is created after retry reopened settle"
+    )
+    expect(notifier.presentCount == 1, "rebound episode notification is deduped after immediate re-hijack")
+}
+
+/// 更早一次已经 accepted 的 protection setter 可能在旧 settle 结束后才真正到达 target，
+/// 即使最近一次 watchdog retry 被拒绝，真实 confirmation 仍必须重新锚定 protection settle。
+/// 否则紧接着的再次抢麦会从 stable 进入 candidate，并可能反向学习 source。
+@MainActor
+private func testDelayedProtectionConfirmationReopensSettleAndRebindsNotification() async {
+    test("delayed protection confirmation reopens settle and rebinds notification")
+
+    let (monitor, provider, notifier) = makeMonitor(
+        devices: [builtInMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto,
+        settle: 1.0
+    )
+
+    provider.applySetImmediately = false
+    provider.devices = [builtInMic, airpodsMic]
+    provider.current = airpodsMic
+    monitor.handleDeviceListChanged()
+
+    expect(provider.setCalls == [builtInMic.uid], "initial hijack restore is accepted but remains pending")
+
+    // 最近一次 watchdog retry 被拒绝，因此它不会延长 settle。
+    provider.forceSetFailure = true
+    try? await Task.sleep(for: .milliseconds(700))
+    expect(provider.setCalls.count == 2, "first watchdog retry is rejected")
+    expect(monitor.protectionRetryState == .setterRejected, "rejected retry is visible while transaction remains pending")
+
+    // 越过初始 1s settle，但保持在下一档 1s watchdog（约 t=1.5s）之前。
+    try? await Task.sleep(for: .milliseconds(500))
+
+    // 模拟最初 accepted 的 CoreAudio 请求现在才真正生效。
+    provider.current = builtInMic
+    monitor.handleDefaultInputChanged()
+
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "late HAL propagation confirms the original protection restore")
+    expect(monitor.recentAudioEvents.first?.kind == .restored(.automaticHijack), "late confirmation keeps protection restore semantics")
+    expect(notifier.presentCount == 1, "late confirmation sends one notification")
+
+    // confirmation 自身应已重新开启 settle；立即再次抢麦必须继续保护，而不是 stable candidate。
+    provider.forceSetFailure = false
+    provider.applySetImmediately = true
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls.count == 3, "immediate re-hijack after late confirmation is restored")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "re-hijack is corrected to BuiltIn")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "late confirmation path never learns AirPods as preferred")
+    expect(
+        !monitor.recentAudioEvents.contains(where: { $0.kind == .acceptedUserSwitch }),
+        "late confirmation path never creates a stable external-switch acceptance"
+    )
+    expect(notifier.presentCount == 1, "confirmation-rebound episode still dedupes the immediate re-hijack notification")
+}
+
+/// Trusted User Selection 可以长期等待/重试，但不能冒充 protection retry。
+@MainActor
+private func testTrustedSelectionRetryNeverExposesProtectionState() async {
+    test("trusted selection retry never exposes protection state")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto,
+        protection: false
+    )
+
+    provider.applySetImmediately = false
+    monitor.selectDevice(usbMic)
+
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "trusted selection commits preferred after accepted setter")
+    expect(monitor.protectionRetryState == nil, "trusted selection never starts protection retry UI")
+
+    try? await Task.sleep(for: .seconds(7.7))
+
+    expect(provider.setCalls.count == 5, "trusted selection shares the same four fast watchdog retries")
+    expect(monitor.protectionRetryState == nil, "long trusted selection retry still has no protection state")
+    expect(
+        monitor.lastError == "Unable to confirm default input change; MicLock is retrying",
+        "long trusted selection uses neutral MicLock retry wording"
+    )
+    expect(monitor.lastError?.contains("protection") == false, "trusted selection wording never claims protection is retrying")
 }
 
 /// 旧 200ms candidate 无法覆盖更慢的 HAL 属性分阶段变化。
@@ -1216,6 +1396,72 @@ private func testStartupEnumerationFailureRecoversWithoutExternalCallback() asyn
     expect(monitor.currentDevice?.uid == builtInMic.uid, "startup recovery confirms BuiltIn as current")
     expect(monitor.recentAudioEvents.first?.kind == .restored(.startup), "recovered alignment keeps startup event semantics")
     expect(notifier.presentCount == 0, "startup recovery does not send a restore notification")
+}
+
+/// Fresh install 不能在 init 枚举失败时用不完整的 current fallback 初始化 preferred。
+/// 第一份可信 startup baseline 到达后应按既定默认规则优先选择 BuiltIn。
+@MainActor
+private func testFreshInstallEnumerationFailurePrefersBuiltInOverCurrent() async {
+    test("fresh install enumeration failure prefers built-in over current")
+
+    let suite = "MicLockTests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.removePersistentDomain(forName: suite)
+    defaults.set(false, forKey: Preferences.protectionEnabledKey)
+    defaults.set(ProtectionMode.auto.rawValue, forKey: Preferences.protectionModeKey)
+
+    let provider = FakeAudioDeviceProvider()
+    provider.devices = [builtInMic, airpodsMic]
+    provider.current = airpodsMic
+    provider.listInputDevicesError = AudioDeviceProviderError.inputDeviceEnumerationFailed
+
+    let monitor = AudioMonitor(
+        provider: provider,
+        preferences: Preferences(defaults: defaults),
+        notifier: RecordingNotifier()
+    )
+
+    expect(monitor.preferredMicrophoneUID == nil, "untrusted init snapshot does not persist AirPods as first-run preferred")
+
+    provider.listInputDevicesError = nil
+    monitor.evaluateStartupPolicy()
+    try? await Task.sleep(for: .milliseconds(700))
+
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "trusted recovery baseline initializes BuiltIn preferred")
+    expect(defaults.string(forKey: Preferences.preferredMicrophoneUIDKey) == builtInMic.uid, "recovered first-run preferred is persisted")
+}
+
+/// Fresh install 初始枚举失败且 current 也不可读时，同样必须在可信 recovery baseline
+/// 到达后完成 BuiltIn 默认初始化，不能让 preferred 永久保持 nil。
+@MainActor
+private func testFreshInstallEnumerationFailureWithNilCurrentPrefersBuiltIn() async {
+    test("fresh install enumeration failure with nil current prefers built-in")
+
+    let suite = "MicLockTests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.removePersistentDomain(forName: suite)
+    defaults.set(false, forKey: Preferences.protectionEnabledKey)
+    defaults.set(ProtectionMode.auto.rawValue, forKey: Preferences.protectionModeKey)
+
+    let provider = FakeAudioDeviceProvider()
+    provider.devices = [builtInMic, airpodsMic]
+    provider.current = nil
+    provider.listInputDevicesError = AudioDeviceProviderError.inputDeviceEnumerationFailed
+
+    let monitor = AudioMonitor(
+        provider: provider,
+        preferences: Preferences(defaults: defaults),
+        notifier: RecordingNotifier()
+    )
+
+    expect(monitor.preferredMicrophoneUID == nil, "failed init with nil current leaves preferred undecided")
+
+    provider.listInputDevicesError = nil
+    provider.current = airpodsMic
+    monitor.evaluateStartupPolicy()
+    try? await Task.sleep(for: .milliseconds(700))
+
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "trusted recovery baseline initializes BuiltIn even after nil init current")
 }
 
 // MARK: - Idempotency (§55)

@@ -208,16 +208,14 @@ final class AudioMonitor {
         .seconds(2),
     ]
 
-    private struct PendingEventDraft {
-        let kind: RecentAudioEvent.Kind
-        let fromDeviceName: String?
-        let toDeviceName: String
+    private enum ProgrammaticSwitchOrigin: Equatable {
+        case protectionRestore(RestoreReason)
+        case trustedUserSelection
     }
 
     private struct PendingNotification {
         let from: String
         let to: String
-        let reason: RestoreReason
         let episodeID: UInt64?
     }
 
@@ -225,8 +223,10 @@ final class AudioMonitor {
         let id: UInt64
         let sourceUID: String?
         let targetUID: String
-        let event: PendingEventDraft
-        let notification: PendingNotification?
+        let origin: ProgrammaticSwitchOrigin
+        let fromDeviceName: String?
+        let toDeviceName: String
+        var notification: PendingNotification?
         var retryAttempt: Int
     }
 
@@ -256,10 +256,14 @@ final class AudioMonitor {
     /// 保持原有 UX：完成 0.5/1/2/4s 四档快速重试后开始显示长期 retry 状态，
     /// 但 transaction 不结束，后续 watchdog 继续按 8/16/32/64s 退避。
     private static let programmaticSwitchRetryWarningAttempt = 4
-    private static let programmaticSwitchRetryingError =
+    private static let protectionSwitchRetryingError =
         "Unable to confirm default input change; protection is retrying"
-    private static let programmaticSwitchSetterRejectedRetryingError =
+    private static let protectionSwitchSetterRejectedRetryingError =
         "Unable to set default input device; protection will keep retrying"
+    private static let userSelectionRetryingError =
+        "Unable to confirm default input change; MicLock is retrying"
+    private static let userSelectionSetterRejectedRetryingError =
+        "Unable to set default input device; MicLock will keep retrying"
 
     /// 离线 preferred 设备的最近已知名称（跨启动持久化，用于 UI 展示）。
     @ObservationIgnored private var lastKnownDeviceNames: [String: String]
@@ -375,13 +379,14 @@ final class AudioMonitor {
 
         refreshDeviceList(initial: true)
 
-        // 首次运行：默认选择内置麦克风。
-        if preferredMicrophoneUID == nil {
-            let preferred = devices.first { $0.isBuiltIn } ?? currentDevice
-            if let preferred {
-                preferredMicrophoneUID = preferred.uid
-                preferences.preferredMicrophoneUID = preferred.uid
-            }
+        // 首次运行只使用可信 startup baseline 初始化 preferred。
+        // 初始 topology 枚举失败/跨属性不一致时，等待 startup recovery 的第一份可信快照，
+        // 避免把瞬时 fallback current 永久持久化为首选设备。
+        if !startupTopologyRecoveryPending {
+            initializeFirstRunPreferredIfNeeded(
+                devices: devices,
+                current: currentDevice
+            )
         }
 
         // 权限检查必须在 App 完成启动之后进行：
@@ -451,11 +456,9 @@ final class AudioMonitor {
 
         let transactionID = beginProgrammaticSwitch(
             to: device.uid,
-            event: PendingEventDraft(
-                kind: .selectedInMicLock,
-                fromDeviceName: currentDevice?.name,
-                toDeviceName: device.name
-            ),
+            origin: .trustedUserSelection,
+            fromDeviceName: currentDevice?.name,
+            toDeviceName: device.name,
             notification: nil
         )
 
@@ -582,6 +585,11 @@ final class AudioMonitor {
             connectedUIDs = newUIDs
             recordDeviceNames(newDevices)
             startupTopologyRecoveryPending = false
+
+            initializeFirstRunPreferredIfNeeded(
+                devices: devices,
+                current: currentDevice
+            )
 
             Self.trace("STARTUP_TOPOLOGY_RECOVERED devices=\(newUIDs)")
             Self.logger.info(
@@ -804,7 +812,6 @@ final class AudioMonitor {
             ? .startupRecovery
             : .topologyRecovery
         topologyRecoveryAttempt += 1
-
         topologyRecoveryTask = Task { [weak self] in
             try? await Task.sleep(for: delay)
             guard !Task.isCancelled, let self else { return }
@@ -929,11 +936,9 @@ final class AudioMonitor {
 
         let transactionID = beginProgrammaticSwitch(
             to: preferred.uid,
-            event: PendingEventDraft(
-                kind: .restored(reason),
-                fromDeviceName: current.name,
-                toDeviceName: preferred.name
-            ),
+            origin: .protectionRestore(reason),
+            fromDeviceName: current.name,
+            toDeviceName: preferred.name,
             notification: pendingNotificationForRestore(
                 from: current.name,
                 to: preferred.name,
@@ -948,7 +953,7 @@ final class AudioMonitor {
             // 只说明“本次请求没被接受”，不是应当放弃保护的事实。保留 PendingSwitch，
             // 让 watchdog 后续按退避节奏继续尝试；target 离线/第三个 current/新用户意图
             // 仍会通过统一事务规则结束它。
-            lastError = Self.programmaticSwitchSetterRejectedRetryingError
+            lastError = Self.protectionSwitchSetterRejectedRetryingError
             protectionRetryState = .setterRejected
             Self.logger.error(
                 "RESTORE_SETTER_REJECTED_RETRYING reason=\(reason, privacy: .public) target=\(preferred.name, privacy: .public)"
@@ -961,7 +966,7 @@ final class AudioMonitor {
             return
         }
 
-        if lastError != Self.programmaticSwitchRetryingError {
+        if lastError != Self.protectionSwitchRetryingError {
             lastError = nil
         }
 
@@ -997,7 +1002,9 @@ final class AudioMonitor {
     @discardableResult
     private func beginProgrammaticSwitch(
         to uid: String,
-        event: PendingEventDraft,
+        origin: ProgrammaticSwitchOrigin,
+        fromDeviceName: String?,
+        toDeviceName: String,
         notification: PendingNotification?
     ) -> UInt64 {
         cancelStableExternalSwitchCandidate()
@@ -1010,7 +1017,9 @@ final class AudioMonitor {
             id: id,
             sourceUID: currentDevice?.uid,
             targetUID: uid,
-            event: event,
+            origin: origin,
+            fromDeviceName: fromDeviceName,
+            toDeviceName: toDeviceName,
             notification: notification,
             retryAttempt: 0
         )
@@ -1024,10 +1033,12 @@ final class AudioMonitor {
         programmaticSwitchWatchdogTask = nil
         protectionRetryState = nil
 
-        // retrying 只描述“当前仍有一笔保护事务在主动重试”。事务被明确取消、
-        // supersede、切模式或关闭保护后，这个瞬态错误不能继续残留在 UI。
-        if lastError == Self.programmaticSwitchRetryingError
-            || lastError == Self.programmaticSwitchSetterRejectedRetryingError
+        // retrying 文案只描述当前仍存活的程序化事务。事务被明确取消、
+        // supersede、切模式或关闭保护后，保护/用户选择两类瞬态错误都不能残留。
+        if lastError == Self.protectionSwitchRetryingError
+            || lastError == Self.protectionSwitchSetterRejectedRetryingError
+            || lastError == Self.userSelectionRetryingError
+            || lastError == Self.userSelectionSetterRejectedRetryingError
         {
             lastError = nil
         }
@@ -1045,22 +1056,43 @@ final class AudioMonitor {
     /// 仅在 provider 已经读到本事务目标设备时确认程序化切换。
     @discardableResult
     private func finishProgrammaticSwitchIfConfirmed() -> Bool {
-        guard case .awaitingConfirmation(let pending) = programmaticSwitchState,
+        guard case .awaitingConfirmation(var pending) = programmaticSwitchState,
               currentDevice?.uid == pending.targetUID
         else { return false }
+
+        // Auto 下 protection restore 的“真实确认”本身也是 protection activity。
+        // 某个更早已 accepted 的 setter 可能在旧 settle episode 结束后才真正反映到 HAL；
+        // 如果确认时仍保持 stable，紧接着的再次抢麦会被误分类为稳定外部切换。
+        // 因此从真实 target confirmation 时刻重新锚定 settle，并把既有 notification
+        // 迁移到当前 episode；Trusted User Selection 不参与 protection settle。
+        if case .protectionRestore = pending.origin,
+           protectionMode == .auto
+        {
+            markTopologyUnsettled()
+            rebindPendingNotificationToCurrentEpisode(&pending)
+        }
 
         cancelProgrammaticSwitch()
         lastError = nil
 
-        // Recent Event 的时间是确认时间，而不是 setter 请求时间。
+        // Recent Event 的时间是确认时间，而不是 setter 请求时间；
+        // 事件语义只从 transaction origin 推导，避免 origin/event kind 双写不一致。
+        let eventKind: RecentAudioEvent.Kind
+        switch pending.origin {
+        case .trustedUserSelection:
+            eventKind = .selectedInMicLock
+        case .protectionRestore(let reason):
+            eventKind = .restored(reason)
+        }
+
         recordRecentAudioEvent(RecentAudioEvent(
-            kind: pending.event.kind,
-            fromDeviceName: pending.event.fromDeviceName,
-            toDeviceName: pending.event.toDeviceName,
+            kind: eventKind,
+            fromDeviceName: pending.fromDeviceName,
+            toDeviceName: pending.toDeviceName,
             occurredAt: Date()
         ))
 
-        commitNotification(pending.notification)
+        commitNotification(pending.notification, origin: pending.origin)
         return true
     }
 
@@ -1070,7 +1102,6 @@ final class AudioMonitor {
         let index = min(pending.retryAttempt, Self.programmaticSwitchRetryDelays.count - 1)
         let delay = Self.programmaticSwitchRetryDelays[index]
         let transactionID = pending.id
-
         programmaticSwitchWatchdogTask = Task { [weak self] in
             try? await Task.sleep(for: delay)
             guard !Task.isCancelled, let self else { return }
@@ -1096,6 +1127,18 @@ final class AudioMonitor {
         programmaticSwitchState = .awaitingConfirmation(currentPending)
 
         let accepted = provider.setInputDevice(uid: currentPending.targetUID)
+
+        // 只有 protection restore 被 CoreAudio 接受时才重新开启/延长 settle。
+        // Trusted User Action 不制造 protection episode。若 transaction 本来就携带
+        // Auto notification，则把它迁移到新的/延长后的当前 episode；nil 绝不补造。
+        if accepted,
+           case .protectionRestore = currentPending.origin
+        {
+            markProtectionRetryAccepted(&currentPending)
+            // confirmation 必须读取更新后的 notification metadata。
+            programmaticSwitchState = .awaitingConfirmation(currentPending)
+        }
+
         refreshCurrentDevice()
 
         if finishProgrammaticSwitchIfConfirmed() {
@@ -1109,28 +1152,68 @@ final class AudioMonitor {
             "PROGRAMMATIC_SWITCH retry id=\(currentPending.id, privacy: .public) attempt=\(currentPending.retryAttempt, privacy: .public) setterAccepted=\(accepted, privacy: .public)"
         )
 
-        if !accepted {
-            // retry 请求本身被 CoreAudio 拒绝，与“请求被接受但状态尚未确认”是两种事实。
-            // transaction 仍保留，后续继续按退避节奏重试。
-            lastError = Self.programmaticSwitchSetterRejectedRetryingError
-            protectionRetryState = .setterRejected
-        } else if currentPending.retryAttempt >= Self.programmaticSwitchRetryWarningAttempt {
-            // 时间经过本身既不能宣告 HAL failure，也不能把仍停留在 source 的状态
-            // 重新交给 Auto 分类，否则会把原本正在抵抗的 hijack 反向学习为 preferred。
-            // 达到快速重试阈值后提示用户，但 transaction 仍保持 pending。
-            lastError = Self.programmaticSwitchRetryingError
-            protectionRetryState = .awaitingConfirmation
-        } else if lastError == Self.programmaticSwitchSetterRejectedRetryingError {
-            // 上一次 retry 被拒绝，但这次请求已重新被接受；在进入长期 retry 阶段前，
-            // 不再保留已经过时的“setter rejected”状态。
-            lastError = nil
-            protectionRetryState = nil
-        }
+        updateProgrammaticSwitchRetryStatus(
+            for: currentPending,
+            setterAccepted: accepted
+        )
 
         if case .awaitingConfirmation(let stillPending) = programmaticSwitchState,
            stillPending.id == currentPending.id
         {
             scheduleProgrammaticSwitchWatchdog(for: stillPending)
+        }
+    }
+
+    private func markProtectionRetryAccepted(_ pending: inout PendingSwitch) {
+        markTopologyUnsettled()
+
+        guard protectionMode == .auto else { return }
+        rebindPendingNotificationToCurrentEpisode(&pending)
+    }
+
+    private func rebindPendingNotificationToCurrentEpisode(_ pending: inout PendingSwitch) {
+        guard let notification = pending.notification,
+              case .settling(let episode) = stabilityState
+        else { return }
+
+        pending.notification = PendingNotification(
+            from: notification.from,
+            to: notification.to,
+            episodeID: episode.id
+        )
+    }
+
+    private func updateProgrammaticSwitchRetryStatus(
+        for pending: PendingSwitch,
+        setterAccepted: Bool
+    ) {
+        switch pending.origin {
+        case .protectionRestore:
+            if !setterAccepted {
+                lastError = Self.protectionSwitchSetterRejectedRetryingError
+                protectionRetryState = .setterRejected
+            } else if pending.retryAttempt >= Self.programmaticSwitchRetryWarningAttempt {
+                // 时间经过本身既不能宣告 HAL failure，也不能把仍停留在 source 的状态
+                // 重新交给 Auto 分类，否则会把原本正在抵抗的 hijack 反向学习为 preferred。
+                lastError = Self.protectionSwitchRetryingError
+                protectionRetryState = .awaitingConfirmation
+            } else if lastError == Self.protectionSwitchSetterRejectedRetryingError {
+                // 上一次 retry 被拒绝，但这次请求已重新被接受；在进入长期 retry 阶段前，
+                // 不再保留已经过时的“setter rejected”状态。
+                lastError = nil
+                protectionRetryState = nil
+            }
+
+        case .trustedUserSelection:
+            // 用户显式选择可以继续复用 watchdog，但它不是 protection 行为：
+            // 不触碰 ProtectionRetryState，只提供中性的操作状态文案。
+            if !setterAccepted {
+                lastError = Self.userSelectionSetterRejectedRetryingError
+            } else if pending.retryAttempt >= Self.programmaticSwitchRetryWarningAttempt {
+                lastError = Self.userSelectionRetryingError
+            } else if lastError == Self.userSelectionSetterRejectedRetryingError {
+                lastError = nil
+            }
         }
     }
 
@@ -1158,7 +1241,6 @@ final class AudioMonitor {
             return PendingNotification(
                 from: from,
                 to: to,
-                reason: reason,
                 episodeID: episode.id
             )
         }
@@ -1166,20 +1248,23 @@ final class AudioMonitor {
         return PendingNotification(
             from: from,
             to: to,
-            reason: reason,
             episodeID: nil
         )
     }
 
-    private func commitNotification(_ pending: PendingNotification?) {
+    private func commitNotification(
+        _ pending: PendingNotification?,
+        origin: ProgrammaticSwitchOrigin
+    ) {
         guard let pending else { return }
+        guard case .protectionRestore(let reason) = origin else { return }
 
         // 用户可能在事务确认前关闭通知；没有真正发送就不能消耗
         // 当前 settle episode 的 notificationSent 去重额度。
         guard notificationsEnabled else { return }
 
-        // Auto notification 只修改创建它的 episode；旧事务晚到的 confirmation
-        // 绝不能把一个更新的 episode 标记成已通知。
+        // Auto notification 只修改它当前绑定的 episode。watchdog accepted retry
+        // 若开启了新的 episode，会先 rebind PendingNotification，再进入这里。
         if let episodeID = pending.episodeID,
            case .settling(var episode) = stabilityState,
            episode.id == episodeID
@@ -1193,7 +1278,7 @@ final class AudioMonitor {
             "NOTIFICATION_SENT \(pending.from, privacy: .public) → \(pending.to, privacy: .public)"
         )
 
-        notifier.presentRestored(from: pending.from, to: pending.to, reason: pending.reason)
+        notifier.presentRestored(from: pending.from, to: pending.to, reason: reason)
     }
 
     // MARK: - Stability State Machine
@@ -1329,17 +1414,50 @@ final class AudioMonitor {
             return
         }
 
-        devices = Self.sortedDevices(newDevices)
-        connectedUIDs = Set(newDevices.map(\.uid))
+        let newCurrent = provider.currentInputDevice()
+        currentDevice = newCurrent
+        let newUIDs = Set(newDevices.map(\.uid))
 
+        // Devices / DefaultInput 不是原子 snapshot。首次启动时如果 current 不在本轮
+        // devices 中，不把这份联合采样当作可信 baseline；等 start() 后主动 recovery。
+        if initial,
+           let newCurrent,
+           !newUIDs.contains(newCurrent.uid)
+        {
+            startupTopologyRecoveryPending = true
+            deviceEnumerationError = "CoreAudio input device state is temporarily inconsistent"
+            Self.logger.error("DEVICE_LIST initial topology inconsistent")
+            return
+        }
+
+        devices = Self.sortedDevices(newDevices)
+        connectedUIDs = newUIDs
         recordDeviceNames(newDevices)
 
         // 初始枚举：所有现存设备视为稳定，不开 settle window。
         if !initial, connectedUIDs.isEmpty {
             Self.logger.debug("DEVICE_LIST_EMPTY")
         }
+    }
 
-        refreshCurrentDevice()
+    /// Fresh install 的 preferred 只从可信 topology 初始化：优先内置麦克风；
+    /// 没有内置设备时，只有 current 本身也属于这份 topology 才允许 fallback。
+    private func initializeFirstRunPreferredIfNeeded(
+        devices: [AudioInputDevice],
+        current: AudioInputDevice?
+    ) {
+        guard preferredMicrophoneUID == nil else { return }
+
+        if let builtIn = devices.first(where: \.isBuiltIn) {
+            preferredMicrophoneUID = builtIn.uid
+            return
+        }
+
+        guard let current,
+              devices.contains(where: { $0.uid == current.uid })
+        else { return }
+
+        preferredMicrophoneUID = current.uid
     }
 
     private func refreshCurrentDevice() {

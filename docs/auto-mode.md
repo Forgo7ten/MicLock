@@ -110,7 +110,7 @@ settling(SettleEpisode)
 
 设备列表出现真实 delta 时进入 `settling`。如果已经在 `settling`，不会创建新 episode，只更新 `lastActivity / deadline` 并增加 `revision`。
 
-恢复 preferred 成功发起后也会延长同一个 episode，因为 macOS / 蓝牙协议栈可能在被恢复后立即再次抢麦。这样同一次接入造成的多次反抢仍属于同一个 protection episode。
+恢复 preferred 成功发起后也会延长同一个 episode，因为 macOS / 蓝牙协议栈可能在被恢复后立即再次抢麦。watchdog 后续某次 retry 如果终于被 CoreAudio 接受，同样会重新开启或延长 settle；即使旧 episode 已经结束，也会从该次 corrective restore 开始新的 protection episode。Auto 下 protection transaction 最终真实到达 target 时也会从 confirmation 时刻重新锚定 settle，因此“更早 accepted 的请求很晚才真正生效”不会在旧 episode 已结束后留下 stable 空窗。
 
 ### timer 只是执行机制
 
@@ -145,10 +145,11 @@ awaitingConfirmation(PendingSwitch)
 - transaction `id`
 - `sourceUID`：发起写入时观察到的 current
 - `targetUID`
-- 待提交的 Recent Event draft
+- `ProgrammaticSwitchOrigin`：`protectionRestore(reason)` 或 `trustedUserSelection`
+- Recent Event 的 from/to 展示 metadata；kind 在确认时只从 origin 推导
 - 待提交的通知（如果本次动作应该通知）
 
-旧实现中 `expectedDefaultUID`、pending Recent Event 和 pending notification 分开保存，存在两笔操作之间 metadata 串线的风险。现在新的程序化切换会整体 supersede 旧事务，source / target / event / notification 永远属于同一 transaction。
+旧实现中 `expectedDefaultUID`、pending Recent Event 和 pending notification 分开保存，存在两笔操作之间 metadata 串线的风险。现在新的程序化切换会整体 supersede 旧事务，source / target / origin / metadata / notification 永远属于同一 transaction；origin 是程序化事务语义的唯一来源，不再额外保存一份可与 origin 冲突的 event kind。
 
 ### 确认规则：不使用固定时间宣告失败
 
@@ -156,17 +157,17 @@ awaitingConfirmation(PendingSwitch)
 
 后续用可靠的可观察事实推进事务：
 
-1. `current.uid == targetUID`：这是独立于 topology 的充分成功证据；即使同一轮设备枚举失败，也立即确认、提交 Recent Event，并在满足通知条件时投递通知
+1. `current.uid == targetUID`：这是独立于 topology 的充分成功证据；即使同一轮设备枚举失败，也立即确认。若 origin 是 Auto 下的 Protection restore，确认本身会先重新开启/延长 settle，并把既有 notification rebind 到当前 episode，再提交 Recent Event / 通知；Trusted User Selection 不制造 protection episode
 2. 只有在 topology sample 有效且跨属性一致时，`targetUID` 不在线才可作为目标明确不可达的失败证据
-3. `sourceUID != nil && current.uid == sourceUID`：说明写入尚未反映；watchdog 按 500ms → 1s → 2s → 4s → 8s → 16s → 32s → 64s 重新读取并重试 setter，之后固定 64s 一次
-4. 完成前四档快速重试后，不把“时间经过”解释为 HAL failure，也不释放仍停留在 source 的 transaction；显示 `protection is retrying`，后续继续指数退避到 64s cap，避免 Auto 把原本正在抵抗的 source 反向学习成新的 preferred
+3. `sourceUID != nil && current.uid == sourceUID`：说明写入尚未反映；watchdog 按 500ms → 1s → 2s → 4s → 8s → 16s → 32s → 64s 重新读取并重试 setter，之后固定 64s 一次。若该 transaction 的 origin 是 Protection restore，任何 accepted retry 都会重新开启/延长 settle；Trusted User Selection 则不会制造 protection episode
+4. 完成前四档快速重试后，不把“时间经过”解释为 HAL failure，也不释放仍停留在 source 的 transaction。Protection restore 显示 `protection is retrying` 并更新 `ProtectionRetryState`；Trusted User Selection 只使用中性的 MicLock retry 文案，不暴露 Protection 状态
 5. 其余非 target current：出现了更新的外部事实，旧事务被 supersede，随后重新运行 policy；特别地，`sourceUID == nil` 时任何实际出现的非 target current 都属于这种新事实
 6. topology sample 无效：不能做 target-offline 判定；保留上一份有效 topology，并通过独立 recovery retry 重新采样
 7. 模式切换、保护关闭或新的 Trusted User Action：属于明确的新用户意图，直接取消/取代旧事务；如果 UI 正显示 `protection is retrying`，同时清理这条只属于旧事务的瞬态状态
 
 因此不会恢复旧的“固定 1 秒后宣告失败”语义：时间只触发重新检查/重试，不直接决定成功或失败。允许一笔 transaction 在 source 持续不变时长期 pending，但这种 pending 会按 capped interval 主动执行 setter；真正结束事务必须来自 target confirmed、target 确定离线、第三个 current 或新的用户意图，而不是单纯等待够久。
 
-Protection restore 中还区分两类未完成状态：setter 返回 `true` 但 `current != target` 表示“请求已接受、等待确认”；watchdog 某次 setter 返回 `false` 则表示“请求本身被拒绝”。后者显示 `Unable to set default input device; protection will keep retrying`，前者在进入长期 retry 阶段后显示 `Unable to confirm default input change; protection is retrying`。任一后续成功确认都会由 `finishProgrammaticSwitchIfConfirmed()` 清空这些瞬态错误。设置窗口的「高级 → 设备切换」会显示对应的结构化警告，并提示检查首选麦克风、系统「声音 → 输入」以及是否存在持续抢占默认输入的蓝牙设备或其他软件；同时明确最长 retry 间隔为 64 秒。MicLock UI 中用户主动选择设备若首个 setter 就失败，仍按该次 Trusted User Action 失败处理，不擅自改写 preferred。
+Protection restore 中还区分两类未完成状态：setter 返回 `true` 但 `current != target` 表示“请求已接受、等待确认”；watchdog 某次 setter 返回 `false` 则表示“请求本身被拒绝”。后者显示 `Unable to set default input device; protection will keep retrying`，前者在进入长期 retry 阶段后显示 `Unable to confirm default input change; protection is retrying`。任一后续成功确认都会由 `finishProgrammaticSwitchIfConfirmed()` 清空这些瞬态错误。设置窗口的「高级 → 设备切换」只显示 Protection restore 的结构化警告；Trusted User Selection 即使长期 pending 也不会修改 `ProtectionRetryState`，只使用中性的 MicLock retry 文案。MicLock UI 中用户主动选择设备若首个 setter 就失败，仍按该次 Trusted User Action 失败处理，不擅自改写 preferred。
 
 Recent Event 的 `occurredAt` 使用**确认时间**，而不是 setter 请求时间。
 
@@ -176,13 +177,13 @@ Recent Event 的 `occurredAt` 使用**确认时间**，而不是 setter 请求�
 
 ## 通知去重与 episode ID
 
-Auto Mode 的 pending notification 会记录创建它时的 `episodeID`。确认时只有同 ID 的当前 episode 才能参与去重，因此旧事务晚到的 confirmation 不会污染一个更新的 episode。
+Auto Mode 的 pending notification 会记录当前绑定的 `episodeID`。如果旧 episode 已结束，而 Protection watchdog 的 accepted retry 或最终 target confirmation 新开了 episode，则**只对已经存在的 notification**重新绑定到新 episode；原本为 nil 的 notification 不会因为 retry / confirmation 而被凭空创建。确认时只有同 ID 的当前 episode 才能参与去重，因此 confirmation 消耗了新 episode 的通知额度后，紧接着的再次抢麦不会重复通知。
 
 只有通知开关在确认时仍然开启、实际准备投递通知时，才把 `notificationSent` 置为 true。若事务确认前用户关闭通知，这次确认不会消耗 episode 的通知额度；之后在同一 episode 内重新开启通知，下一次恢复仍可以发送一次通知。Manual Mode 不使用 episode 去重。
 
 ## Trusted User Action
 
-用户在 MicLock 菜单里选择设备属于明确的 Trusted User Action，不受 settle window 限制。选择动作同样走 `PendingSwitch`：setter 失败不覆盖 preferred；setter 被接受后 preferred 可以立即更新，但 Recent Event 仍等真实 current 达到目标后才提交。
+用户在 MicLock 菜单里选择设备属于明确的 Trusted User Action，不受 settle window 限制。选择动作同样走 `PendingSwitch`：setter 失败不覆盖 preferred；setter 被接受后 preferred 可以立即更新，但 Recent Event 仍等真实 current 达到目标后才提交。它可以复用同一 watchdog 重试机制，但不会重新开启 settle，也不会冒充 Protection retry。
 
 设备刚接入的 settle window 内如果确实要更换首选麦克风，直接在 MicLock 菜单中选择即可。
 
