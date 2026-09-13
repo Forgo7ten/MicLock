@@ -534,20 +534,21 @@ final class AudioMonitor {
             }
 
             if let sourceUID = pending.sourceUID,
-               current.uid != sourceUID
+               current.uid == sourceUID
             {
-                cancelProgrammaticSwitch()
-                Self.logger.info(
-                    "PROGRAMMATIC_SWITCH superseded id=\(pending.id, privacy: .public) current=\(current.uid, privacy: .public)"
-                )
-                // current 既不是 source 也不是 target，说明出现了新的外部事实；
-                // 放弃旧事务并让下面的 policy 对这个 snapshot 重新分类。
-            } else {
                 Self.logger.debug(
                     "PROGRAMMATIC_SWITCH still pending current=\(current.name, privacy: .public) target=\(pending.targetUID, privacy: .public)"
                 )
                 return
             }
+
+            // target 已在上面排除；如果 source 存在，只有仍停在 source 才继续等待。
+            // source == nil 时，任何实际出现的非 target current 都是新的外部事实。
+            cancelProgrammaticSwitch()
+            Self.logger.info(
+                "PROGRAMMATIC_SWITCH superseded id=\(pending.id, privacy: .public) current=\(current.uid, privacy: .public)"
+            )
+            // 放弃旧事务并让下面的 policy 对这个 snapshot 重新分类。
         }
 
         Self.trace(

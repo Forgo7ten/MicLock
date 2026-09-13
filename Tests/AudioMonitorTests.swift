@@ -15,6 +15,7 @@ func runAllTests() async {
     await testDelayedConfirmationBeyondLegacyTimeoutSucceeds()
     testPendingSwitchFailsWhenTargetDisappears()
     testPendingSwitchFailsWhenTargetDisappearsAndCurrentIsNil()
+    testNilSourcePendingSwitchIsSupersededByNonTargetCurrent()
     testPendingRestoreIsAtomicallySupersededByModeChange()
     testIntermediateCallbackWhileExpectedDoesNotRestoreAgain()
     testA1_NewDeviceHijack()
@@ -283,6 +284,38 @@ private func testPendingSwitchFailsWhenTargetDisappearsAndCurrentIsNil() {
     expect(monitor.lastError == "Target input device is no longer available", "target disappearance resolves pending even without current")
     expect(monitor.recentAudioEvents.isEmpty, "no false success event when all devices disappear")
     expect(notifier.presentCount == 0, "no notification when pending target disappears")
+}
+
+/// sourceUID == nil 时，只要出现非 target 的真实 current，就说明旧事务已被新的外部事实取代。
+/// 不能因为没有 source 可比较而永久挡住后续 policy。
+@MainActor
+private func testNilSourcePendingSwitchIsSupersededByNonTargetCurrent() {
+    test("nil-source pending switch is superseded by non-target current")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [usbMic, airpodsMic],
+        current: nil,
+        preferred: nil,
+        mode: .manual
+    )
+
+    provider.applySetImmediately = false
+    monitor.selectDevice(usbMic)
+
+    expect(provider.setCalls == [usbMic.uid], "trusted selection starts pending switch from nil source")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "trusted selection persists target preferred")
+
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(
+        provider.setCalls == [usbMic.uid, usbMic.uid],
+        "non-target current supersedes nil-source transaction and manual policy continues"
+    )
+    expect(
+        monitor.currentDevice?.uid == airpodsMic.uid,
+        "monitor keeps the real non-target current while replacement restore waits"
+    )
 }
 
 /// 新事务必须原子取代旧事务：Auto 恢复未确认时切到 Manual，
