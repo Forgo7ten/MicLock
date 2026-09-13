@@ -183,6 +183,7 @@ final class AudioMonitor {
 
     private struct PendingSwitch {
         let id: UInt64
+        let sourceUID: String?
         let targetUID: String
         let event: PendingEventDraft
         let notification: PendingNotification?
@@ -197,11 +198,6 @@ final class AudioMonitor {
     @ObservationIgnored private var programmaticSwitchState: ProgrammaticSwitchState = .idle
 
     @ObservationIgnored private var nextProgrammaticSwitchID: UInt64 = 0
-
-    /// 用于清理始终无法从 CoreAudio 真实状态确认的程序化切换。
-    @ObservationIgnored private var expectedSwitchTimeoutTask: Task<Void, Never>?
-
-    private static let expectedSwitchConfirmationTimeout: Duration = .seconds(1.0)
 
     /// 离线 preferred 设备的最近已知名称（跨启动持久化，用于 UI 展示）。
     @ObservationIgnored private var lastKnownDeviceNames: [String: String]
@@ -486,20 +482,44 @@ final class AudioMonitor {
         guard let current = currentDevice else { return }
 
         // 3. MicLock 自己触发的变化优先于 Auto / Manual policy。
+        // PendingSwitch 不再因为固定时间到点而失败，只根据可观察事实推进：
+        // target 出现 => 成功；target 离线 => 明确失败；第三个 current => 被外部变化取代。
         if case .awaitingConfirmation(let pending) = programmaticSwitchState {
             Self.trace(
-                "CORE_AUDIO_RECONCILE current=\(current.name) pendingTarget=\(pending.targetUID)"
+                "CORE_AUDIO_RECONCILE current=\(current.name) source=\(pending.sourceUID ?? "nil") target=\(pending.targetUID)"
             )
+
             if finishProgrammaticSwitchIfConfirmed() {
                 Self.logger.debug(
                     "PROGRAMMATIC_SWITCH confirmed → \(current.name, privacy: .public)"
                 )
+                return
+            }
+
+            if !connectedUIDs.contains(pending.targetUID) {
+                failProgrammaticSwitch(
+                    id: pending.id,
+                    error: "Target input device is no longer available"
+                )
+                Self.logger.error(
+                    "PROGRAMMATIC_SWITCH target disappeared id=\(pending.id, privacy: .public) uid=\(pending.targetUID, privacy: .public)"
+                )
+                // 继续用当前完整 snapshot 运行 policy；例如 preferred 离线时保留 UID。
+            } else if let sourceUID = pending.sourceUID,
+                      current.uid != sourceUID
+            {
+                cancelProgrammaticSwitch()
+                Self.logger.info(
+                    "PROGRAMMATIC_SWITCH superseded id=\(pending.id, privacy: .public) current=\(current.uid, privacy: .public)"
+                )
+                // current 既不是 source 也不是 target，说明出现了新的外部事实；
+                // 放弃旧事务并让下面的 policy 对这个 snapshot 重新分类。
             } else {
                 Self.logger.debug(
                     "PROGRAMMATIC_SWITCH still pending current=\(current.name, privacy: .public) target=\(pending.targetUID, privacy: .public)"
                 )
+                return
             }
-            return
         }
 
         Self.trace(
@@ -623,60 +643,31 @@ final class AudioMonitor {
     // MARK: - Programmatic Switch Transaction
 
     /// 开始一笔由 MicLock 发起的切换事务。新事务会原子地取代旧事务，
-    /// 因此 target / Recent Event / notification 不会跨两次操作串线。
+    /// 因此 source / target / Recent Event / notification 不会跨两次操作串线。
+    ///
+    /// 事务不设置固定确认超时：HAL 何时真正反映 setter 没有时间保证。
+    /// 后续由完整 CoreAudio snapshot 的可观察事实确认、取消或 supersede。
     @discardableResult
     private func beginProgrammaticSwitch(
         to uid: String,
         event: PendingEventDraft,
         notification: PendingNotification?
     ) -> UInt64 {
-        expectedSwitchTimeoutTask?.cancel()
-
         nextProgrammaticSwitchID &+= 1
         let id = nextProgrammaticSwitchID
         let pending = PendingSwitch(
             id: id,
+            sourceUID: currentDevice?.uid,
             targetUID: uid,
             event: event,
             notification: notification
         )
         programmaticSwitchState = .awaitingConfirmation(pending)
-
-        expectedSwitchTimeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: Self.expectedSwitchConfirmationTimeout)
-
-            guard !Task.isCancelled else { return }
-            guard let self else { return }
-            guard case .awaitingConfirmation(let currentPending) = self.programmaticSwitchState,
-                  currentPending.id == id
-            else { return }
-
-            // timeout 到达时最后再读一次真实 CoreAudio 状态。
-            self.refreshCurrentDevice()
-
-            if self.finishProgrammaticSwitchIfConfirmed() {
-                Self.logger.debug(
-                    "PROGRAMMATIC_SWITCH confirmed on timeout recheck id=\(id, privacy: .public) uid=\(uid, privacy: .public)"
-                )
-                return
-            }
-
-            self.failProgrammaticSwitch(
-                id: id,
-                error: "Unable to confirm default input device change"
-            )
-            Self.logger.error(
-                "PROGRAMMATIC_SWITCH timeout id=\(id, privacy: .public) uid=\(uid, privacy: .public)"
-            )
-        }
-
         return id
     }
 
     private func cancelProgrammaticSwitch() {
         programmaticSwitchState = .idle
-        expectedSwitchTimeoutTask?.cancel()
-        expectedSwitchTimeoutTask = nil
     }
 
     private func failProgrammaticSwitch(id: UInt64, error: String) {

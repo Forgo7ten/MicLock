@@ -12,6 +12,8 @@ func runAllTests() async {
     testUserSelectionFailureDoesNotPersistPreferred()
     testRestoreImmediateConfirmation()
     testRestoreWaitsForRealConfirmation()
+    await testDelayedConfirmationBeyondLegacyTimeoutSucceeds()
+    testPendingSwitchFailsWhenTargetDisappears()
     testPendingRestoreIsAtomicallySupersededByModeChange()
     testIntermediateCallbackWhileExpectedDoesNotRestoreAgain()
     testA1_NewDeviceHijack()
@@ -187,6 +189,70 @@ private func testRestoreWaitsForRealConfirmation() {
     expect(notifier.presentCount == 1, "notification sent after real confirmation")
     expect(provider.setCalls == [builtInMic.uid], "confirmation does not trigger another setter")
     expect(monitor.recentAudioEvents.first?.kind == .restored(.manualLock), "recent event is committed with confirmation")
+}
+
+/// HAL 没有承诺 setter 必须在固定时间内反映到真实 default。
+/// 超过旧的 1 秒阈值后才确认，事务仍应成功，不产生伪失败。
+@MainActor
+private func testDelayedConfirmationBeyondLegacyTimeoutSucceeds() async {
+    test("delayed confirmation beyond legacy timeout succeeds")
+
+    let (monitor, provider, notifier) = makeMonitor(
+        devices: [builtInMic, airpodsMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual
+    )
+
+    provider.applySetImmediately = false
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls == [builtInMic.uid], "restore request remains pending")
+    expect(monitor.lastError == nil, "pending restore has no false error")
+
+    // 等待超过旧实现的 1 秒 confirmation timeout。
+    try? await Task.sleep(for: .seconds(1.4))
+
+    expect(monitor.lastError == nil, "elapsed time alone does not fail the transaction")
+    expect(monitor.recentAudioEvents.isEmpty, "unconfirmed transaction still has no success event")
+    expect(notifier.presentCount == 0, "unconfirmed transaction still has no notification")
+
+    provider.current = builtInMic
+    monitor.handleDefaultInputChanged()
+
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "late HAL state confirms target")
+    expect(monitor.lastError == nil, "late confirmation remains successful")
+    expect(monitor.recentAudioEvents.first?.kind == .restored(.manualLock), "late confirmation commits recent event")
+    expect(notifier.presentCount == 1, "late confirmation sends notification")
+}
+
+/// pending 期间 target 离线属于明确失败证据，不需要等待时间阈值。
+@MainActor
+private func testPendingSwitchFailsWhenTargetDisappears() {
+    test("pending switch fails when target disappears")
+
+    let (monitor, provider, notifier) = makeMonitor(
+        devices: [builtInMic, airpodsMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual
+    )
+
+    provider.applySetImmediately = false
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls == [builtInMic.uid], "restore starts pending")
+
+    provider.devices = [airpodsMic]
+    provider.current = airpodsMic
+    monitor.handleDeviceListChanged()
+
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "offline target remains preferred")
+    expect(monitor.lastError == "Target input device is no longer available", "target disappearance fails pending transaction")
+    expect(monitor.recentAudioEvents.isEmpty, "failed pending transaction has no success event")
+    expect(notifier.presentCount == 0, "failed pending transaction has no notification")
 }
 
 /// 新事务必须原子取代旧事务：Auto 恢复未确认时切到 Manual，

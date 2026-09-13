@@ -36,39 +36,55 @@ flowchart LR
         P2["awaitingConfirmation(PendingSwitch)"]
         P1 -->|MicLock setInputDevice| P2
         P2 -->|真实 current == target| P1
-        P2 -->|timeout / cancel / supersede| P1
+        P2 -->|target 离线 / 明确用户取消 / 外部状态 supersede| P1
     end
 ```
 
-## DefaultInputDevice 判定流程
+## CoreAudio 统一收敛流程
 
-每次 `handleDefaultInputChanged()` 都先重新读取 CoreAudio 的真实默认输入，然后按以下顺序处理：
+`kAudioHardwarePropertyDevices` 与 `kAudioHardwarePropertyDefaultInputDevice` 是两个独立属性，MicLock **不依赖两个 listener 的跨属性投递顺序**。两个 listener 都只作为 wake-up 信号，统一进入 `reconcileCoreAudioState()`；每次都重新读取同一轮完整 snapshot：
+
+```swift
+newDevices = provider.listInputDevices()
+newCurrent = provider.currentInputDevice()
+```
+
+随后固定按以下顺序处理：
+
+1. 用 `newDevices` 与 `connectedUIDs` 求 topology delta；有真实 delta 时先进入/延长 `settling`
+2. 更新 `devices / connectedUIDs / currentDevice`
+3. 处理 `PendingSwitch` 的确认、取消或 supersede
+4. 最后运行 Auto / Manual policy
+
+因此无论系统先投递 Devices callback 还是 DefaultInput callback，第一次 wake-up 都能看到当时 CoreAudio 的完整真实状态：新设备抢麦不会因为 Default callback 先到而被误学为 preferred；preferred 被拔出时也会先识别它已经离线，再决定是否处理系统 fallback。
 
 ```mermaid
 flowchart TD
-    A["DefaultInputDevice callback"] --> B["重读真实 current"]
-    B --> C{"存在 PendingSwitch？"}
-    C -->|是| D{"current == transaction.targetUID？"}
-    D -->|是| D1["确认事务：提交 Recent Event / 通知，回到 idle"]
-    D -->|否| D2["吸收中间 callback，继续等待；不重复 setter"]
-    C -->|否| E{"保护开启？"}
-    E -->|否| Z[结束：只观察，不学习]
-    E -->|是| F{"preferred 已设置？"}
-    F -->|否| L[学习 current 为 preferred]
-    F -->|是| G{"current == preferred？"}
-    G -->|是| Z
-    G -->|否| H{"preferred 在线？"}
-    H -->|否| Z2[保留 preferred UID，等待重连]
-    H -->|是| I{"模式"}
-    I -->|manual| R[立即发起 restore transaction]
-    I -->|auto| J{"StabilityState"}
-    J -->|settling| R
-    J -->|stable| U[接受外部切换并学习 preferred]
+    A["Devices 或 DefaultInput callback"] --> B["读取 devices + current 完整 snapshot"]
+    B --> C["先计算并应用 topology delta"]
+    C --> D["再更新真实 current"]
+    D --> E{"存在 PendingSwitch？"}
+    E -->|target 已成为 current| E1["确认事务：提交 Recent Event / 通知"]
+    E -->|target 已离线| E2["失败旧事务，继续 policy"]
+    E -->|current 既非 source 也非 target| E3["外部事实 supersede 旧事务，继续 policy"]
+    E -->|仍是 source| E4["继续等待，不重复 setter"]
+    E -->|否| F{"保护开启？"}
+    E2 --> F
+    E3 --> F
+    E1 --> Z[结束]
+    E4 --> Z
+    F -->|否| Z
+    F -->|是| G{"preferred 已设置且在线？"}
+    G -->|离线| G1[保留 preferred UID]
+    G -->|在线且 current != preferred| H{"模式"}
+    H -->|manual| R[立即发起 restore transaction]
+    H -->|auto + settling| R
+    H -->|auto + stable| U[接受外部切换并学习 preferred]
 ```
 
 这里有三个关键约束：
 
-- **真实状态优先**：callback 只表示属性发生过变化，策略始终重新读取 CoreAudio 当前值。
+- **完整 snapshot 优先**：callback 只表示“值得重新检查”，策略不把某一个 listener 的局部状态当作事实。
 - **程序化事务优先**：MicLock 自己的写入回声必须在 Auto/Manual 判定之前吸收，否则会形成 setter 循环。
 - **保护关闭不学习**：关闭保护期间的临时系统选择不会悄悄覆盖 preferred。
 
@@ -126,22 +142,28 @@ awaitingConfirmation(PendingSwitch)
 一笔 `PendingSwitch` 原子保存：
 
 - transaction `id`
+- `sourceUID`：发起写入时观察到的 current
 - `targetUID`
 - 待提交的 Recent Event draft
 - 待提交的通知（如果本次动作应该通知）
 
-旧实现中 `expectedDefaultUID`、pending Recent Event 和 pending notification 分开保存，存在两笔操作之间 metadata 串线的风险。现在新的程序化切换会整体 supersede 旧事务，target / event / notification 永远属于同一 transaction。
+旧实现中 `expectedDefaultUID`、pending Recent Event 和 pending notification 分开保存，存在两笔操作之间 metadata 串线的风险。现在新的程序化切换会整体 supersede 旧事务，source / target / event / notification 永远属于同一 transaction。
 
-### 确认规则
+### 确认规则：不使用固定时间宣告失败
 
-`setInputDevice()` 返回成功只表示 CoreAudio 接受了写请求，不代表默认输入已经真实变化。因此：
+`setInputDevice()` 返回成功只表示 CoreAudio 接受了写请求，不代表默认输入已经真实变化。HAL 也没有给出“必须在 1 秒或任何固定秒数内完成”的正确性保证，因此 PendingSwitch 不再设置 confirmation timeout。
 
-1. 发起 `PendingSwitch`
-2. 调用 setter
-3. 重新读取真实 current
-4. `current.uid == targetUID` 时才确认
-5. 若未确认，等待后续 callback；1 秒确认 timeout 到达时最后再重读一次
-6. 仍未命中则事务失败，不写成功 Recent Event、不发恢复通知
+后续每次完整 snapshot 用事实推进事务：
+
+1. `current.uid == targetUID`：确认成功，提交 Recent Event，并在满足通知条件时投递通知
+2. `targetUID` 已不在在线设备集合中：目标已明确不可达，事务失败并继续对当前 snapshot 运行 policy
+3. `current` 既不是 `sourceUID` 也不是 `targetUID`：出现了更新的外部事实，旧事务被 supersede，随后用当前 snapshot 重新跑 policy
+4. `current` 仍是 `sourceUID`：没有足够证据判断失败，继续等待后续 CoreAudio wake-up，不重复 setter
+5. 模式切换、保护关闭或新的 Trusted User Action：属于明确的新用户意图，直接取消/取代旧事务
+
+因此仅仅经过 1.2 秒、5 秒甚至更久都不会产生“Unable to confirm”的伪失败；只要之后 HAL 真实切到 target，仍会正常确认并记录事件/通知。
+
+这个设计有一个刻意取舍：如果某个驱动对 setter 返回成功、target 始终在线、current 永远停留在 source，并且此后再也没有任何 CoreAudio 状态变化，事务会保持 pending，而不是凭任意时间阈值猜测失败。后续明确的 topology/current/user-intent 事件会继续推进或取代它。
 
 Recent Event 的 `occurredAt` 使用**确认时间**，而不是 setter 请求时间。
 
@@ -151,9 +173,9 @@ Recent Event 的 `occurredAt` 使用**确认时间**，而不是 setter 请求�
 
 ## 通知去重与 episode ID
 
-Auto Mode 的 pending notification 会记录创建它时的 `episodeID`。确认时只有同 ID 的当前 episode 才能被标记为 `notificationSent = true`，因此旧事务晚到的 confirmation 不会污染一个更新的 episode。
+Auto Mode 的 pending notification 会记录创建它时的 `episodeID`。确认时只有同 ID 的当前 episode 才能参与去重，因此旧事务晚到的 confirmation 不会污染一个更新的 episode。
 
-同一 episode 第一次确认恢复后会把 `notificationSent` 置为 true；后续反抢仍立即恢复，但不会再次创建通知。Manual Mode 不使用 episode 去重。
+只有通知开关在确认时仍然开启、实际准备投递通知时，才把 `notificationSent` 置为 true。若事务确认前用户关闭通知，这次确认不会消耗 episode 的通知额度；之后在同一 episode 内重新开启通知，下一次恢复仍可以发送一次通知。Manual Mode 不使用 episode 去重。
 
 ## Trusted User Action
 
@@ -169,7 +191,7 @@ Recent Events 只记录已经确认成功的关键动作：
 - Auto 在 `stable` 状态接受的外部切换
 - Manual / Auto / preferred 重连 / startup 的恢复
 
-Auto 接受外部切换时，事件的 `from` 使用**旧 preferred**，而不是缓存的 `previous currentDevice`。这是因为 CoreAudio 的 devices callback 可能先于 default-input callback 到达并提前刷新 current；旧 preferred 才是策略迁移前可靠的来源设备。
+Auto 接受外部切换时，事件的 `from` 使用**旧 preferred**。这表示一次明确的 policy 迁移：从旧 preferred 接受到新的 current；不会依赖 listener 到达顺序或某个 callback 前缓存的 current。
 
 ## 时序示例：AirPods 接入并反抢
 
