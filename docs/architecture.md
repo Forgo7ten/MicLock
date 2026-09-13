@@ -227,7 +227,7 @@ Self.logger.info(
 ./Tests/run.sh
 ```
 
-与 App 相同的 Core/Services 源一起编译（不含 `@main` 入口），注入 `FakeAudioDeviceProvider`（内存设备表 + 可控 setter 失败/延迟/枚举失败状态 + 调用记录）与 `RecordingNotifier`（通知计数），直接调用 `handleDefaultInputChanged()` / `handleDeviceListChanged()` 模拟 CoreAudio wake-up，`UserDefaults` 用随机命名的独立 suite 隔离。时间敏感状态机统一依赖 `AudioMonitorScheduling`；`schedule(after:action:)` 在返回前完成 timer 登记，生产实现再用 `ContinuousClock + Task.sleep` 等待，测试则注入 `ManualAudioMonitorScheduler` 同步登记 action 并手动推进单调时间，因此多级 watchdog 不依赖 `Task.yield()` 调度时机，也不必真实等待 8/16/32/64 秒。当前 64 个用例 / 312 个断言：
+与 App 相同的 Core/Services 源一起编译（不含 `@main` 入口），注入 `FakeAudioDeviceProvider`（内存设备表 + 可控 setter 失败/延迟/枚举失败状态 + 调用记录）与 `RecordingNotifier`（通知计数），直接调用 `handleDefaultInputChanged()` / `handleDeviceListChanged()` 模拟 CoreAudio wake-up，`UserDefaults` 用随机命名的独立 suite 隔离。时间敏感状态机统一依赖 `AudioMonitorScheduling`；`schedule(after:action:)` 在返回前完成 timer 登记，生产实现再用 `ContinuousClock + Task.sleep` 等待，测试则注入 `ManualAudioMonitorScheduler` 同步登记 action 并手动推进单调时间，因此多级 watchdog 不依赖 `Task.yield()` 调度时机，也不必真实等待 8/16/32/64 秒。当前 66 个用例 / 326 个断言：
 
 | 场景 | 断言要点 |
 |---|---|

@@ -27,6 +27,8 @@ func runAllTests() async {
     await testLateSupersededTrustedCallbackDoesNotCancelLatest()
     testRapidTrustedSelectionsTrackOnlyLatestTransaction()
     await testTrustedSelectionExpiresAfterSingleFastRetry()
+    await testLateTrustedSuccessClearsConfirmationError()
+    await testAcceptedExternalSwitchClearsExpiredTrustedConfirmationError()
     await testTrustedSelectionExpirySurvivesCurrentReadFailure()
     await testNilSourcePendingSwitchWatchdogRetriesWithoutCurrent()
     testEnumerationFailureDoesNotApplyEmptyTopology()
@@ -694,6 +696,72 @@ private func testTrustedSelectionExpiresAfterSingleFastRetry() async {
 
     await scheduler.advance(by: .seconds(120))
     expect(provider.setCalls == [usbMic.uid, usbMic.uid], "expired trusted command never enters background 64s retry")
+}
+
+/// Trusted 已 timeout 后，HAL 仍可能稍晚完成之前 accepted 的 setter。
+/// fresh current 一旦证明 current == preferred，就必须清掉已经被解决的 confirmation error。
+@MainActor
+private func testLateTrustedSuccessClearsConfirmationError() async {
+    test("late trusted success clears confirmation error")
+
+    let scheduler = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .manual,
+        protection: false,
+        scheduler: scheduler
+    )
+
+    provider.applySetImmediately = false
+    monitor.selectDevice(usbMic)
+    await scheduler.advance(by: .seconds(1))
+
+    expect(provider.setCalls == [usbMic.uid, usbMic.uid], "trusted command writes once and performs one fast retry")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "current is still A when trusted confirmation expires")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "accepted trusted command keeps B as preferred after expiry")
+    expect(monitor.lastError == "Unable to confirm default input change", "trusted expiry reports confirmation failure")
+
+    provider.current = usbMic
+    monitor.handleDefaultInputChanged()
+
+    expect(monitor.currentDevice?.uid == usbMic.uid, "late HAL success updates current to B")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "late success leaves preferred at B")
+    expect(monitor.lastError == nil, "fresh current matching preferred clears resolved trusted confirmation error")
+    expect(provider.setCalls == [usbMic.uid, usbMic.uid], "late callback only clears transient error and does not issue another setter")
+}
+
+/// Auto 可能在 Trusted timeout 后接受当前设备为新的 preferred。candidate 提交使用的是
+/// fresh current，因此 preferred 更新后同样应清掉已经不再成立的 Trusted confirmation error。
+@MainActor
+private func testAcceptedExternalSwitchClearsExpiredTrustedConfirmationError() async {
+    test("accepted external switch clears expired trusted confirmation error")
+
+    let scheduler = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto,
+        protection: true,
+        settle: 1.0,
+        scheduler: scheduler
+    )
+
+    provider.applySetImmediately = false
+    monitor.selectDevice(usbMic)
+    await scheduler.advance(by: .seconds(1))
+
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "expired trusted command still prefers USB before Auto candidate settles")
+    expect(monitor.lastError == "Unable to confirm default input change", "expired trusted command exposes confirmation error while candidate is pending")
+
+    await scheduler.advance(by: .seconds(1))
+
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "current remains BuiltIn through candidate confirmation")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "stable external candidate accepts current BuiltIn as preferred")
+    expect(monitor.lastError == nil, "candidate preferred commit clears the resolved trusted confirmation error")
+    expect(provider.setCalls == [usbMic.uid, usbMic.uid], "candidate acceptance does not issue another trusted setter")
 }
 
 /// current read failure 不能绕过 Trusted 的 bounded lifetime；否则 final watchdog 的早退

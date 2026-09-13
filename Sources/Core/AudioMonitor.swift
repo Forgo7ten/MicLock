@@ -650,6 +650,7 @@ final class AudioMonitor {
         do {
             newCurrent = try provider.currentInputDevice()
             currentDevice = newCurrent
+            clearResolvedUserSelectionErrorIfNeeded(current: newCurrent)
         } catch {
             markTopologySampleInvalid(
                 message: "Unable to read current input device",
@@ -997,6 +998,18 @@ final class AudioMonitor {
         return false
     }
 
+    /// Trusted confirmation timeout 只描述“当时未能确认”，不是永久错误。
+    /// 后续任意一次成功 fresh read 若已经证明 current == preferred，就清掉这条
+    /// transient error；其他 setter / listener / topology / protection error 一律不碰。
+    private func clearResolvedUserSelectionErrorIfNeeded(current: AudioInputDevice?) {
+        guard lastError == Self.userSelectionConfirmationFailedError,
+              let current,
+              current.uid == preferredMicrophoneUID
+        else { return }
+
+        lastError = nil
+    }
+
     private func markTopologySampleInvalid(message: String, trigger: CoreAudioWakeReason) {
         deviceEnumerationError = message
         Self.trace("CORE_AUDIO_RECONCILE invalid-topology trigger=\(trigger.rawValue) error=\(message)")
@@ -1101,6 +1114,9 @@ final class AudioMonitor {
 
         cancelStableExternalSwitchCandidate()
         preferredMicrophoneUID = candidate.newCurrentUID
+        // candidate 只有在本轮 fresh current 仍等于 target 时才会提交；preferred 更新后
+        // 已经证明先前 Trusted timeout 的 confirmation error 被当前事实解决。
+        clearResolvedUserSelectionErrorIfNeeded(current: currentDevice)
         recordRecentAudioEvent(RecentAudioEvent(
             kind: .acceptedUserSwitch,
             fromDeviceName: candidate.oldPreferredName,
