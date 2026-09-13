@@ -307,6 +307,45 @@ struct MenuBarView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
+
+                if !monitor.recentAudioEvents.isEmpty {
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Recent Events")
+                            .font(.headline)
+
+                        ForEach(Array(monitor.recentAudioEvents.prefix(5).enumerated()), id: \.element.id) { index, event in
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text(index == 0 ? "Last Action" : event.titleText)
+                                        .font(.subheadline)
+                                        .fontWeight(index == 0 ? .semibold : .regular)
+
+                                    Spacer()
+
+                                    Text(event.occurredAt, style: .time)
+                                        .font(.caption)
+                                        .monospacedDigit()
+                                        .foregroundStyle(.secondary)
+                                }
+
+                                Text(event.transitionText)
+                                    .font(.caption)
+                                    .lineLimit(1)
+
+                                Text(event.reasonText)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+
+                            if index < min(monitor.recentAudioEvents.count, 5) - 1 {
+                                Divider()
+                            }
+                        }
+                    }
+                }
             }
 
             Group {
