@@ -513,6 +513,40 @@ final class AudioMonitor {
     func selectDevice(_ device: AudioInputDevice) {
         Self.logger.info("USER_SELECT \(device.name, privacy: .public)")
 
+        // 先重新读取真实 current；只有 fresh read 明确证明 target 已经生效时，
+        // 才能绕过 setter。读取失败时 currentDevice 只是缓存，不能拿它当成功事实。
+        if refreshCurrentDevice(), currentDevice?.uid == device.uid {
+            cancelStableExternalSwitchCandidate()
+            cancelProgrammaticSwitch()
+
+            let previousPreferredUID = preferredMicrophoneUID
+            guard previousPreferredUID != device.uid else {
+                lastError = nil
+                Self.logger.debug(
+                    "USER_SELECT no-op already current/preferred uid=\(device.uid, privacy: .public)"
+                )
+                return
+            }
+
+            let previousPreferredName = previousPreferredUID.flatMap { uid in
+                trustedDevices.first(where: { $0.uid == uid })?.name
+                    ?? lastKnownDeviceNames[uid]
+            }
+
+            preferredMicrophoneUID = device.uid
+            lastError = nil
+            recordRecentAudioEvent(RecentAudioEvent(
+                kind: .selectedInMicLock,
+                fromDeviceName: previousPreferredName,
+                toDeviceName: device.name,
+                occurredAt: Date()
+            ))
+            Self.logger.info(
+                "USER_SELECT already current; preferred updated uid=\(device.uid, privacy: .public)"
+            )
+            return
+        }
+
         let transactionID = beginProgrammaticSwitch(
             to: device.uid,
             origin: .trustedUserSelection,

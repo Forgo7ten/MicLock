@@ -11,6 +11,9 @@ func runAllTests() async {
     testM2_PreferredOffline()
     testM3_TrustedUserSelection()
     testUserSelectionFailureDoesNotPersistPreferred()
+    testSelectingAlreadyCurrentDeviceBypassesSetter()
+    testSelectingAlreadyCurrentPreferredDeviceIsNoOp()
+    testSelectingCachedCurrentAfterReadFailureStillUsesSetter()
     testRestoreImmediateConfirmation()
     testRestoreWaitsForRealConfirmation()
     await testRestoreSetterRejectionKeepsRetrying()
@@ -188,6 +191,83 @@ private func testUserSelectionFailureDoesNotPersistPreferred() {
     )
     expect(monitor.lastError != nil, "selection failure surfaces an error")
     expect(monitor.recentAudioEvents.isEmpty, "failed selection is not recorded")
+}
+
+/// 系统已经真实使用 USB，但 preferred 仍是 BuiltIn 时，用户点击当前 USB 是明确意图。
+/// 不应再依赖 setter；即使 setter 被配置为失败，也要直接把 preferred 更新为 USB。
+@MainActor
+private func testSelectingAlreadyCurrentDeviceBypassesSetter() {
+    test("selecting already-current device bypasses setter")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: usbMic,
+        preferred: builtInMic.uid,
+        mode: .manual,
+        protection: false
+    )
+
+    provider.forceSetFailure = true
+    monitor.selectDevice(usbMic)
+
+    expect(provider.setCalls.isEmpty, "fresh current confirmation bypasses setter")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "explicit current-device selection updates preferred")
+    expect(monitor.currentDevice?.uid == usbMic.uid, "current remains the confirmed USB device")
+    expect(monitor.lastError == nil, "no setter error is surfaced when no setter is needed")
+    expect(monitor.recentAudioEvents.count == 1, "real preferred change records one trusted action")
+    expect(monitor.recentAudioEvents.first?.kind == .selectedInMicLock, "event records trusted selection")
+    expect(monitor.recentAudioEvents.first?.fromDeviceName == builtInMic.name, "event describes previous preferred instead of USB -> USB")
+}
+
+/// current == target == preferred 时点击当前设备是纯 no-op：不 setter，也不制造 USB -> USB Recent Event。
+@MainActor
+private func testSelectingAlreadyCurrentPreferredDeviceIsNoOp() {
+    test("selecting already-current preferred device is no-op")
+
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: usbMic,
+        preferred: usbMic.uid,
+        mode: .manual
+    )
+
+    provider.forceSetFailure = true
+    monitor.selectDevice(usbMic)
+
+    expect(provider.setCalls.isEmpty, "already-current preferred target does not call setter")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "preferred remains unchanged")
+    expect(monitor.recentAudioEvents.isEmpty, "no meaningless same-device event is recorded")
+    expect(monitor.lastError == nil, "no-op remains error-free")
+}
+
+/// fresh current 读取失败时，缓存 current 即使恰好等于 target 也不能作为成功证据。
+/// 此时仍应走正常 setter 路径；这里强制 setter 失败来证明没有错误地 bypass。
+@MainActor
+private func testSelectingCachedCurrentAfterReadFailureStillUsesSetter() {
+    test("selecting cached current after read failure still uses setter")
+
+    let scheduler = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: usbMic,
+        preferred: builtInMic.uid,
+        mode: .manual,
+        protection: false,
+        scheduler: scheduler
+    )
+
+    provider.currentInputDeviceError = AudioDeviceProviderError.coreAudio(
+        operation: .queryDefaultInputDevice,
+        objectID: nil,
+        status: -1
+    )
+    provider.forceSetFailure = true
+    monitor.selectDevice(usbMic)
+
+    expect(provider.setCalls == [usbMic.uid], "failed fresh read does not bypass setter using cached current")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "failed setter does not persist target preferred")
+    expect(monitor.lastError == "Unable to set default input device", "setter failure remains visible")
+    expect(monitor.recentAudioEvents.isEmpty, "unconfirmed selection is not recorded")
 }
 
 /// setter 立即反映真实状态时，恢复仍应立即确认并通知。
