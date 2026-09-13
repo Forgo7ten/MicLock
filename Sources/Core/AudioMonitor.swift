@@ -88,9 +88,7 @@ final class AudioMonitor {
                 evaluateStartupPolicy()
             } else {
                 // Protection OFF：只监控与刷新，不执行任何策略、不学习。
-                pendingRestoreNotification = nil
-                pendingRecentAudioEvent = nil
-                clearExpectedDefaultSwitch()
+                cancelProgrammaticSwitch()
             }
         }
     }
@@ -151,8 +149,34 @@ final class AudioMonitor {
 
     @ObservationIgnored private var connectedUIDs: Set<String> = []
 
-    /// MicLock 自己最后一次 set 期望达到的设备 UID，用于识别 self-induced 回调。
-    @ObservationIgnored private var expectedDefaultUID: String?
+    private struct PendingEventDraft {
+        let kind: RecentAudioEvent.Kind
+        let fromDeviceName: String?
+        let toDeviceName: String
+    }
+
+    private struct PendingNotification {
+        let from: String
+        let to: String
+        let reason: RestoreReason
+    }
+
+    private struct PendingSwitch {
+        let id: UInt64
+        let targetUID: String
+        let event: PendingEventDraft
+        let notification: PendingNotification?
+    }
+
+    private enum ProgrammaticSwitchState {
+        case idle
+        case awaitingConfirmation(PendingSwitch)
+    }
+
+    /// MicLock 自己发起的切换事务；目标、解释事件与通知必须原子地属于同一笔事务。
+    @ObservationIgnored private var programmaticSwitchState: ProgrammaticSwitchState = .idle
+
+    @ObservationIgnored private var nextProgrammaticSwitchID: UInt64 = 0
 
     /// 用于清理始终无法从 CoreAudio 真实状态确认的程序化切换。
     @ObservationIgnored private var expectedSwitchTimeoutTask: Task<Void, Never>?
@@ -163,12 +187,6 @@ final class AudioMonitor {
     /// 一个 episode，通知最多发一条。
     @ObservationIgnored private var protectionEpisodeActive = false
     @ObservationIgnored private var protectionEpisodeNotified = false
-
-    /// 待确认的恢复通知：set 成功后挂起，确认 current == preferred 才投递。
-    @ObservationIgnored private var pendingRestoreNotification: (from: String, to: String, reason: RestoreReason)?
-
-    /// 程序化切换对应的解释事件；只有 expected switch 被真实状态确认后才提交。
-    @ObservationIgnored private var pendingRecentAudioEvent: RecentAudioEvent?
 
     /// 离线 preferred 设备的最近已知名称（跨启动持久化，用于 UI 展示）。
     @ObservationIgnored private var lastKnownDeviceNames: [String: String]
@@ -358,15 +376,15 @@ final class AudioMonitor {
     func selectDevice(_ device: AudioInputDevice) {
         Self.logger.info("USER_SELECT \(device.name, privacy: .public)")
 
-        // 用户的新选择取代尚未确认的自动恢复，不应沿用旧通知。
-        pendingRestoreNotification = nil
-        pendingRecentAudioEvent = RecentAudioEvent(
-            kind: .selectedInMicLock,
-            fromDeviceName: currentDevice?.name,
-            toDeviceName: device.name,
-            occurredAt: Date()
+        let transactionID = beginProgrammaticSwitch(
+            to: device.uid,
+            event: PendingEventDraft(
+                kind: .selectedInMicLock,
+                fromDeviceName: currentDevice?.name,
+                toDeviceName: device.name
+            ),
+            notification: nil
         )
-        beginExpectedDefaultSwitch(to: device.uid)
 
         if provider.setInputDevice(uid: device.uid) {
             // setter 成功只代表 CoreAudio 接受了写操作；preferred 可以提交，
@@ -375,15 +393,16 @@ final class AudioMonitor {
             lastError = nil
 
             refreshCurrentDevice()
-            if finishExpectedDefaultSwitchIfConfirmed() {
+            if finishProgrammaticSwitchIfConfirmed() {
                 Self.logger.debug(
                     "USER_SELECT confirmed immediately uid=\(device.uid, privacy: .public)"
                 )
             }
         } else {
-            clearExpectedDefaultSwitch()
-            pendingRecentAudioEvent = nil
-            lastError = "Unable to set default input device"
+            failProgrammaticSwitch(
+                id: transactionID,
+                error: "Unable to set default input device"
+            )
             Self.logger.error("USER_SELECT failed uid=\(device.uid, privacy: .public)")
         }
     }
@@ -461,22 +480,23 @@ final class AudioMonitor {
 
         guard let current = currentDevice else { return }
 
-        // MicLock 自己触发的变化：只有真实 current 已达到 expected 才确认成功。
-        Self.trace("DEFAULT_INPUT_CHANGED → \(current.name) expected=\(expectedDefaultUID ?? "nil")")
-        if expectedDefaultUID != nil {
-            if finishExpectedDefaultSwitchIfConfirmed() {
+        // MicLock 自己触发的变化优先于策略判定：等待中的事务只有在真实 current
+        // 达到 target 时才确认；中间 callback 只被吸收，不重复 setter。
+        if case .awaitingConfirmation(let pending) = programmaticSwitchState {
+            Self.trace("DEFAULT_INPUT_CHANGED → \(current.name) pendingTarget=\(pending.targetUID)")
+            if finishProgrammaticSwitchIfConfirmed() {
                 Self.logger.debug(
                     "DEFAULT_INPUT_CHANGED (self-induced confirmed) → \(current.name, privacy: .public)"
                 )
             } else {
-                // CoreAudio 可能先发出中间 callback；在 expected 仍未确认时，
-                // 不把中间状态误判为新的外部抢麦，也不重复 setter。
                 Self.logger.debug(
-                    "DEFAULT_INPUT_CHANGED while waiting expected target; current=\(current.name, privacy: .public)"
+                    "DEFAULT_INPUT_CHANGED while waiting programmatic switch; current=\(current.name, privacy: .public) target=\(pending.targetUID, privacy: .public)"
                 )
             }
             return
         }
+
+        Self.trace("DEFAULT_INPUT_CHANGED → \(current.name) pendingTarget=nil")
 
         Self.logger.info(
             "DEFAULT_INPUT_CHANGED \(previous?.name ?? "nil", privacy: .public) → \(current.name, privacy: .public) mode=\(self.protectionMode.rawValue, privacy: .public)"
@@ -546,21 +566,27 @@ final class AudioMonitor {
     ) {
         guard protectionEnabled else { return }
 
-        beginExpectedDefaultSwitch(to: preferred.uid)
-        pendingRecentAudioEvent = RecentAudioEvent(
-            kind: .restored(reason),
-            fromDeviceName: current.name,
-            toDeviceName: preferred.name,
-            occurredAt: Date()
+        let transactionID = beginProgrammaticSwitch(
+            to: preferred.uid,
+            event: PendingEventDraft(
+                kind: .restored(reason),
+                fromDeviceName: current.name,
+                toDeviceName: preferred.name
+            ),
+            notification: pendingNotificationForRestore(
+                from: current.name,
+                to: preferred.name,
+                reason: reason
+            )
         )
 
         let ok = provider.setInputDevice(uid: preferred.uid)
 
         guard ok else {
-            clearExpectedDefaultSwitch()
-            pendingRestoreNotification = nil
-            pendingRecentAudioEvent = nil
-            lastError = "Unable to set default input device"
+            failProgrammaticSwitch(
+                id: transactionID,
+                error: "Unable to set default input device"
+            )
             Self.logger.error("RESTORE_FAILURE reason=\(reason, privacy: .public) target=\(preferred.name, privacy: .public)")
             return
         }
@@ -571,13 +597,11 @@ final class AudioMonitor {
         // 系统/蓝牙子系统可能立刻再次抢麦，直到稳定前继续保护。
         markTopologyUnsettled()
 
-        preparePendingNotification(from: current.name, to: preferred.name, reason: reason)
-
         // setter 返回成功不等于 CoreAudio 已经切换；重新读取真实 current，
         // 同步生效时可立即确认，异步生效时等待 listener callback。
         refreshCurrentDevice()
 
-        if finishExpectedDefaultSwitchIfConfirmed() {
+        if finishProgrammaticSwitchIfConfirmed() {
             Self.logger.info(
                 "RESTORE_CONFIRMED \(current.name, privacy: .public) → \(preferred.name, privacy: .public) reason=\(reason, privacy: .public)"
             )
@@ -588,63 +612,94 @@ final class AudioMonitor {
         }
     }
 
-    // MARK: - Expected Switch Lifecycle
+    // MARK: - Programmatic Switch Transaction
 
-    /// 开始一次由 MicLock 发起的切换，并安排无法确认时的最终清理。
-    private func beginExpectedDefaultSwitch(to uid: String) {
+    /// 开始一笔由 MicLock 发起的切换事务。新事务会原子地取代旧事务，
+    /// 因此 target / Recent Event / notification 不会跨两次操作串线。
+    @discardableResult
+    private func beginProgrammaticSwitch(
+        to uid: String,
+        event: PendingEventDraft,
+        notification: PendingNotification?
+    ) -> UInt64 {
         expectedSwitchTimeoutTask?.cancel()
-        expectedDefaultUID = uid
+
+        nextProgrammaticSwitchID &+= 1
+        let id = nextProgrammaticSwitchID
+        let pending = PendingSwitch(
+            id: id,
+            targetUID: uid,
+            event: event,
+            notification: notification
+        )
+        programmaticSwitchState = .awaitingConfirmation(pending)
 
         expectedSwitchTimeoutTask = Task { [weak self] in
             try? await Task.sleep(for: Self.expectedSwitchConfirmationTimeout)
 
             guard !Task.isCancelled else { return }
             guard let self else { return }
-            guard self.expectedDefaultUID == uid else { return }
+            guard case .awaitingConfirmation(let currentPending) = self.programmaticSwitchState,
+                  currentPending.id == id
+            else { return }
 
             // timeout 到达时最后再读一次真实 CoreAudio 状态。
             self.refreshCurrentDevice()
 
-            if self.finishExpectedDefaultSwitchIfConfirmed() {
+            if self.finishProgrammaticSwitchIfConfirmed() {
                 Self.logger.debug(
-                    "EXPECTED_SWITCH confirmed on timeout recheck uid=\(uid, privacy: .public)"
+                    "PROGRAMMATIC_SWITCH confirmed on timeout recheck id=\(id, privacy: .public) uid=\(uid, privacy: .public)"
                 )
                 return
             }
 
-            self.expectedDefaultUID = nil
-            self.expectedSwitchTimeoutTask = nil
-            self.pendingRestoreNotification = nil
-            self.pendingRecentAudioEvent = nil
-            self.lastError = "Unable to confirm default input device change"
-
-            Self.logger.error("EXPECTED_SWITCH timeout uid=\(uid, privacy: .public)")
+            self.failProgrammaticSwitch(
+                id: id,
+                error: "Unable to confirm default input device change"
+            )
+            Self.logger.error(
+                "PROGRAMMATIC_SWITCH timeout id=\(id, privacy: .public) uid=\(uid, privacy: .public)"
+            )
         }
+
+        return id
     }
 
-    /// 清理 expected 状态；pending restore 通知由调用方按语义单独处理。
-    private func clearExpectedDefaultSwitch() {
-        expectedDefaultUID = nil
+    private func cancelProgrammaticSwitch() {
+        programmaticSwitchState = .idle
         expectedSwitchTimeoutTask?.cancel()
         expectedSwitchTimeoutTask = nil
     }
 
-    /// 仅在 provider 已经读到目标设备时确认程序化切换。
-    @discardableResult
-    private func finishExpectedDefaultSwitchIfConfirmed() -> Bool {
-        guard let expected = expectedDefaultUID,
-              currentDevice?.uid == expected
-        else { return false }
+    private func failProgrammaticSwitch(id: UInt64, error: String) {
+        guard case .awaitingConfirmation(let pending) = programmaticSwitchState,
+              pending.id == id
+        else { return }
 
-        clearExpectedDefaultSwitch()
-        if let pendingRecentAudioEvent {
-            recordRecentAudioEvent(pendingRecentAudioEvent)
-            self.pendingRecentAudioEvent = nil
-        }
-        completePendingRestoreNotification()
-        return true
+        cancelProgrammaticSwitch()
+        lastError = error
     }
 
+    /// 仅在 provider 已经读到本事务目标设备时确认程序化切换。
+    @discardableResult
+    private func finishProgrammaticSwitchIfConfirmed() -> Bool {
+        guard case .awaitingConfirmation(let pending) = programmaticSwitchState,
+              currentDevice?.uid == pending.targetUID
+        else { return false }
+
+        cancelProgrammaticSwitch()
+
+        // Recent Event 的时间是确认时间，而不是 setter 请求时间。
+        recordRecentAudioEvent(RecentAudioEvent(
+            kind: pending.event.kind,
+            fromDeviceName: pending.event.fromDeviceName,
+            toDeviceName: pending.event.toDeviceName,
+            occurredAt: Date()
+        ))
+
+        commitNotification(pending.notification)
+        return true
+    }
 
     private func recordRecentAudioEvent(_ event: RecentAudioEvent) {
         recentAudioEvents.insert(event, at: 0)
@@ -655,28 +710,28 @@ final class AudioMonitor {
 
     // MARK: - Notification 去重
 
-    private func preparePendingNotification(from: String, to: String, reason: RestoreReason) {
-        guard notificationsEnabled else { return }
-        guard reason != .startup else { return }
+    private func pendingNotificationForRestore(
+        from: String,
+        to: String,
+        reason: RestoreReason
+    ) -> PendingNotification? {
+        guard notificationsEnabled else { return nil }
+        guard reason != .startup else { return nil }
 
         // Auto Mode：一个 protection episode 只通知一次。
-        if protectionMode == .auto, protectionEpisodeNotified { return }
+        if protectionMode == .auto, protectionEpisodeNotified { return nil }
 
-        pendingRestoreNotification = (from: from, to: to, reason: reason)
+        return PendingNotification(from: from, to: to, reason: reason)
     }
 
-    /// 确认恢复已生效（current == preferred）后才投递挂起的通知。
-    private func completePendingRestoreNotification() {
-        guard let pending = pendingRestoreNotification else { return }
-
-        guard currentDevice?.uid == preferredMicrophoneUID else { return }
-
-        pendingRestoreNotification = nil
+    private func commitNotification(_ pending: PendingNotification?) {
+        guard let pending else { return }
 
         if protectionMode == .auto {
             protectionEpisodeNotified = true
         }
 
+        // 用户可能在事务确认前关闭通知；关闭后不应投递。
         guard notificationsEnabled else { return }
 
         Self.logger.info(

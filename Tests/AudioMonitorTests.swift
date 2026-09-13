@@ -12,6 +12,7 @@ func runAllTests() async {
     testUserSelectionFailureDoesNotPersistPreferred()
     testRestoreImmediateConfirmation()
     testRestoreWaitsForRealConfirmation()
+    testPendingRestoreIsAtomicallySupersededByModeChange()
     testIntermediateCallbackWhileExpectedDoesNotRestoreAgain()
     testA1_NewDeviceHijack()
     testA2_SettledUserSwitch()
@@ -173,6 +174,7 @@ private func testRestoreWaitsForRealConfirmation() {
         "monitor does not fabricate current before confirmation"
     )
     expect(notifier.presentCount == 0, "no notification before actual confirmation")
+    expect(monitor.recentAudioEvents.isEmpty, "no recent event before actual confirmation")
 
     provider.current = builtInMic
     monitor.handleDefaultInputChanged()
@@ -180,6 +182,43 @@ private func testRestoreWaitsForRealConfirmation() {
     expect(monitor.currentDevice?.uid == builtInMic.uid, "confirmed current is preferred")
     expect(notifier.presentCount == 1, "notification sent after real confirmation")
     expect(provider.setCalls == [builtInMic.uid], "confirmation does not trigger another setter")
+    expect(monitor.recentAudioEvents.first?.kind == .restored(.manualLock), "recent event is committed with confirmation")
+}
+
+/// 新事务必须原子取代旧事务：Auto 恢复未确认时切到 Manual，
+/// 新的 startup 对齐确认后不能发送旧 automaticHijack 通知或记录旧事件。
+@MainActor
+private func testPendingRestoreIsAtomicallySupersededByModeChange() {
+    test("pending restore is atomically superseded by mode change")
+
+    let (monitor, provider, notifier) = makeMonitor(
+        devices: [builtInMic, airpodsMic],
+        current: builtInMic,
+        preferred: builtInMic.uid,
+        mode: .auto
+    )
+    provider.applySetImmediately = false
+
+    // 打开 Auto settle window，再模拟系统抢到 AirPods，产生未确认的 automaticHijack restore。
+    provider.devices = [builtInMic, airpodsMic, usbMic]
+    monitor.handleDeviceListChanged()
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls == [builtInMic.uid], "auto restore is pending")
+    expect(notifier.presentCount == 0, "pending auto restore has not notified")
+    expect(monitor.recentAudioEvents.isEmpty, "pending auto restore has not recorded event")
+
+    // 切到 Manual 会 evaluateStartupPolicy，启动一笔新的 startup 对齐事务并 supersede 旧事务。
+    monitor.protectionMode = .manual
+    expect(provider.setCalls == [builtInMic.uid, builtInMic.uid], "manual mode starts a replacement startup transaction")
+
+    provider.current = builtInMic
+    monitor.handleDefaultInputChanged()
+
+    expect(notifier.presentCount == 0, "startup confirmation does not leak old auto notification")
+    expect(monitor.recentAudioEvents.count == 1, "only replacement transaction is recorded")
+    expect(monitor.recentAudioEvents.first?.kind == .restored(.startup), "confirmed event belongs to replacement startup transaction")
 }
 
 /// 异步切换期间的中间 callback 不应重复 setter。
