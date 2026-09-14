@@ -236,6 +236,9 @@ final class AudioMonitor {
         let firstBaseline = trustedDevices == nil
         let oldUIDs = Set((trustedDevices ?? []).map(\.uid))
         let newUIDs = Set(snapshot.devices.map(\.uid))
+        // A complete topology proves availability independently of which device
+        // is currently selected. Clear only a stale target-offline UI failure.
+        writer.clearTargetOfflineFailureIfAvailable(in: newUIDs)
         let added = firstBaseline ? [] : newUIDs.subtracting(oldUIDs)
         let topologyChanged = !firstBaseline && newUIDs != oldUIDs
         trustedDevices = devices

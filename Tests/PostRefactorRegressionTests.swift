@@ -8,6 +8,7 @@ func runPostRefactorRegressionTests() async {
     await testProtectingAutoDoesNotTrustPartialRemoval()
     testAvailabilityProjectionIsObservable()
     testOfflineFailureClearsOnlyWhenItsTargetReturns()
+    testOfflineFailureClearsWhenTargetReconnectsWithoutBecomingCurrent()
 }
 
 @MainActor
@@ -129,4 +130,34 @@ private func testOfflineFailureClearsOnlyWhenItsTargetReturns() {
     monitor.handleDeviceListChanged()
     expect(monitor.lastError == nil, "fresh observation of the failed target clears stale offline error")
     expect(provider.setCalls.count == writes, "already-current reconnected target needs no redundant write")
+}
+
+@MainActor
+private func testOfflineFailureClearsWhenTargetReconnectsWithoutBecomingCurrent() {
+    test("review: target-offline error clears when complete topology proves target returned")
+    let (monitor, provider, _) = makeMonitor(
+        devices: [usbMic, airpodsMic], current: usbMic,
+        preferred: usbMic.uid, mode: .manual, scheduler: ManualAudioMonitorScheduler()
+    )
+
+    provider.applySetImmediately = false
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+    expect(provider.setCalls == [usbMic.uid], "Manual starts one restore to the USB preferred target")
+
+    provider.devices = [airpodsMic]
+    monitor.handleDeviceListChanged()
+    expect(
+        monitor.lastError == "Target input device is no longer available",
+        "complete topology records the disappeared USB target"
+    )
+
+    monitor.protectionEnabled = false
+    let writes = provider.setCalls.count
+    provider.devices = [airpodsMic, usbMic]
+    monitor.handleDeviceListChanged()
+
+    expect(monitor.currentDevice?.uid == airpodsMic.uid, "USB can reconnect without becoming current")
+    expect(monitor.lastError == nil, "complete topology clears the stale USB offline failure")
+    expect(provider.setCalls.count == writes, "disabled protection does not restore merely because USB returned")
 }

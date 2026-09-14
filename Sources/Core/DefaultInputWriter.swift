@@ -86,6 +86,15 @@ struct DefaultInputWriter {
         failure = .targetOffline(uid: targetUID)
     }
 
+    /// Call only with a complete topology snapshot. Reappearance of the exact
+    /// failed UID proves that an old target-offline presentation error is stale,
+    /// even when that device has not become the current default input.
+    mutating func clearTargetOfflineFailureIfAvailable(in availableUIDs: Set<String>) {
+        guard case .targetOffline(let uid) = failure,
+              availableUIDs.contains(uid) else { return }
+        failure = nil
+    }
+
     /// Call ONLY after a successful fresh current read (including an explicit nil).
     mutating func observe(_ current: AudioInputDevice?) -> Request? {
         switch failure {
