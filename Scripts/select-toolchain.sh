@@ -1,45 +1,81 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 
-# 选择用于编译的 Swift 工具链，把 .xctoolchain 目录输出到 stdout。
+# 选择用于编译的 Swift 6+ 工具链根目录，把路径输出到 stdout。
 # 供 build.sh 与 Tests/run.sh 共用。
 #
-# 背景：本机 Command Line Tools 的 swiftc 是 5.8.1，无法解析新版 SDK
-# （15/26+）里使用 Swift 6 语法的 swiftinterface，也缺少 @Observable 宏。
-# 从 swift.org 安装的 Swift 6 工具链位于 /Library/Developer/Toolchains/
-# （安装命令见 README），CLT 保持原样不动——脚本显式调用工具链内的 swiftc，
-# 不改变系统默认编译器。
+# 优先级：
+# 1. MICLOCK_TOOLCHAIN 显式覆盖
+# 2. xcrun 当前选中的 swiftc
+# 3. /Library 与 ~/Library 下可用的独立 .xctoolchain，按真实 swiftc 版本选择
 #
-# 优先级：MICLOCK_TOOLCHAIN 环境变量 > 系统目录与用户目录中版本号最新的工具链。
+# 不再按目录名排序：目录名不保证等于编译器版本，也避免依赖 macOS sort 是否支持 -V。
 
 set -euo pipefail
 
+version_major=0
+version_minor=0
+version_patch=0
+
+usable() {
+    local root="$1"
+    local text
+
+    [[ -n "$root" && -x "$root/usr/bin/swiftc" ]] || return 1
+    text="$("$root/usr/bin/swiftc" --version 2>/dev/null)" || return 1
+
+    if [[ "$text" =~ [Vv]ersion[[:space:]]+([0-9]+)\.([0-9]+)(\.([0-9]+))? ]]; then
+        version_major="${BASH_REMATCH[1]}"
+        version_minor="${BASH_REMATCH[2]}"
+        version_patch="${BASH_REMATCH[4]:-0}"
+        (( version_major >= 6 ))
+    else
+        return 1
+    fi
+}
+
 if [[ -n "${MICLOCK_TOOLCHAIN:-}" ]]; then
-    [[ -d "${MICLOCK_TOOLCHAIN}" ]] || {
-        echo "error: MICLOCK_TOOLCHAIN 不存在: ${MICLOCK_TOOLCHAIN}" >&2
+    usable "$MICLOCK_TOOLCHAIN" || {
+        echo "error: MICLOCK_TOOLCHAIN 必须包含可用的 Swift 6+ usr/bin/swiftc: $MICLOCK_TOOLCHAIN" >&2
         exit 1
     }
-    echo "${MICLOCK_TOOLCHAIN}"
+    printf '%s\n' "$MICLOCK_TOOLCHAIN"
     exit 0
 fi
 
-CANDIDATES=()
-
-for DIR in \
-    /Library/Developer/Toolchains \
-    "${HOME}/Library/Developer/Toolchains"; do
-    [[ -d "${DIR}" ]] || continue
-    for TOOLCHAIN in "${DIR}"/*.xctoolchain; do
-        [[ -d "${TOOLCHAIN}" ]] && CANDIDATES+=("${TOOLCHAIN}")
-    done
-done
-
-# swift-latest 是 swift.org 安装器创建的符号链接，版本号排序会把它排到
-# 任意真实版本前面/后面造成误选，剔除后只比真实版本号。
-CANDIDATES=("${(@)CANDIDATES:#*swift-latest.xctoolchain}")
-
-if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
-    echo "error: 未找到 Swift 6+ 工具链。安装方法见 README（系统要求一节）。" >&2
-    exit 1
+compiler="$(xcrun --find swiftc 2>/dev/null || true)"
+if [[ "$compiler" == */usr/bin/swiftc ]]; then
+    selected="${compiler%/usr/bin/swiftc}"
+    if usable "$selected"; then
+        printf '%s\n' "$selected"
+        exit 0
+    fi
 fi
 
-echo "${CANDIDATES[@]}" | tr ' ' '\n' | sort -rV | head -1
+shopt -s nullglob
+best=""
+best_major=0
+best_minor=0
+best_patch=0
+
+for candidate in \
+    /Library/Developer/Toolchains/*.xctoolchain \
+    "$HOME"/Library/Developer/Toolchains/*.xctoolchain; do
+    [[ "$candidate" != */swift-latest.xctoolchain ]] || continue
+    usable "$candidate" || continue
+
+    if (( version_major > best_major ||
+          (version_major == best_major && version_minor > best_minor) ||
+          (version_major == best_major && version_minor == best_minor && version_patch > best_patch) )); then
+        best="$candidate"
+        best_major="$version_major"
+        best_minor="$version_minor"
+        best_patch="$version_patch"
+    fi
+done
+
+[[ -n "$best" ]] || {
+    echo "error: 未找到可用的 Swift 6+ 编译器。请选择合适的 Xcode，或设置 MICLOCK_TOOLCHAIN；详见 docs/build.md。" >&2
+    exit 1
+}
+
+printf '%s\n' "$best"

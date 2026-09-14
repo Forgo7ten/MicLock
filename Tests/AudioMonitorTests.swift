@@ -39,8 +39,8 @@ func runAllTests() async {
     testManualRestoresWhenEnumerationFails()
     await testPendingSwitchWatchdogRetriesStuckSource()
     await testPendingSwitchWatchdogDoesNotLearnSourceAfterRetryThreshold()
-    await testProtectionRetrySuccessReopensSettleAndRebindsNotification()
-    await testDelayedProtectionConfirmationReopensSettleAndRebindsNotification()
+    await testProtectionRetryConfirmationReopensProtectionWindow()
+    await testDelayedProtectionConfirmationReopensProtectionWindow()
     await testTrustedSelectionRetryNeverExposesProtectionState()
     await testCandidateRecoversAfterEnumerationFailure()
     await testPreferredRemovalBeyondLegacyCandidateDelay()
@@ -53,14 +53,14 @@ func runAllTests() async {
     await testPreferredRemoval_DefaultPropertyChangesBeforeDevicesProperty()
     await testA2_SettledUserSwitch()
     await testA2_RecentEventUsesOldPreferredAfterNoDeltaDeviceCallback()
-    testA3_ManualSwitchInsideSettleWindow()
+    testA3_ManualSwitchInsideProtectionWindow()
     await testA4_NewDeviceSettlesThenAccepted()
     testBurst()
-    testNotificationDedupeOnlyConsumedWhenActuallySent()
-    await testSettleConfigurationChangeKeepsEpisodeNotificationDeduped()
+    testNotificationCooldownStartsOnlyWhenActuallySubmitted()
+    await testSettleConfigurationChangeExtendsProtectionAndNotificationCooldown()
     testPreferredReconnect()
     testPreferredReconnectAlreadyCurrentDoesNotSetAgain()
-    testUserSelectionInsideSettleWindow()
+    testUserSelectionInsideProtectionWindow()
     testProtectionOff()
     testStartupEnforce()
     await testStartupCurrentReadFailureRecoversWithoutExternalCallback()
@@ -70,6 +70,8 @@ func runAllTests() async {
     await testFreshInstallEnumerationFailureWithNilCurrentPrefersBuiltIn()
     testIdempotentCallbacks()
     testFirstRunDefaultSelection()
+    testCurrentDeviceNameShowsNoDefaultInputAfterSuccessfulNilRead()
+    await testCurrentDeviceNameDistinguishesUnknownFromSuccessfulNil()
     testDeviceNamePersistence()
     testPreferencesFreshInstall()
     testPreferencesSettleClamp()
@@ -967,7 +969,7 @@ private func testPartialTopologyUpdatesUIButFreezesPolicyFacts() {
     expect(provider.setCalls.isEmpty, "partial topology does not treat omitted USB as a removal event")
 
     // 同一可见列表随后成为完整 snapshot：现在 USB removal 才是可信事实，
-    // Auto 进入 settling 并恢复原 preferred。
+    // Auto 开启 protection window 并恢复原 preferred。
     provider.incompleteDeviceIDs = []
     monitor.handleDeviceListChanged()
 
@@ -1050,8 +1052,8 @@ private func testPendingSwitchWatchdogRetriesStuckSource() async {
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "watchdog never learns source as preferred")
 }
 
-/// Auto settling hijack 的 setter 如果一直 accepted、但 current 永远停在 source，
-/// 完整 watchdog 退避周期结束后也必须保持保护事务，不能重新进入 stable candidate
+/// Auto protection-window hijack 的 setter 如果一直 accepted、但 current 永远停在 source，
+/// 完整 watchdog 退避周期结束后也必须保持保护事务，不能落入新的 external candidate
 /// 并把 source（抢麦设备）反向学习成 preferred。
 @MainActor
 private func testPendingSwitchWatchdogDoesNotLearnSourceAfterRetryThreshold() async {
@@ -1069,7 +1071,7 @@ private func testPendingSwitchWatchdogDoesNotLearnSourceAfterRetryThreshold() as
 
     provider.applySetImmediately = false
 
-    // AirPods 接入并抢占 default input：真实 topology delta 先把 Auto 置为 settling，
+    // AirPods 接入并抢占 default input：真实 topology delta 先开启 Auto protection window，
     // 随后 corrective restore 被 HAL 接受，但真实 current 始终不切回 BuiltIn。
     // USB 预先在线，仅用于后面验证“第三个 current”会 supersede 旧事务。
     provider.devices = [builtInMic, usbMic, airpodsMic]
@@ -1105,13 +1107,13 @@ private func testPendingSwitchWatchdogDoesNotLearnSourceAfterRetryThreshold() as
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "supersede does not immediately rewrite preferred")
 }
 
-/// Auto hijack 的旧 settle 已结束后，后续 protection retry 一旦被 CoreAudio 接受，
-/// 必须重新开启 settle；该 retry 若确认成功并立即再次被 source 抢回，仍要再次 restore，
-/// 不能进入 stable external candidate，更不能把 source 学成 preferred。
-/// 同时原 transaction 的 notification 必须迁移到新 episode，确保 episode 内只通知一次。
+/// Auto hijack 的初始 protection window 已结束后，后续 protection retry 只有在
+/// fresh current 确认恢复成功时才重新开启 protection window；若随后立即被 source 抢回，
+/// 仍要再次 restore，不能进入 external candidate，更不能把 source 学成 preferred。
+/// 第一次确认同时启动 notification cooldown，紧接着的恢复不得重复通知。
 @MainActor
-private func testProtectionRetrySuccessReopensSettleAndRebindsNotification() async {
-    test("protection retry success reopens settle and rebinds notification")
+private func testProtectionRetryConfirmationReopensProtectionWindow() async {
+    test("protection retry confirmation reopens protection window")
 
     let scheduler = ManualAudioMonitorScheduler()
     let (monitor, provider, notifier) = makeMonitor(
@@ -1131,20 +1133,20 @@ private func testProtectionRetrySuccessReopensSettleAndRebindsNotification() asy
     expect(provider.setCalls == [builtInMic.uid], "initial topology hijack starts one restore")
     expect(notifier.presentCount == 0, "pending restore has not notified")
 
-    // 让最初 episode 结束，并让第一个 watchdog retry 仍保持未确认。
+    // 让最初 protection window 到期，并让前两个 watchdog retry 仍保持未确认。
     await scheduler.advance(by: .seconds(1.5))
     expect(provider.setCalls.count == 3, "watchdog has retried at 0.5s and 1.5s")
 
-    // 下一档 2s retry 改为同步生效：accepted retry 应在确认前重新开启 settle。
+    // 下一档 2s retry 同步生效并被 fresh read 确认；只有 confirmation 才重新开启 protection window。
     provider.applySetImmediately = true
     await scheduler.advance(by: .seconds(2))
 
     expect(monitor.currentDevice?.uid == builtInMic.uid, "later accepted retry reaches preferred")
     expect(monitor.recentAudioEvents.first?.kind == .restored(.automaticHijack), "retry confirmation keeps original restore semantics")
-    expect(notifier.presentCount == 1, "retry confirmation sends the episode notification once")
+    expect(notifier.presentCount == 1, "retry confirmation submits one notification and starts cooldown")
 
-    // 立刻再次被 AirPods 抢回。因为 retry 已重新开启 settle，这次必须再次 restore；
-    // notification 已在同一个 rebind 后 episode 消耗，不得重复发送。
+    // 立刻再次被 AirPods 抢回。因为 confirmation 已重新开启 protection window，这次必须再次 restore；
+    // 第二次确认仍在 notification cooldown 内，不得重复发送。
     provider.current = airpodsMic
     monitor.handleDefaultInputChanged()
 
@@ -1153,17 +1155,17 @@ private func testProtectionRetrySuccessReopensSettleAndRebindsNotification() asy
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "preferred remains BuiltIn across re-hijack")
     expect(
         !monitor.recentAudioEvents.contains(where: { $0.kind == .acceptedUserSwitch }),
-        "no accepted external switch is created after retry reopened settle"
+        "no accepted external switch is created after confirmation reopened protection"
     )
-    expect(notifier.presentCount == 1, "rebound episode notification is deduped after immediate re-hijack")
+    expect(notifier.presentCount == 1, "notification cooldown suppresses the immediate duplicate restore")
 }
 
-/// 更早一次已经 accepted 的 protection setter 可能在旧 settle 结束后才真正到达 target，
-/// 即使最近一次 watchdog retry 被拒绝，真实 confirmation 仍必须重新锚定 protection settle。
-/// 否则紧接着的再次抢麦会从 stable 进入 candidate，并可能反向学习 source。
+/// 更早一次已经 accepted 的 protection setter 可能在旧 protection window 结束后才真正到达 target，
+/// 即使最近一次 watchdog retry 被拒绝，fresh current confirmation 仍必须重新开启 protection window。
+/// 否则紧接着的再次抢麦会进入 external candidate，并可能反向学习 source。
 @MainActor
-private func testDelayedProtectionConfirmationReopensSettleAndRebindsNotification() async {
-    test("delayed protection confirmation reopens settle and rebinds notification")
+private func testDelayedProtectionConfirmationReopensProtectionWindow() async {
+    test("delayed protection confirmation reopens protection window")
 
     let scheduler = ManualAudioMonitorScheduler()
     let (monitor, provider, notifier) = makeMonitor(
@@ -1182,13 +1184,13 @@ private func testDelayedProtectionConfirmationReopensSettleAndRebindsNotificatio
 
     expect(provider.setCalls == [builtInMic.uid], "initial hijack restore is accepted but remains pending")
 
-    // 最近一次 watchdog retry 被拒绝，因此它不会延长 settle。
+    // 最近一次 watchdog retry 被拒绝，因此它不会重新开启 protection window。
     provider.forceSetFailure = true
     await scheduler.advance(by: .milliseconds(700))
     expect(provider.setCalls.count == 2, "first watchdog retry is rejected")
     expect(monitor.protectionRetryState == .setterRejected, "rejected retry is visible while transaction remains pending")
 
-    // 越过初始 1s settle，但保持在下一档 1s watchdog（约 t=1.5s）之前。
+    // 越过初始 1s protection window，但保持在下一档 1s watchdog（约 t=1.5s）之前。
     await scheduler.advance(by: .milliseconds(500))
 
     // 模拟最初 accepted 的 CoreAudio 请求现在才真正生效。
@@ -1199,7 +1201,7 @@ private func testDelayedProtectionConfirmationReopensSettleAndRebindsNotificatio
     expect(monitor.recentAudioEvents.first?.kind == .restored(.automaticHijack), "late confirmation keeps protection restore semantics")
     expect(notifier.presentCount == 1, "late confirmation sends one notification")
 
-    // confirmation 自身应已重新开启 settle；立即再次抢麦必须继续保护，而不是 stable candidate。
+    // confirmation 自身应已重新开启 protection window；立即再次抢麦必须继续保护，而不是 external candidate。
     provider.forceSetFailure = false
     provider.applySetImmediately = true
     provider.current = airpodsMic
@@ -1212,7 +1214,7 @@ private func testDelayedProtectionConfirmationReopensSettleAndRebindsNotificatio
         !monitor.recentAudioEvents.contains(where: { $0.kind == .acceptedUserSwitch }),
         "late confirmation path never creates a stable external-switch acceptance"
     )
-    expect(notifier.presentCount == 1, "confirmation-rebound episode still dedupes the immediate re-hijack notification")
+    expect(notifier.presentCount == 1, "notification cooldown suppresses the immediate re-hijack notification")
 }
 
 /// Trusted User Selection 只做一次 fast retry，并且永远不暴露 Protection retry 状态。
@@ -1301,7 +1303,7 @@ private func testCurrentMissingFromTopologyIsInconclusive() async {
     provider.devices = [builtInMic, airpodsMic]
     monitor.handleDeviceListChanged()
 
-    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "topology catch-up enters settling instead of accepting AirPods")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "topology catch-up enters protection instead of accepting AirPods")
 }
 
 /// stable candidate 的确认若恰好遇到设备枚举失败，不应永久悬挂。
@@ -1349,7 +1351,7 @@ private func testPendingRestoreIsAtomicallySupersededByModeChange() {
     )
     provider.applySetImmediately = false
 
-    // 打开 Auto settle window，再模拟系统抢到 AirPods，产生未确认的 automaticHijack restore。
+    // 打开 Auto protection window，再模拟系统抢到 AirPods，产生未确认的 automaticHijack restore。
     provider.devices = [builtInMic, airpodsMic, usbMic]
     monitor.handleDeviceListChanged()
     provider.current = airpodsMic
@@ -1572,10 +1574,10 @@ private func testA2_RecentEventUsesOldPreferredAfterNoDeltaDeviceCallback() asyn
     expect(event?.toDeviceName == usbMic.name, "event target is new current device")
 }
 
-/// A3：settle window 内的外部切换 → 按启发式恢复（预期行为，非 bug）。
+/// A3：protection window 内的外部切换 → 按启发式恢复（预期行为，非 bug）。
 @MainActor
-private func testA3_ManualSwitchInsideSettleWindow() {
-    test("A3 switch inside settle window")
+private func testA3_ManualSwitchInsideProtectionWindow() {
+    test("A3 switch inside protection window")
 
     let (monitor, provider, _) = makeMonitor(
         devices: [builtInMic, usbMic],
@@ -1584,7 +1586,7 @@ private func testA3_ManualSwitchInsideSettleWindow() {
         mode: .auto
     )
 
-    // 制造拓扑变化开启 settle window。
+    // 制造拓扑变化开启 protection window。
     provider.devices = [builtInMic, usbMic, airpodsMic]
     monitor.handleDeviceListChanged()
 
@@ -1611,7 +1613,7 @@ private func testA4_NewDeviceSettlesThenAccepted() async {
     provider.devices = [builtInMic, usbMic]
     monitor.handleDeviceListChanged()
 
-    // 等待 settle episode 到期并回到 stable。
+    // 等待 protection window 到期并回到 stable。
     await waitPastSettleWindow()
 
     provider.current = usbMic
@@ -1628,7 +1630,7 @@ private func testA4_NewDeviceSettlesThenAccepted() async {
 // MARK: - Burst Robustness (§60)
 
 /// CoreAudio burst：交错重复的列表/默认输入事件，最终收敛，
-/// setter 无循环，Auto 通知一 episode 一条。
+/// setter 无循环，短时间重复恢复由 Auto notification cooldown 去重。
 @MainActor
 private func testBurst() {
     test("burst robustness")
@@ -1649,7 +1651,7 @@ private func testBurst() {
     monitor.handleDefaultInputChanged()
     expect(provider.setCalls == [builtInMic.uid], "first restore")
 
-    // 系统再次抢麦（同一 episode）
+    // 系统再次抢麦（仍在 notification cooldown 内）
     provider.current = airpodsMic
     monitor.handleDefaultInputChanged()
     expect(provider.setCalls == [builtInMic.uid, builtInMic.uid], "second restore")
@@ -1668,13 +1670,13 @@ private func testBurst() {
     expect(provider.setCalls.count == 2, "no extra setter from burst/idempotent events")
     expect(monitor.currentDevice?.uid == builtInMic.uid, "final current = preferred")
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "preferred stable")
-    expect(notifier.presentCount == 1, "one notification per protection episode")
+    expect(notifier.presentCount == 1, "notification cooldown suppresses immediate duplicate restore")
 }
 
-/// pending restore 确认前关闭通知，不应消耗当前 episode 的去重额度。
+/// pending restore 确认前关闭通知，不应启动 Auto notification cooldown。
 @MainActor
-private func testNotificationDedupeOnlyConsumedWhenActuallySent() {
-    test("notification dedupe only consumed when actually sent")
+private func testNotificationCooldownStartsOnlyWhenActuallySubmitted() {
+    test("notification cooldown starts only when actually submitted")
 
     let (monitor, provider, notifier) = makeMonitor(
         devices: [builtInMic],
@@ -1703,15 +1705,15 @@ private func testNotificationDedupeOnlyConsumedWhenActuallySent() {
     provider.current = airpodsMic
     monitor.handleDefaultInputChanged()
 
-    expect(provider.setCalls == [builtInMic.uid, builtInMic.uid], "second hijack is restored in same episode")
-    expect(notifier.presentCount == 1, "second hijack can still consume the unused notification slot")
+    expect(provider.setCalls == [builtInMic.uid, builtInMic.uid], "second hijack is restored after notifications are re-enabled")
+    expect(notifier.presentCount == 1, "disabled confirmation did not start cooldown, so the next restore may notify")
 }
 
-/// 运行中的 settleSeconds 修改必须立即重排当前 episode 的 deadline；
-/// 旧 timer 到点后不能提前结束 episode、重置通知去重状态。
+/// 运行中修改 settleSeconds 会重算尚未过期的 protection window，
+/// Auto notification cooldown 也按最新 settleSeconds 判断；旧 1s 边界不能提前放行。
 @MainActor
-private func testSettleConfigurationChangeKeepsEpisodeNotificationDeduped() async {
-    test("settle configuration change keeps episode notification deduped")
+private func testSettleConfigurationChangeExtendsProtectionAndNotificationCooldown() async {
+    test("settle configuration change extends protection and notification cooldown")
 
     let (monitor, provider, notifier) = makeMonitor(
         devices: [builtInMic],
@@ -1728,15 +1730,15 @@ private func testSettleConfigurationChangeKeepsEpisodeNotificationDeduped() asyn
     monitor.handleDefaultInputChanged()
     expect(notifier.presentCount == 1, "first hijack notifies once")
 
-    // 把当前 episode 从 1s 延长到 30s；等待超过旧 1s deadline。
+    // 将仍活跃的 protection window 与后续 notification cooldown 从 1s 扩展到 30s；等待超过旧 1s。
     monitor.settleSeconds = 30.0
     await waitPastSettleWindow()
 
     provider.current = airpodsMic
     monitor.handleDefaultInputChanged()
 
-    expect(provider.setCalls == [builtInMic.uid, builtInMic.uid], "second hijack is still restored inside extended episode")
-    expect(notifier.presentCount == 1, "old timer cannot reset notification dedupe")
+    expect(provider.setCalls == [builtInMic.uid, builtInMic.uid], "second hijack is still restored inside extended protection window")
+    expect(notifier.presentCount == 1, "updated notification cooldown suppresses the second notification")
 }
 
 // MARK: - Reconnect (§61)
@@ -1794,11 +1796,11 @@ private func testPreferredReconnectAlreadyCurrentDoesNotSetAgain() {
     expect(provider.setCalls.isEmpty, "no redundant setter when preferred is already current")
 }
 
-// MARK: - Trusted selection inside settle window (§62)
+// MARK: - Trusted selection inside protection window (§62)
 
 @MainActor
-private func testUserSelectionInsideSettleWindow() {
-    test("user selection inside settle window")
+private func testUserSelectionInsideProtectionWindow() {
+    test("user selection inside protection window")
 
     let (monitor, provider, _) = makeMonitor(
         devices: [builtInMic, usbMic],
@@ -1807,7 +1809,7 @@ private func testUserSelectionInsideSettleWindow() {
         mode: .auto
     )
 
-    // 开启 settle window。
+    // 开启 protection window。
     provider.devices = [builtInMic, usbMic, airpodsMic]
     monitor.handleDeviceListChanged()
 
@@ -2102,7 +2104,72 @@ private func testFirstRunDefaultSelection() {
         preferred: nil
     )
 
+    expect(monitor.preferredMicrophoneUID == nil, "pre-listener snapshot does not initialize preferred")
+    monitor.evaluateStartupPolicy()
+
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "first run prefers built-in mic")
+}
+
+@MainActor
+private func testCurrentDeviceNameShowsNoDefaultInputAfterSuccessfulNilRead() {
+    test("current presentation: successful nil read means no default input")
+
+    let (monitor, _, _) = makeMonitor(
+        devices: [builtInMic],
+        current: nil,
+        preferred: builtInMic.uid,
+        mode: .auto,
+        protection: false
+    )
+
+    expect(monitor.currentDevice == nil, "provider successfully reports no default input")
+    expect(
+        monitor.currentDeviceName == "无默认输入",
+        "successful nil current is presented as no default input instead of Unknown"
+    )
+}
+
+@MainActor
+private func testCurrentDeviceNameDistinguishesUnknownFromSuccessfulNil() async {
+    test("current presentation: unreadable current is distinct from successful nil")
+
+    let suite = "MicLockTests.current-presentation.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.removePersistentDomain(forName: suite)
+    defaults.set(builtInMic.uid, forKey: Preferences.preferredMicrophoneUIDKey)
+    defaults.set(false, forKey: Preferences.protectionEnabledKey)
+    defaults.set(ProtectionMode.auto.rawValue, forKey: Preferences.protectionModeKey)
+    defaults.set(1.0, forKey: Preferences.settleSecondsKey)
+
+    let clock = ManualAudioMonitorScheduler()
+    let provider = FakeAudioDeviceProvider()
+    provider.devices = [builtInMic]
+    provider.current = nil
+    provider.currentInputDeviceError = AudioDeviceProviderError.coreAudio(
+        operation: .queryDefaultInputDevice,
+        objectID: nil,
+        status: -1
+    )
+
+    let monitor = AudioMonitor(
+        provider: provider,
+        preferences: Preferences(defaults: defaults),
+        notifier: RecordingNotifier(),
+        scheduler: clock
+    )
+
+    expect(monitor.currentDevice == nil, "failed initial read has no current cache")
+    expect(monitor.currentDeviceName == "Unknown", "failed read remains unknown")
+
+    monitor.evaluateStartupPolicy()
+    provider.currentInputDeviceError = nil
+    await clock.advance(by: .milliseconds(250))
+
+    expect(monitor.currentDevice == nil, "recovery successfully observes explicit nil current")
+    expect(
+        monitor.currentDeviceName == "无默认输入",
+        "fresh successful nil observation updates presentation"
+    )
 }
 
 // MARK: - Preferences (§39-§40)
@@ -2134,12 +2201,43 @@ private func testDeviceNamePersistence() {
 
     expect(monitor.offlinePreferredName == "USB Microphone", "offline preferred shows persisted name")
 
-    // USB 重新在线：名字刷新并写回 defaults。
-    provider.devices = [builtInMic, usbMic]
+    // USB 重新在线，但这一轮 HAL Name property 瞬时失败：UI 可以使用 fallback，
+    // 但 fallback 不能覆盖上一轮已经持久化的真实设备名称。
+    let unresolvedUSB = AudioInputDevice(
+        uid: usbMic.uid,
+        deviceID: usbMic.deviceID,
+        name: "Unknown (\(usbMic.deviceID))",
+        transportType: usbMic.transportType,
+        nameIsResolved: false
+    )
+    provider.devices = [builtInMic, unresolvedUSB]
     monitor.handleDeviceListChanged()
 
-    let stored = defaults.dictionary(forKey: Preferences.deviceNamesKey)?["USB"] as? String
-    expect(stored == "USB Microphone", "name persisted to defaults")
+    expect(
+        monitor.devices.first(where: { $0.uid == usbMic.uid })?.name == unresolvedUSB.name,
+        "UI may display the unresolved fallback name"
+    )
+    var stored = defaults.dictionary(forKey: Preferences.deviceNamesKey)?["USB"] as? String
+    expect(stored == "USB Microphone", "unresolved fallback does not overwrite persisted name")
+
+    // 再次离线时仍应显示上一次真正解析到的名字，而不是 Unknown fallback。
+    provider.current = builtInMic
+    provider.devices = [builtInMic]
+    monitor.handleDeviceListChanged()
+    expect(monitor.offlinePreferredName == "USB Microphone", "offline name survives transient name-read failure")
+
+    // Name property 恢复后，新的真实名称仍然可以正常刷新缓存。
+    let renamedUSB = AudioInputDevice(
+        uid: usbMic.uid,
+        deviceID: usbMic.deviceID,
+        name: "RØDE NT-USB",
+        transportType: usbMic.transportType
+    )
+    provider.devices = [builtInMic, renamedUSB]
+    monitor.handleDeviceListChanged()
+
+    stored = defaults.dictionary(forKey: Preferences.deviceNamesKey)?["USB"] as? String
+    expect(stored == "RØDE NT-USB", "resolved HAL name still refreshes persisted name")
 }
 
 /// 全新安装 → auto。

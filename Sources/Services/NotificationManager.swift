@@ -32,8 +32,13 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, Not
     // MARK: - NotificationPresenting
 
     func ensureAuthorization() async -> NotificationAuthorizationState {
+        guard !Task.isCancelled else { return .notDetermined }
         let center = UNUserNotificationCenter.current()
         let settings = await center.notificationSettings()
+        // The switch may have been turned off while this read was suspended.
+        // Once requestAuthorization is actually issued, its system dialog cannot
+        // be withdrawn; cancellation only prevents issuing a stale request.
+        guard !Task.isCancelled else { return .notDetermined }
 
         switch settings.authorizationStatus {
         case .authorized, .provisional, .ephemeral:
@@ -47,6 +52,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, Not
             Self.logger.info("requesting notification authorization")
             _ = try? await center.requestAuthorization(options: [.alert])
 
+            guard !Task.isCancelled else { return .notDetermined }
             let after = await center.notificationSettings()
             switch after.authorizationStatus {
             case .authorized, .provisional, .ephemeral:
@@ -70,6 +76,8 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, Not
             content.title = "已恢复锁定麦克风"
         case .automaticHijack:
             content.title = "已阻止麦克风自动切换"
+        case .missingDefaultInput:
+            content.title = "已恢复默认麦克风"
         case .preferredReconnected:
             content.title = "首选麦克风已重新连接"
         case .startup:

@@ -14,7 +14,7 @@ MicLock 不用 Xcode 工程与 SPM，构建链由 shell 脚本 + Makefile 组成
 
 | 脚本 | 职责 | 覆盖方式 |
 |---|---|---|
-| `Scripts/select-toolchain.sh` | 从 `/Library/Developer/Toolchains/` 与 `~/Library/Developer/Toolchains/` 中选版本号最新的 `.xctoolchain`（剔除 `swift-latest` 符号链接防排序误选） | `MICLOCK_TOOLCHAIN=/path/to.xctoolchain` |
+| `Scripts/select-toolchain.sh` | 先验证 `MICLOCK_TOOLCHAIN`，再尝试 `xcrun --find swiftc` 当前工具链；最后检查系统/用户 Toolchains，并按 `swiftc --version` 选择可用的 Swift 6+ 编译器 | `MICLOCK_TOOLCHAIN=/path/to.xctoolchain` |
 | `Scripts/select-sdk.sh` | 用所选工具链对候选 SDK 跑覆盖真实依赖面的 `-typecheck` 探针（`@Observable` 宏展开、`didSet`、`MenuBarExtra(.window)`、Settings Scene / `openSettings`、Activation Policy、CoreAudio 监听块、UserNotifications、ServiceManagement、OSLog 结构化日志插值），顺序：默认 SDK → 15.4 → 15 | 无（探测全自动） |
 
 ### 为什么需要 Swift 6 工具链
@@ -25,7 +25,7 @@ MicLock 不用 Xcode 工程与 SPM，构建链由 shell 脚本 + Makefile 组成
 2. 本机没有 macOS 14 SDK，含 Observation 模块的最小可用 SDK 是 15.4 → 需要 ≥ 15.4 的 SDK
 3. 15.4/26 SDK 的 `.swiftinterface` 使用 Swift 6 语法（typed throws 等）→ 编译器 ≥ 6.0
 
-若 Command Line Tools 自带的 swiftc 较旧（如 5.8.1），从 swift.org 安装独立工具链（装到 `/Library/Developer/Toolchains/`，不动系统默认编译器，脚本会自动发现）：
+优先使用当前 Xcode / Command Line Tools 提供的 Swift 6+ 编译器。若当前工具链仍较旧，可从 swift.org 安装独立工具链（装到 `/Library/Developer/Toolchains/`，不动系统默认编译器，脚本会自动发现）：
 
 ```zsh
 curl -L -o /tmp/swift-toolchain.pkg \
@@ -58,7 +58,7 @@ plutil -lint Info.plist            ← 校验 plist 语法
 
 与 App 相同的 Core/Services 源 + Tests/ 一起编译（不含 App 的 `@main`），产出独立可执行文件直跑。Fake 注入模拟 CoreAudio 与通知，不依赖真实音频设备；断言失败以非零退出码结束。
 
-`make test` 同时是 Core/Services 的 Swift 6 编译门禁：包括 OSLog 结构化消息构造在内的编译错误会在测试运行前直接失败。相关写法约束见[架构文档的 OSLog 日志构造约束](architecture.md#oslog-日志构造约束)。
+`make test` 同时是 Core/Services 的 Swift 6 编译门禁：包括 OSLog 结构化消息构造在内的编译错误会在测试运行前直接失败。相关写法约束见[架构文档的“构建、测试和调试”章节](architecture.md#构建测试和调试)。
 
 ## App 图标
 
@@ -66,7 +66,7 @@ plutil -lint Info.plist            ← 校验 plist 语法
 
 **构建自举**：`build.sh` 检测到 icns 缺失时自动编译 genicon 并从 SVG 现生成——全新 clone 直接 `make build` 即可，无需手动步骤。改了 SVG 后想强制再生：`rm Resources/AppIcon.icns && make build`，或单独执行 `make icon` 后重新构建；`make icon` 会自行创建所需的 `build/` 目录，因此在 `make clean` 后也可直接运行。Finder 显示旧图标是 LaunchServices 缓存，`killall Finder` 或注销重登刷新。
 
-`Resources/MenuBarIconTemplate.svg` 作为原始矢量资源直接复制到 App bundle。运行时以 `NSImage` 加载并设置 `isTemplate = true`，由 macOS 自动适配浅色、深色和选中状态；保护关闭时图标透明度降低。
+`Resources/MenuBarIconTemplate.svg` 作为原始矢量资源直接复制到 App bundle。运行时以 `NSImage` 加载并设置 `isTemplate = true`，由 macOS 自动适配浅色、深色和选中状态；保护关闭时图标透明度降低。`make icon` 的临时 iconset 位于当前仓库 `build/` 下的独立临时目录，不再复用固定的 `/tmp/AppIcon.iconset`。
 
 ## Makefile 快捷命令
 
@@ -78,10 +78,20 @@ plutil -lint Info.plist            ← 校验 plist 语法
 | `make icon` | 从 SVG 重新生成 `Resources/AppIcon.icns`（可独立执行） |
 | `make run` | 构建并启动（`open`） |
 | `make debug` | `MICLOCK_DEBUG=1` 前台运行，决策日志到终端 |
-| `make install` | 停止运行中的实例 → ditto 到 `/Applications` → 启动 |
+| `make install` | 构建 → 暂存新 `.app` → 覆盖安装到 `/Applications` → 启动（不要使用 sudo） |
 | `make clean` | 删除 `build/` 产物 |
 | `make all` | test + build（build 过程中会自动检查并生成缺失的 `AppIcon.icns`） |
 
 ## 安装路径与登录项
 
-「登录时启动」（SMAppService）要求 App 位于稳定路径（`/Applications` 或 `~/Applications`）；从临时构建目录 `open` 的实例注册会被系统拒绝。`make install` 已处理停止旧实例、覆盖安装、重新启动。`/Applications` 通常 admin 组可直接写入；仅当旧 `.app` 属主为 root（如 pkg 安装）时需 `sudo make install`。
+「登录时启动」（SMAppService）要求 App 位于稳定路径（`/Applications` 或 `~/Applications`）；从临时构建目录 `open` 的实例注册会被系统拒绝。
+
+`make install` 的职责保持简单：先执行正常构建，再把 `build/MicLock.app` 完整复制到 `INSTALL_DIR` 内的临时目录；只有复制成功后才停止当前用户的旧实例、删除旧 bundle、把已经完整复制的新 `.app` 移到最终位置，并调用 `open`。这样不会因为 `ditto` 在复制途中失败而先丢掉旧版本，同时不引入独立安装器或额外安装状态机。
+
+不要使用 `sudo make install`：否则构建产物及 GUI 操作会进入 root 上下文。若 `/Applications` 不可写，使用：
+
+```zsh
+make install INSTALL_DIR="$HOME/Applications"
+```
+
+从仓库根目录运行 `make`，或使用 `make -C /path/to/MicLock`。安装只停止当前用户的 MicLock 进程，不影响其他登录用户。

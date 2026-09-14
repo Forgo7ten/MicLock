@@ -12,7 +12,7 @@ MicLock 监听 macOS 的 CoreAudio 设备变化，在不录音、不联网的前
 - 自定义模板图标常驻菜单栏，左键或右键均可打开面板；平时无 Dock 图标，打开设置窗口时临时显示 Dock 图标，关闭后恢复，防双开
 - 菜单栏面板只保留高频操作（保护开关、模式、首选麦克风）；「设置…」打开独立设置窗口（通用 / 高级 / 关于）
 - 两种保护模式：
-  - **自动**：设备接入的不稳定窗口内阻止系统抢麦；设备稳定后，外部默认输入变化会被视为用户意图并接受为新的首选
+  - **自动**：保护窗口内阻止系统抢麦；窗口外观察到新的默认输入变化时，持续稳定一段时间后接受为新的首选；默认输入持续为空且首选仍在线时恢复首选
   - **手动**：严格锁定首选麦克风，任何来源的外部切换都会被立即恢复
 - CoreAudio 正常路径由事件驱动；仅在采样失败或程序化切换未确认时使用退避重试，不进行常驻轮询
 - 设备 Device UID 持久化，跨插拔稳定；首选设备离线时保留等待重连
@@ -25,7 +25,7 @@ MicLock 监听 macOS 的 CoreAudio 设备变化，在不录音、不联网的前
 
 - [build.md](docs/build.md) —— 构建系统：工具链/SDK 探测、Swift 6 要求、图标生成、Makefile、安装路径
 - [architecture.md](docs/architecture.md) —— 模块结构、事件流、恢复路径、通知、登录项、配置、调试、测试
-- [auto-mode.md](docs/auto-mode.md) —— Auto 模式判定原理、settle 窗口、时序示例、已知限制
+- [auto-mode.md](docs/auto-mode.md) —— Auto 模式判定原理、保护/候选窗口、写入确认、重试与已知限制
 - [releasing.md](docs/releasing.md) —— GitHub 网页发版、tag/版本规则与 Release 产物
 
 ## 系统要求
@@ -75,12 +75,14 @@ make install    # 安装到 /Applications 并启动
 | `make icon` | 从 `Resources/AppIcon.svg` 重新生成 icns |
 | `make run` | 构建并启动 |
 | `make debug` | `MICLOCK_DEBUG=1` 前台运行，决策日志到终端 |
-| `make install` | 停止旧实例 → 安装到 /Applications → 启动 |
+| `make install` | 构建 → 覆盖安装到 `/Applications` → 启动（不要使用 sudo） |
 | `make clean` | 清理构建产物 |
+
+若 `/Applications` 不可写，可使用 `make install INSTALL_DIR="$HOME/Applications"` 安装到用户应用目录。`make install` 会先把新 `.app` 完整复制到安装目录内的临时位置，再替换旧 bundle；不要使用 `sudo make install`。
 
 首次启动约 0.5 秒后请求通知权限，允许即可；被拒绝时设置窗口（通用 → 通知）会显示提示行并可一键跳转系统设置。
 
-更多调试手段（`MICLOCK_TRACE_PATH` 决策流文件、OSLog）见 [docs/architecture.md](docs/architecture.md#调试)。
+更多调试手段（`MICLOCK_TRACE_PATH` 决策流文件、OSLog）见 [docs/architecture.md](docs/architecture.md)。
 
 ## 数据存储
 

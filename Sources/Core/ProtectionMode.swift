@@ -14,6 +14,7 @@ enum ProtectionMode: String, Codable, CaseIterable {
 enum RestoreReason: Equatable {
     case manualLock
     case automaticHijack
+    case missingDefaultInput
     case preferredReconnected
     case startup
 }
@@ -52,6 +53,8 @@ struct RecentAudioEvent: Identifiable, Equatable {
             return "已恢复首选麦克风"
         case .restored(.automaticHijack):
             return "已阻止自动抢麦"
+        case .restored(.missingDefaultInput):
+            return "已恢复默认麦克风"
         case .restored(.preferredReconnected):
             return "首选麦克风重新连接"
         case .restored(.startup):
@@ -69,6 +72,8 @@ struct RecentAudioEvent: Identifiable, Equatable {
             return "Manual Mode 检测到外部切换，因此恢复首选麦克风"
         case .restored(.automaticHijack):
             return "设备仍处于稳定窗口内，Auto Mode 将这次切换视为系统抢麦并恢复"
+        case .restored(.missingDefaultInput):
+            return "系统持续没有默认输入，首选麦克风仍在线，因此恢复为该设备"
         case .restored(.preferredReconnected):
             return "首选麦克风重新连接，因此恢复为该设备"
         case .restored(.startup):
@@ -87,6 +92,7 @@ extension RestoreReason: CustomStringConvertible {
         switch self {
         case .manualLock: return "manual-lock"
         case .automaticHijack: return "automatic-hijack"
+        case .missingDefaultInput: return "missing-default-input"
         case .preferredReconnected: return "preferred-reconnected"
         case .startup: return "startup"
         }

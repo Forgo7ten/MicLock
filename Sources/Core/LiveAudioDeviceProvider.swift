@@ -9,7 +9,11 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
 
     private let systemObject = AudioObjectID(kAudioObjectSystemObject)
 
-    init() {}
+    private let access: CoreAudioPropertyAccess
+
+    init(access: CoreAudioPropertyAccess = .live) {
+        self.access = access
+    }
 
     // MARK: - AudioDeviceProviding
 
@@ -23,11 +27,14 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
             do {
                 guard try hasInputStreams(deviceID) else { continue }
                 let uid = try requiredDeviceUID(deviceID)
+                let transportType = try requiredTransportType(deviceID)
+                let name = deviceName(deviceID)
                 inputDevices.append(AudioInputDevice(
                     uid: uid,
                     deviceID: deviceID,
-                    name: deviceName(deviceID) ?? "Unknown (\(deviceID))",
-                    transportType: transportType(deviceID) ?? 0
+                    name: name ?? "Unknown (\(deviceID))",
+                    transportType: transportType,
+                    nameIsResolved: name != nil
                 ))
             } catch let error as AudioDeviceProviderError {
                 // 单个 HAL object 读失败时保留其余健康设备给 UI/诊断；
@@ -47,12 +54,16 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
     func currentInputDevice() throws -> AudioInputDevice? {
         guard let deviceID = try defaultInputDeviceID() else { return nil }
         let uid = try requiredDeviceUID(deviceID)
+        let name = deviceName(deviceID)
 
         return AudioInputDevice(
             uid: uid,
             deviceID: deviceID,
-            name: deviceName(deviceID) ?? "Unknown",
-            transportType: transportType(deviceID) ?? 0
+            name: name ?? "Unknown",
+            // Current identity is UID-based. Transport remains best-effort here;
+            // topology enumeration is the authority for built-in classification.
+            transportType: (try? requiredTransportType(deviceID)) ?? 0,
+            nameIsResolved: name != nil
         )
     }
 
@@ -66,7 +77,7 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         )
 
         var value = deviceID
-        let status = AudioObjectSetPropertyData(
+        let status = access.setData(
             systemObject,
             &address,
             0,
@@ -94,7 +105,7 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         )
 
         var size: UInt32 = 0
-        var status = AudioObjectGetPropertyDataSize(systemObject, &address, 0, nil, &size)
+        var status = access.getSize(systemObject, &address, 0, nil, &size)
 
         guard status == noErr else {
             throw AudioDeviceProviderError.coreAudio(
@@ -104,14 +115,19 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
             )
         }
 
-        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        let stride = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard size % stride == 0 else {
+            throw invalid(.enumerateDeviceListSize, systemObject, "unaligned device list size")
+        }
+        let capacity = size
+        let count = Int(size / stride)
         guard count > 0 else { return [] }
 
         var devices = [AudioDeviceID](repeating: 0, count: count)
 
         status = devices.withUnsafeMutableBufferPointer { buffer -> OSStatus in
             guard let baseAddress = buffer.baseAddress else { return -1 }
-            return AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, baseAddress)
+            return access.getData(systemObject, &address, 0, nil, &size, baseAddress)
         }
 
         guard status == noErr else {
@@ -122,7 +138,12 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
             )
         }
 
-        return devices
+        // ioDataSize is an output too: hot-unplug can shrink the list between
+        // getSize and getData. Never treat the unused zero-filled tail as IDs.
+        guard size <= capacity, size % stride == 0 else {
+            throw invalid(.enumerateDeviceListData, systemObject, "invalid returned device list size")
+        }
+        return Array(devices.prefix(Int(size / stride)))
     }
 
     private func hasInputStreams(_ deviceID: AudioDeviceID) throws -> Bool {
@@ -133,7 +154,7 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         )
 
         var size: UInt32 = 0
-        let status = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size)
+        let status = access.getSize(deviceID, &address, 0, nil, &size)
 
         guard status == noErr else {
             throw AudioDeviceProviderError.coreAudio(
@@ -143,6 +164,9 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
             )
         }
 
+        guard size % UInt32(MemoryLayout<AudioStreamID>.size) == 0 else {
+            throw invalid(.queryInputStreams, deviceID, "unaligned input stream list size")
+        }
         return size > 0
     }
 
@@ -157,44 +181,63 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         var size = UInt32(MemoryLayout<CFTypeRef?>.size)
 
         let status = withUnsafeMutablePointer(to: &value) { pointer in
-            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, pointer)
+            access.getData(deviceID, &address, 0, nil, &size, pointer)
         }
 
-        guard status == noErr,
-              let uid = value?.takeUnretainedValue() as String?
-        else {
+        guard status == noErr else {
             throw AudioDeviceProviderError.coreAudio(
-                operation: .queryDeviceUID,
-                objectID: deviceID,
-                status: status
+                operation: .queryDeviceUID, objectID: deviceID, status: status
             )
         }
-
+        // UID and Name properties return caller-owned CF objects (+1).
+        // Consume that ownership even if the successful result is malformed.
+        let object = value?.takeRetainedValue()
+        guard size == UInt32(MemoryLayout<CFTypeRef?>.size), let object else {
+            throw invalid(.queryDeviceUID, deviceID, "missing UID or wrong result size")
+        }
+        let uid = object as String
+        guard !uid.isEmpty else {
+            throw invalid(.queryDeviceUID, deviceID, "empty UID")
+        }
         return uid
     }
 
     private func resolveDeviceID(uid: String) throws -> AudioDeviceID {
-        let deviceIDs = try allDevices()
-        var incompleteDeviceIDs: [AudioDeviceID] = []
-
-        for deviceID in deviceIDs {
-            do {
-                if try requiredDeviceUID(deviceID) == uid {
-                    return deviceID
-                }
-            } catch {
-                incompleteDeviceIDs.append(deviceID)
-            }
+        guard !uid.isEmpty else {
+            throw invalid(.translateDeviceUID, systemObject, "empty requested UID")
         }
-
-        if !incompleteDeviceIDs.isEmpty {
-            throw AudioDeviceProviderError.targetDeviceLookupIncomplete(
-                uid: uid,
-                incompleteDeviceIDs: incompleteDeviceIDs
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        // Resolve afresh for EVERY write. UID translation avoids enumerating
+        // unrelated devices, and does not assume a cached AudioDeviceID is live.
+        var qualifier = uid as CFString
+        var deviceID = AudioDeviceID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = withUnsafePointer(to: &qualifier) { pointer in
+            access.getData(systemObject, &address, UInt32(MemoryLayout<CFString>.size),
+                           pointer, &size, &deviceID)
+        }
+        guard status == noErr else {
+            throw AudioDeviceProviderError.coreAudio(
+                operation: .translateDeviceUID, objectID: systemObject, status: status
             )
         }
+        guard size == UInt32(MemoryLayout<AudioDeviceID>.size) else {
+            throw invalid(.translateDeviceUID, systemObject, "wrong device ID size")
+        }
+        guard deviceID != kAudioObjectUnknown else {
+            throw AudioDeviceProviderError.targetDeviceNotFound(uid: uid)
+        }
+        return deviceID
+    }
 
-        throw AudioDeviceProviderError.targetDeviceNotFound(uid: uid)
+    private func invalid(
+        _ operation: AudioDeviceProviderOperation, _ objectID: AudioObjectID, _ detail: String
+    ) -> AudioDeviceProviderError {
+        .invalidPropertyData(operation: operation, objectID: objectID, detail: detail)
     }
 
     private func deviceName(_ deviceID: AudioDeviceID) -> String? {
@@ -208,15 +251,24 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         var size = UInt32(MemoryLayout<CFTypeRef?>.size)
 
         let status = withUnsafeMutablePointer(to: &value) { pointer in
-            AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, pointer)
+            access.getData(deviceID, &address, 0, nil, &size, pointer)
         }
 
         guard status == noErr else { return nil }
 
-        return value?.takeUnretainedValue() as String?
+        let object = value?.takeRetainedValue()
+        guard size == UInt32(MemoryLayout<CFTypeRef?>.size),
+              let object
+        else {
+            return nil
+        }
+
+        let name = object as String
+        guard !name.isEmpty else { return nil }
+        return name
     }
 
-    private func transportType(_ deviceID: AudioDeviceID) -> UInt32? {
+    private func requiredTransportType(_ deviceID: AudioDeviceID) throws -> UInt32 {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyTransportType,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -226,10 +278,16 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         var value: UInt32 = 0
         var size = UInt32(MemoryLayout<UInt32>.size)
 
-        let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value)
+        let status = access.getData(deviceID, &address, 0, nil, &size, &value)
 
-        guard status == noErr else { return nil }
-
+        guard status == noErr else {
+            throw AudioDeviceProviderError.coreAudio(
+                operation: .queryTransportType, objectID: deviceID, status: status
+            )
+        }
+        guard size == UInt32(MemoryLayout<UInt32>.size) else {
+            throw invalid(.queryTransportType, deviceID, "wrong transport type size")
+        }
         return value
     }
 
@@ -243,7 +301,7 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         var deviceID = AudioDeviceID(kAudioObjectUnknown)
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
 
-        let status = AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, &deviceID)
+        let status = access.getData(systemObject, &address, 0, nil, &size, &deviceID)
 
         guard status == noErr else {
             throw AudioDeviceProviderError.coreAudio(
@@ -253,6 +311,9 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
             )
         }
 
+        guard size == UInt32(MemoryLayout<AudioDeviceID>.size) else {
+            throw invalid(.queryDefaultInputDevice, systemObject, "wrong device ID size")
+        }
         guard deviceID != kAudioObjectUnknown else { return nil }
         return deviceID
     }

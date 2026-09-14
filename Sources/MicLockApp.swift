@@ -45,8 +45,8 @@ private final class MicLockAppDelegate:
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let monitor = AudioMonitor.live()
-        // 启动顺序：load prefs → enumerate → read current（monitor.init）
-        //           → install listeners → evaluate（start）。
+        // 启动顺序：load prefs → read current + enumerate（monitor.init）
+        //           → install listeners → fresh sample + evaluate（start）。
         monitor.start()
 
         NotificationManager.shared.activate()

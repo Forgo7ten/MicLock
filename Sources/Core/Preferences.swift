@@ -30,9 +30,13 @@ struct Preferences {
     // MARK: - Accessors
 
     var preferredMicrophoneUID: String? {
-        get { defaults.string(forKey: Preferences.preferredMicrophoneUIDKey) }
+        get {
+            guard let uid = defaults.string(forKey: Preferences.preferredMicrophoneUIDKey),
+                  !uid.isEmpty else { return nil }
+            return uid
+        }
         nonmutating set {
-            if let newValue {
+            if let newValue, !newValue.isEmpty {
                 defaults.set(newValue, forKey: Preferences.preferredMicrophoneUIDKey)
             } else {
                 defaults.removeObject(forKey: Preferences.preferredMicrophoneUIDKey)
@@ -83,7 +87,8 @@ struct Preferences {
         }
     }
 
-    private static func clamp(_ value: Double) -> Double {
-        min(max(value, Preferences.settleRange.lowerBound), Preferences.settleRange.upperBound)
+    static func clamp(_ value: Double) -> Double {
+        guard value.isFinite else { return 2.0 }
+        return min(max(value, Preferences.settleRange.lowerBound), Preferences.settleRange.upperBound)
     }
 }

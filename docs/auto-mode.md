@@ -1,250 +1,100 @@
 # Auto 模式原理
 
-一句话：**恢复永远是立即的；settle 窗口只用来给变化定性**——判断默认输入变化更像「设备拓扑变化引起的系统抢麦」还是「设备已经稳定后的外部切换」。MicLock 不通过延迟恢复来观察结果，因此不会故意让错误麦克风保持数秒。
+MicLock 管理的是系统默认输入设备，不是录音权限，也不能控制 App 内部单独选择的麦克风。`preferred` 是持久化的目标，`current` 是最近一次成功读取的系统实际值；两者不相等不等于刚刚发生了一次外部切换。
 
-## Auto 与 Manual 的差异
+## 固定的产品规则
 
 | 场景 | Auto | Manual |
 |---|---|---|
-| 设备接入/断开的稳定窗口内的外部切换 | 立即恢复 | 立即恢复 |
-| 稳定窗口外的外部切换（系统设置、其他 App、CLI） | 接受，并学习为新的 preferred | 立即恢复 |
-| MicLock 菜单中主动选择 | 立即接受 | 立即接受 |
-| 通知频率 | 一个 settle episode 最多一条 | 每次确认恢复后通知 |
-| preferred 何时变化 | 稳定后的外部切换 / MicLock 菜单选择 | 仅 MicLock 菜单选择 |
+| 首选在线，启动、重新开启保护时当前设备不一致 | 立即请求恢复，启动对齐不通知 | 相同 |
+| 可信 topology 发生设备增减 | 进入保护窗口 | 始终严格保护 |
+| 保护窗口内当前偏离首选 | 立即请求恢复 | 立即请求恢复 |
+| 窗口外观察到真正的新外部默认设备变化 | 连续有效确认 `settleSeconds` 后学习 | 恢复首选 |
+| 窗口外默认输入持续为 nil，首选可信在线 | 连续有效确认 `settleSeconds` 后恢复首选 | 立即恢复首选 |
+| MicLock 内明确选择 | 不受保护窗口限制 | 相同 |
+| 首选离线 | 保留首选，等待重连 | 相同 |
+| 关闭保护 | 只刷新，不恢复，不自动学习 | 相同 |
 
-## 为什么是两个正交状态机
+“立即恢复”指立即发起 setter，不代表 HAL 保证同步完成。setter 返回成功后，仍然只能用新的、成功的 current read 确认。MicLock 内的选择沿用原有失败语义：setter 直接拒绝时不覆盖旧首选；请求被接受后保存新首选，确认超时也不把首选回滚到旧 current。当前设备已经等于目标时，不需要重复 setter。
 
-Auto Mode 同时存在两类彼此独立的状态：
+## 两个核心状态模型，不是多套互相取消的状态机
 
-1. **稳定性状态 `StabilityState`**：系统当前是稳定 (`stable`) 还是处于设备变化 episode (`settling`)。
-2. **程序化切换状态 `ProgrammaticSwitchState`**：MicLock 是否正在等待自己发起的一次 `DefaultInputDevice` 写入被 CoreAudio 真实确认。
-
-二者可以同时成立。例如 AirPods 接入时，MicLock 可以一边处于 `settling`，一边等待「恢复到内置麦克风」这笔程序化切换确认。因此不能把它们压成一个扁平的 `stable / settling / enforcing` 枚举，否则会出现组合状态爆炸。
-
-```mermaid
-flowchart LR
-    subgraph Stability["稳定性状态"]
-        S1[stable]
-        S2["settling(SettleEpisode)"]
-        S1 -->|真实设备拓扑 delta| S2
-        S2 -->|再次拓扑活动 / corrective restore| S2
-        S2 -->|当前 revision 的 deadline 到期| S1
-    end
-
-    subgraph Switch["程序化切换事务"]
-        P1[idle]
-        P2["awaitingConfirmation(PendingSwitch)"]
-        P1 -->|MicLock setInputDevice| P2
-        P2 -->|真实 current == target| P1
-        P2 -->|target 离线 / 明确用户取消 / 外部状态 supersede| P1
-    end
-```
-
-## CoreAudio 统一收敛流程
-
-`kAudioHardwarePropertyDevices` 与 `kAudioHardwarePropertyDefaultInputDevice` 是两个独立属性，MicLock **不依赖两个 listener 的跨属性投递顺序**。两个 listener 都只作为 wake-up 信号，统一进入 `reconcileCoreAudioState()`；每次都会重新读取 devices 与 current，但这只是一次一致化采样，**不是 CoreAudio 提供的原子 snapshot 保证**。HAL 仍可能先改变 DefaultInput、稍后才更新 Devices。
-
-```swift
-newCurrent = try provider.currentInputDevice()
-snapshot = try provider.listInputDevices() // devices + completeness / issues
-```
-
-只有 topology 采样完整且与 `current` 不矛盾时，本轮结果才可用于 topology/Auto policy：全局枚举失败、默认输入读取失败、关键单设备 identity 查询失败，或 `current.uid` 根本不在本轮完整 `devices` 中，都会把这轮策略采样视为 inconclusive。单设备失败时 provider 返回 partial snapshot：其中健康 `devices` 仍更新 UI，但上一份完整可信 `trustedDevices / connectedUIDs` 保留给 removal、target-offline、preferred availability 与 Auto classification；默认输入读取失败则保留最后一次可信 `currentDevice`。两类失败都会安排 recovery retry。`current == pending.target` 这种不依赖 topology 的确定事实仍可立即确认；Manual 也可使用上一份可信 topology 继续严格恢复。完整有效采样后固定按以下顺序处理：
-
-1. 用 `newDevices` 与 `connectedUIDs` 求 topology delta；有真实 delta 时先进入/延长 `settling`
-2. 更新 UI `devices` 与策略事实 `trustedDevices / connectedUIDs / currentDevice`
-3. 处理 `PendingSwitch` 的确认、取消或 supersede
-4. 最后运行 Auto / Manual policy
-
-对于 **Auto + stable + 外部 default 变化**，即使本轮 `devices` 暂时仍显示旧 preferred 在线，也不会立刻学习新的 preferred，而是建立 `StableExternalSwitchCandidate`。`currentDevice` 会立即更新供 UI 展示；candidate 的分类窗口复用用户配置的 `settleSeconds`，不再使用额外的隐藏 200ms 常量。若窗口内出现 topology delta，candidate 立即取消并按 topology 事实处理；窗口结束时只有 topology sample 仍有效、`current` 未变化且 candidate target 仍存在于 `connectedUIDs`，才确认这是 stable external switch 并学习新的 preferred。若确认采样无效，则保留 candidate，等待 recovery / 后续 wake-up。这个 candidate 只延迟“学习 preferred”，不会延迟 corrective restore。
-
-```mermaid
-flowchart TD
-    A["Devices 或 DefaultInput callback"] --> B["先读取真实 current，再尝试枚举 devices"]
-    B --> C{"current == pending target？"}
-    C -->|是| E1["确认事务：提交 Recent Event / 通知"]
-    C -->|否| D{"topology sample 有效且与 current 一致？"}
-    D -->|否| D1["保留上次有效 topology；Manual 可继续恢复；Auto 冻结分类；安排 recovery"]
-    D -->|是| E["应用 topology delta，再处理 PendingSwitch / policy"]
-    E -->|target 已离线| E2["失败旧事务，继续 policy"]
-    E -->|仍是明确 source| E4["watchdog recheck / retry"]
-    E -->|其他非 target current| E3{"transaction origin?"}
-    E3 -->|Protection restore| E5["外部事实 supersede 旧事务，继续 policy"]
-    E3 -->|Trusted selection| E6["保留最新用户目标；watchdog 继续收敛"]
-    E -->|否| F{"保护开启？"}
-    E2 --> F
-    E5 --> F
-    E6 --> Z
-    E1 --> Z[结束]
-    E4 --> Z
-    F -->|否| Z
-    F -->|是| G{"preferred 已设置且在线？"}
-    G -->|离线| G1[保留 preferred UID]
-    G -->|在线且 current != preferred| H{"模式"}
-    H -->|manual| R[立即发起 restore transaction]
-    H -->|auto + settling| R
-    H -->|auto + stable| U[建立 / 确认 StableExternalSwitchCandidate]
-```
-
-这里有三个关键约束：
-
-- **有效采样优先**：callback 只表示“值得重新检查”；devices/current 的联合读取不是原子事务，枚举失败或分阶段属性变化都不能被当成完整 topology 事实。
-- **程序化事务优先**：MicLock 自己的写入回声必须在 Auto/Manual 判定之前吸收，否则会形成 setter 循环。
-- **保护关闭不学习**：关闭保护期间的临时系统选择不会悄悄覆盖 preferred。
-
-## StabilityState 与 SettleEpisode
-
-稳定性只有两个状态：
+### AutoPolicy：三个互斥阶段
 
 ```swift
 stable
-settling(SettleEpisode)
+protecting(since: ContinuousClock.Instant)
+considering(Candidate)
 ```
 
-`SettleEpisode` 保存：
+`protecting` 表示最近一次可信拓扑变化或已经确认的恢复之后的保护窗口。截止时间由 `since + settleSeconds` 推导；不再存两份时间，也不需要专门的 settle timer、episode ID 或 revision。下一次实际决策按单调时钟判断是否到期。修改配置前先按旧时长结算，避免延长配置把已经结束的窗口重新激活。
 
-- `id`：episode 唯一 ID；同一次接入/反抢收敛过程始终保持同一个 ID
-- `revision`：每次延长 deadline 都递增，用来淘汰已经过期的 timer
-- `lastActivity`：最近一次真实拓扑活动或 corrective restore 的单调时钟时间
-- `deadline`：本 revision 的稳定截止时间
-- `notificationSent`：该 episode 是否已经投递过恢复通知
+Auto 在保护关闭时仍记录可信 topology 变化建立的窗口，但不执行恢复或学习；重新开启保护不会清掉尚未过期的窗口，因此设备接入后的延迟系统切换仍会受到保护。
 
-### 进入与延长 episode
+`considering` 表示已有一次合格的新变化，正在确认能否学习。Candidate 只保存 current 的 `revision`、旧首选 UID/名称、新设备以及 `validSince`。保护窗口与候选不能同时存在。
 
-设备列表出现真实 delta 时进入 `settling`。如果已经在 `settling`，不会创建新 episode，只更新 `lastActivity / deadline` 并增加 `revision`。
+窗口外成功读到 `current == nil` 不属于 Candidate，因为没有设备可以学习。AudioMonitor 单独保存这项异常事实的 `validSince` 和一个唤醒 timer；连续有效达到 `settleSeconds` 后 fresh sample，只有默认输入仍为空且首选仍由完整 topology 证明在线时才恢复。任何非 nil current 或采样盲区都会取消这项证据；盲区恢复后必须重新计满整个窗口。这只是防抖证据，不增加 AutoPolicy phase。
 
-恢复 preferred 成功发起后也会延长同一个 episode，因为 macOS / 蓝牙协议栈可能在被恢复后立即再次抢麦。watchdog 后续某次 retry 如果终于被 CoreAudio 接受，同样会重新开启或延长 settle；即使旧 episode 已经结束，也会从该次 corrective restore 开始新的 protection episode。Auto 下 protection transaction 最终真实到达 target 时也会从 confirmation 时刻重新锚定 settle，因此“更早 accepted 的请求很晚才真正生效”不会在旧 episode 已结束后留下 stable 空窗。
+### DefaultInputWriter：一笔逻辑写入
 
-### timer 只是执行机制
+`pending == nil` 表示没有待确认的请求；否则保留目标、来源、最初的 current UID、展示信息、通知资格和重试阶段。Writer 不管理 Auto 的截止时间，不携带通知 episode，不读取 UI 缓存来判成功。
 
-`settleTask` 不是业务事实来源。每个 task 都携带创建时的 `episode.id + revision`，醒来时只有同时满足以下条件才允许把状态改成 `stable`：
+Writer 是 AudioMonitor 内的可观测值类型，`lastError` 与 `protectionRetryState` 由结构化状态推导。不能为了减少观测把整个 writer 标为 `@ObservationIgnored`，否则错误提示可能不刷新。
 
-- 当前仍是同一个 episode ID
-- revision 仍匹配
-- 当前单调时间已经达到该 revision 的 deadline
+## 变化证据从哪里来
 
-因此被取消但晚到的旧 task、旧 revision 或前一个 episode 的 task 都无法结束新的 settle window。
+所有成功的 current read 经过 `readCurrent()`，包括 callback、watchdog、recovery、用户选择前后的读取。
 
-### 运行中修改 settleSeconds
+首次成功读取只建立基线。之后只有 UID 真正改变才推进 `currentRevision`；重复回调、相同值、错误读取都不凭空产生一次变化。成功读到 nil 与读取失败分开处理；前者是一次明确的“没有默认输入”，后者保留 UI 缓存。
 
-修改 `settleSeconds` 对当前 episode **立即生效**。MicLock 以当前 episode 的 `lastActivity` 为基点重新计算 deadline，并增加 revision：
+候选必须有合格的真实 UID 变化证据。通常由 `observation.changed` 提供：timer 确实读到 A→B 时可以发现新变化，但 timer 读到 A→A 不能仅因为 `A != preferred` 而启动学习。MicLock 正在处理的 target 写入观察优先由 Writer 消费；Protection 的非 target 第三状态是例外，它可以用 Request 的 source 与当前设备不同来保留已发生变化的候选资格，详见下文。
 
-- 新 deadline 仍在未来：取消旧 task，按新的剩余时间重新调度
-- 新 deadline 已经过去：立即转为 `stable`
+因此 Trusted 超时后，即使收到无变化的 Devices/DefaultInput callback，或者 recovery timer 再次读到旧 A，也不会覆盖用户选择的 B。不需要专门的 `trustedSelectionExpired` 策略返回值或 timeout 后的屏蔽 flag。
 
-这样不会再出现「决策函数按新配置判断仍 unsettled，但旧 timer 按旧配置提前重置 episode / 通知去重」的分裂状态。
+注意：revision 只能证明“观察值改变”，不能证明“由哪个进程改变”。它不是 HAL 写入来源识别机制。
 
-## ProgrammaticSwitchState 与 PendingSwitch
+## 候选连续性与不完整采样
 
-MicLock 自己发起的切换只存在两种状态：
+联合采样仍不是原子快照。只有 current read 成功、枚举完整、current 属于该设备集合（或明确为 nil）时，才更新可信 topology、判断离线或提交 Auto 学习。
 
-```swift
-idle
-awaitingConfirmation(PendingSwitch)
-```
+采样失败、partial topology、跨属性不一致都会将候选的 `validSince` 置为 nil，并取消其确认 timer；缺失默认输入的防抖证据也按相同可信边界清除。后续采样恢复有效时，从恢复时刻重新计满整个窗口；不能把不可观察的时段算作持续稳定。
 
-一笔 `PendingSwitch` 原子保存：
+当前 UID 在异常期间出现 B→C→B 时，每次成功读取都推进 revision，旧 B 候选不会复活。保留的是最近一次真实变化的证据，不是旧截止时间。没有新变化、也没有既存合格候选时，恢复采样不会凭空开始学习。
 
-- transaction `id`
-- `sourceUID`：仅 Protection Restore 使用，用于描述其发起时的 current；Trusted User Selection 不依赖 source 做 provenance 判断
-- `targetUID`
-- `ProgrammaticSwitchOrigin`：`protectionRestore(reason)` 或 `trustedUserSelection`
-- Recent Event 的 from/to 展示 metadata；kind 在确认时只从 origin 推导
-- 待提交的通知（如果本次动作应该通知）
+设备健康展示与可信策略快照分开：`devices` 可以展示 partial 中的健康设备；`trustedDevices` 保留最后完整快照。`nil` 表示尚无基线，空数组表示已成功采到空列表。构造阶段的初始 UI 快照即使可信，也不会初始化首选；从 listener 安装后的 startup fresh sample 开始，后续可信采样在首选仍未初始化时，都可以按“内置优先、否则当前”的规则补全，因此初次空列表不再结束初始化机会。
 
-旧实现中 `expectedDefaultUID`、pending Recent Event 和 pending notification 分开保存，存在两笔操作之间 metadata 串线的风险。现在 source / target / origin / metadata / notification 永远属于同一 transaction；origin 是程序化事务语义的唯一来源，不再额外保存一份可与 origin 冲突的 event kind。Trusted User Selection 使用 latest-wins：新的 MicLock 点击立即 supersede 旧 Trusted transaction，并马上发出新 target 的 setter；active transaction 始终只代表最后一次明确的 MicLock 选择。
+不完整采样不能建立新的拓扑事实或学习首选。但已经由可信拓扑建立的保护窗口仍然有效：只要 fresh current 明确偏离首选，就和 Manual 一样尝试恢复最后可信的目标，实际是否可写由 Provider 重新解析 UID 决定；失败进入已有退避，只有完整快照才能判定目标离线并取消。没有成功 current read 时，绝不使用缓存冒充新的恢复或确认依据。
 
-### 确认与 retry 生命周期
+仍保留保守的全局可信边界，不增加逐设备置信度、隔离表等状态机。长期异常设备仍可能暂停新的拓扑分类及 Auto 学习；这不等于撤销已建立的保护。`trustedDevices` 同时支撑首选在线/离线 UI，必须参与 Observation；离线错误绑定具体失败的目标 UID，后续 fresh current 到达该目标，或完整可信 topology 再次证明该 UID 已在线时，都会清除这条已经过期的 target-offline 错误。
 
-`setInputDevice()` 返回成功只表示 CoreAudio 接受了写请求，不代表默认输入已经真实变化。成功确认仍必须来自 fresh current observation；但 Protection Restore 与 Trusted User Selection 的生命周期不同：前者维护保护 invariant，可以长期 retry；后者只是一次 UI command，只保留一个很短的确认窗口。
+## 写入确认与重试
 
-后续用可靠的可观察事实推进事务：
+Trusted 选择保留原有 latest-wins：新点击立即取代旧逻辑请求，并发出新 setter。500ms 后对最新目标重试一次，再给 500ms 确认窗口；仍未确认则结束，保存新首选并显示确认失败。首次 setter 直接被 HAL 拒绝时，该 Trusted command 当场结束、旧 Preferred 不变；AudioMonitor 随后执行一次普通 policy reconcile，使 Manual 或仍成立的 Auto protection 重新建立自己的 Protection writer，但不会复活已被用户意图取消的旧 alignment。之后真实 current 到达该首选时清除超时错误。Manual 会在 Trusted 结束后恢复其严格保护策略。
 
-1. `current.uid == targetUID`：只有当 `current` 来自本轮成功的 fresh read 时，才是独立于 topology 的充分成功证据；共享 `currentDevice` cache 绝不能参与 confirmation。即使同一轮设备枚举失败，只要 fresh current 已到 target 仍可立即确认。若 origin 是 Auto 下的 Protection restore，确认本身会先重新开启/延长 settle，并把既有 notification rebind 到当前 episode，再提交 Recent Event / 通知；Trusted User Selection 不制造 protection episode
-2. 只有在 topology sample 有效且跨属性一致时，`targetUID` 不在线才可作为目标明确不可达的失败证据
-3. Protection Restore：`sourceUID != nil && current.uid == sourceUID` 表示写入尚未反映；watchdog 按 500ms → 1s → 2s → 4s → 8s → 16s → 32s → 64s 重新读取并重试 setter，之后固定 64s 一次。任何 accepted retry 都会重新开启/延长 settle，并可更新 `ProtectionRetryState`
-4. Protection Restore 的其余第三状态仍按“更新事实”处理：旧 restore transaction 被 supersede，再由当前 protection policy 决定后续
-5. Trusted User Selection 不解释 source / third current / callback 类型的 provenance。只要 fresh current 还不是最新 target，就继续保持最新 MicLock target；500ms watchdog 做唯一一次 fast retry，再给 500ms 最终确认窗口。若约 1 秒后仍未确认，则结束 Trusted transaction，不进入 1/2/4/.../64s 的后台 retry。若 expiry 来自 `programmaticSwitchWatchdog`，这次 synthetic observation 在 Auto 下到此结束，不能作为 external-switch learning 的证据；Manual 则仍可继续 normal protection policy
-6. topology sample 无效或 partial：不能做 target-offline 判定；策略继续使用上一份完整可信 topology，partial 中健康设备仍可更新 UI，并通过独立 recovery retry 重新采样
-7. Trusted User Selection 为 latest-wins：新的 MicLock 点击立即取消旧 Trusted transaction、建立新 transaction 并 `set(newTarget)`。旧 setter 若稍后回声为旧 target，只会更新 current UI；它既不能完成也不能取消最新 transaction。只有最新 target 的 fresh confirmation 才能提交 Recent Event
+Protection 继续按 0.5、1、2、4、8、16、32、64 秒退避，之后保持最长 64 秒。setter 拒绝与“接受但尚未确认”分别显示。重试请求无论被接受或拒绝，都不延长 Auto 保护窗口；只有真实确认恢复成功时，才从确认时刻重新开启一次窗口，以保护紧接着的再次抢麦。
 
-因此，只有 Protection Restore 允许长期 pending；Trusted User Selection 明确是有界的 UI command。它的短窗口只用于吸收 CoreAudio 正常的异步传播与一次快速 retry，不会在几分钟后偷偷再次 set 用户早已放弃的旧选择。
+保留既有的 Protection 第三状态规则：当前还是起始 source 时，等待/重试；真实 current 到达另一个非 target 设备时，可以结束旧 restore 并重新运行策略。Request 的 source 与当前非 target 设备不同，本身可以保留“本次请求生命周期内发生过变化”的候选资格，即使 setter 后的 confirmation read 已经先消费了 revision 变化；这仍是产品启发式，不是可靠的写入来源证明。拓扑不可信时也不能提交学习。
 
-Protection restore 中还区分两类未完成状态：`setInputDevice()` 未抛错但 `current != target` 表示“请求已接受、等待确认”；watchdog 某次 setter 抛错则表示“本次请求没有完成”。provider error 保留 lookup 阶段、CoreAudio 操作阶段、对象 ID 与 `OSStatus`，并写入日志。setter 抛错时显示 `Unable to set default input device; protection will keep retrying`，accepted 但长期未确认时显示 `Unable to confirm default input change; protection is retrying`。任一后续成功确认都会由 `finishProgrammaticSwitchIfConfirmed()` 清空这些瞬态错误。设置窗口的「高级 → 设备切换」只显示 Protection restore 的结构化警告。Trusted User Selection 不修改 `ProtectionRetryState`；首个 setter 抛错仍立即失败且不擅自改写 preferred，短确认窗口耗尽则显示 `Unable to confirm default input change`。
+关闭保护、切换模式、MicLock 的更新选择会先取消逻辑请求、尚未完成的显式对齐、缺失默认输入防抖及其 timer/watchdog。切到 Auto 且保护开启时，取消旧工作后立即执行一次普通 fresh reconcile；这不是 alignment，不会仅凭 `current != preferred` 强制恢复，但可信的 `current == nil` 可以据此重新开始 missing-default debounce。目标离线只有在完整可信快照中才能确认。成功的 fresh current 等于目标可以独立确认写入，即使同次枚举失败；缓存碰巧等于目标不能确认。
 
-Recent Event 的 `occurredAt` 使用**确认时间**，而不是 setter 请求时间。
+## 通知：独立冷却，不再绑定 episode
 
-### 模式切换与保护关闭
+仅在恢复已经确认、请求创建时允许通知、确认时通知开关仍开启且不是启动对齐时，提交恢复通知。
 
-模式切换代表新的用户意图，会取消旧模式下尚未确认的 transaction；切到 Manual 后再基于当前真实状态执行新的 startup 对齐。关闭保护同样会取消 active transaction。Trusted latest-wins 没有额外 queued intent 需要清理。
+Auto 只记录 `lastAutoNotificationAt`，两次提交通知至少间隔当前 `settleSeconds`；未提交的恢复不消耗冷却。Manual 保持每次确认恢复可通知。配置变化影响后续冷却判断。
 
-## 通知去重与 episode ID
+这是有意的行为变化：持续时间很长的反复抢麦可能在一个连续保护过程中收到多条间隔通知；很接近的独立插拔也可能共用冷却。以前承诺的“一个 episode 恰好最多一条”不再适用。换取的是删除 `PendingNotification`、`notificationSent`、`episodeID` 和 rebind 全部跨状态耦合。冷却限制的是提交，不保证系统实际展示横幅。
 
-Auto Mode 的 pending notification 会记录当前绑定的 `episodeID`。如果旧 episode 已结束，而 Protection watchdog 的 accepted retry 或最终 target confirmation 新开了 episode，则**只对已经存在的 notification**重新绑定到新 episode；原本为 nil 的 notification 不会因为 retry / confirmation 而被凭空创建。确认时只有同 ID 的当前 episode 才能参与去重，因此 confirmation 消耗了新 episode 的通知额度后，紧接着的再次抢麦不会重复通知。
+## 计时器与恢复
 
-只有通知开关在确认时仍然开启、实际准备投递通知时，才把 `notificationSent` 置为 true。若事务确认前用户关闭通知，这次确认不会消耗 episode 的通知额度；之后在同一 episode 内重新开启通知，下一次恢复仍可以发送一次通知。Manual Mode 不使用 episode 去重。
+音频核心有四类任务：候选确认、缺失默认输入确认、写入 watchdog、异常采样恢复。保护窗口自己不需要 timer。采样恢复从 250ms、500ms、1s、2s 逐级退避到最长 64s，成功后清零；比旧实现长期每 2 秒重新采样更克制，但异常刚恢复且没有 callback 时可能更晚发现。
 
-## Trusted User Action
+候选 timer 校验 revision 和截止时间，缺失默认输入 timer 校验有效起点和截止时间，Writer timer 校验请求 ID。任务只负责唤醒；学习或恢复前仍检查当前证据、可信 topology 和单调时间。通知授权等非音频任务独立存在，不能把“四类”误写成整个 App 只有四类异步任务。
 
-用户在 MicLock 菜单里选择设备属于明确的 Trusted User Action，不受 settle window 限制。动作开始时先 fresh-read current：若 target 已经是真实 current，则直接完成用户意图而不依赖 setter；若 target 同时也是 preferred，则纯 no-op，不记录无意义的同设备 Recent Event。否则正常建立 `PendingSwitch`：所需 setter 抛错不覆盖 preferred；setter 被接受后 preferred 可以立即更新，但 Recent Event 仍必须等某次成功 fresh read 明确观察到 target 后才提交，失败读取保留下来的 `currentDevice` cache 不能确认事务。
+## 尚存边界
 
-Trusted User Selection 使用 **latest-wins** 语义。`A → 点击 B → 点击 C → 点击 D` 会立即依次发出 `set(B)`、`set(C)`、`set(D)`，但 active transaction 始终只有一笔，并且永远代表最后一次 MicLock 明确选择 D。旧 B/C setter 若随后延迟生效，MicLock 不尝试判断它是旧写回声还是外部选择；只知道最新 MicLock target 仍是 D，因此旧回声不能完成或取消 D。
+Auto 仍是启发式：窗口内真正的用户外部切换可能被恢复，窗口外迟到的系统变化可能被接受；窗口内明确选择请使用 MicLock 菜单。可信联合采样也不提供 HAL 原子性保证。
 
-Trusted transaction 在最新 setter 后只保留很短的确认窗口：立即 fresh-read；未确认则 500ms 后对最新 target fast retry 一次；再过 500ms 仍未确认就结束。这个窗口内，System Settings 的非 target 变化不会被解释成新的外部意图；窗口结束后立即恢复普通 Auto policy，因此正常情况下 MicLock target 很快确认后，之后用户在 System Settings 选择 D 仍会走稳定外部切换 candidate，并按 `settleSeconds` 学习为新的 preferred。
+取消 pending 不会撤销 HAL 已接受的写入。最新目标确认以后，旧 setter 极晚生效，仍可能被当作新外部变化；这次瘦身没有声称解决 HAL 完成乱序。无 callback、无待处理任务的静默变化也不能立即感知。
 
-设备刚接入的 settle window 内如果确实要更换首选麦克风，直接在 MicLock 菜单中选择即可。
-
-## Recent Events 的解释语义
-
-Recent Events 只记录已经确认成功的关键动作：
-
-- MicLock 菜单中的用户选择
-- Auto 在 `stable` 状态接受的外部切换
-- Manual / Auto / preferred 重连 / startup 的恢复
-
-Auto 接受外部切换时，事件的 `from` 使用**旧 preferred**。这表示一次明确的 policy 迁移：从旧 preferred 接受到新的 current；不会依赖 listener 到达顺序或某个 callback 前缓存的 current。
-
-## 时序示例：AirPods 接入并反抢
-
-```mermaid
-sequenceDiagram
-    participant SYS as macOS
-    participant ML as MicLock
-    Note over ML: preferred = MacBook Microphone; state = stable
-    SYS->>ML: devices delta: AirPods added
-    ML->>ML: create settle episode #7 rev1
-    SYS->>ML: default input -> AirPods
-    ML->>ML: state = settling => classify as hijack
-    ML->>SYS: set preferred (transaction #20)
-    ML->>ML: extend episode #7 to rev2
-    SYS->>ML: default input -> MacBook Microphone
-    ML->>ML: confirm transaction #20; record event; notification #7 = sent
-    SYS->>ML: default input -> AirPods again
-    ML->>SYS: restore again (same episode #7, no second notification)
-    ML->>ML: current revision deadline reached -> stable
-```
-
-## 已知限制
-
-- **settle window 内的真实用户外部切换仍可能被恢复**：CoreAudio 没有提供可靠的「是谁修改默认输入」来源。窗口内想明确更换首选，请使用 MicLock 菜单。
-- **窗口结束后的系统延迟切换仍可能被接受**：稳定以后 MicLock 选择“允许用户意图”优先，无法证明一个外部变化一定来自人类操作。
-- **StableExternalSwitchCandidate 仍是时间启发式**：candidate 复用 `settleSeconds` 吸收常见的跨属性分阶段更新，并要求 target UID 存在于可信 topology；如果 CoreAudio 的 topology 更新延迟超过整个分类窗口，仍可能把系统 fallback 误判为稳定后的外部切换。这是 Auto 允许外部切换自动成为 preferred 所带来的产品 trade-off，而不是原子性保证。
-- **个别虚拟驱动静默回弹**：若驱动接受 setter 后又静默回弹且完全不产生属性事件，事件驱动模型无法立即感知。
-- **preferred 离线期间**：保留原 UID，不学习系统 fallback，等待同 UID 重连。
-
-## 对应单元测试
-
-`Tests/AudioMonitorTests.swift` 覆盖的关键行为包括：
-
-| 测试 | 锁定的行为 |
-|---|---|
-| A1 new device hijack | settling 内抢麦 → 立即恢复、preferred 不变 |
-| A2 settled user switch | stable 后外部切换 → 接受并学习 |
-| A2 recent event uses old preferred | devices callback 先刷新 current 时解释历史仍正确 |
-| A3 switch inside settle window | settle 内外部切换按启发式恢复 |
-| A4 new device settles then accepted | 新设备稳定后允许用户切换到它 |
-| pending restore superseded by mode change | 新事务原子取代旧事务，event / notification 不串线 |
-| restore waits for real confirmation | 未真实确认前不伪造 current、不通知、不写 Recent Event |
-| burst robustness | 反抢 / 重复 / 回声交错时 setter 不循环、episode 只通知一次 |
-| settle configuration change | 修改 settleSeconds 后旧 timer 不得提前结束 episode 或重置去重 |
-| user selection inside settle window | Trusted User Action 在 settle 内仍立即生效 |
+测试覆盖原有 `AudioMonitorTests.swift`、危险时序回归 `StateMachineRegressionTests.swift`、重构验收 `StateMachineAcceptanceTests.swift`、`PostRefactorRegressionTests.swift`、`LiveAudioDeviceProviderTests.swift` 和 `SettingsBoundaryTests.swift`。时间敏感的 AudioMonitor/状态机测试使用 Manual Scheduler；Provider 与设置/通知边界测试使用各自的可控 fixture / continuation，不把新的 wall-clock sleep 引入这些回归。原有睡眠用例保留，另行迁移，避免把性能优化混进这次行为重构。
