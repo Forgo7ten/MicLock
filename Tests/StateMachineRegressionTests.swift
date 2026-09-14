@@ -12,6 +12,7 @@ func runStateMachineRegressionTests() async {
     await regressionChangedCurrentDiscoveredByRecovery()
     regressionStartupUsesFreshObservation()
     regressionPreferredInitializationWaitsForStartup()
+    regressionPartialTopologyDelaysPreferredInitialization()
     regressionFirstUsableTopologyAfterEmptyStartup()
     await regressionPartialTopologyCannotConfirmFromCache()
     await regressionCancelledWatchdogCannotWrite()
@@ -169,6 +170,31 @@ private func regressionPreferredInitializationWaitsForStartup() {
 
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "fresh startup topology must still apply built-in-first initialization")
     expect(provider.setCalls == [builtInMic.uid], "startup alignment uses the newly initialized built-in preferred")
+}
+
+@MainActor
+private func regressionPartialTopologyDelaysPreferredInitialization() {
+    test("regression: partial topology delays preferred initialization")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [usbMic], current: usbMic,
+        preferred: nil, scheduler: clock
+    )
+    expect(monitor.preferredMicrophoneUID == nil, "pre-listener snapshot has no policy side effect")
+
+    // Simulate a built-in device whose critical TransportType is temporarily
+    // unreadable: LiveAudioDeviceProvider omits it and marks the snapshot partial.
+    provider.devices = [usbMic]
+    provider.incompleteDeviceIDs = [builtInMic.deviceID]
+    monitor.evaluateStartupPolicy()
+    expect(monitor.preferredMicrophoneUID == nil, "partial startup topology cannot initialize preferred")
+    expect(provider.setCalls.isEmpty, "partial startup topology cannot align to a guessed target")
+
+    provider.devices = [builtInMic, usbMic]
+    provider.incompleteDeviceIDs = []
+    monitor.handleDeviceListChanged()
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "built-in is initialized only after topology becomes complete")
+    expect(provider.setCalls == [builtInMic.uid], "pending startup alignment uses the recovered built-in preferred")
 }
 
 @MainActor

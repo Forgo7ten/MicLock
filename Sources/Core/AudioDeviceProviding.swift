@@ -6,6 +6,7 @@ enum AudioDeviceProviderOperation: String {
     case enumerateDeviceListData
     case queryInputStreams
     case queryDeviceUID
+    case queryTransportType
     case translateDeviceUID
     case queryDefaultInputDevice
     case setDefaultInputDevice

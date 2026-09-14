@@ -27,11 +27,12 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
             do {
                 guard try hasInputStreams(deviceID) else { continue }
                 let uid = try requiredDeviceUID(deviceID)
+                let transportType = try requiredTransportType(deviceID)
                 inputDevices.append(AudioInputDevice(
                     uid: uid,
                     deviceID: deviceID,
                     name: deviceName(deviceID) ?? "Unknown (\(deviceID))",
-                    transportType: transportType(deviceID) ?? 0
+                    transportType: transportType
                 ))
             } catch let error as AudioDeviceProviderError {
                 // 单个 HAL object 读失败时保留其余健康设备给 UI/诊断；
@@ -56,7 +57,9 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
             uid: uid,
             deviceID: deviceID,
             name: deviceName(deviceID) ?? "Unknown",
-            transportType: transportType(deviceID) ?? 0
+            // Current identity is UID-based. Transport remains best-effort here;
+            // topology enumeration is the authority for built-in classification.
+            transportType: (try? requiredTransportType(deviceID)) ?? 0
         )
     }
 
@@ -254,7 +257,7 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         return object as String?
     }
 
-    private func transportType(_ deviceID: AudioDeviceID) -> UInt32? {
+    private func requiredTransportType(_ deviceID: AudioDeviceID) throws -> UInt32 {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyTransportType,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -266,8 +269,14 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
 
         let status = access.getData(deviceID, &address, 0, nil, &size, &value)
 
-        guard status == noErr, size == UInt32(MemoryLayout<UInt32>.size) else { return nil }
-
+        guard status == noErr else {
+            throw AudioDeviceProviderError.coreAudio(
+                operation: .queryTransportType, objectID: deviceID, status: status
+            )
+        }
+        guard size == UInt32(MemoryLayout<UInt32>.size) else {
+            throw invalid(.queryTransportType, deviceID, "wrong transport type size")
+        }
         return value
     }
 
