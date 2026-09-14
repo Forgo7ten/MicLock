@@ -41,7 +41,7 @@ HAL callback / candidate timer / recovery timer / watchdog
   -> 只有合格的新变化才能建立外部候选
 ```
 
-Devices 与 DefaultInput 是独立属性；连续读取不是原子事务。current 读取失败、枚举失败、partial、current 不属于设备表时，都不做不可逆 Auto 学习。Manual 可以使用最后一份完整 topology 继续请求恢复；已有写入只要被 fresh current 证明已到目标，就可以独立确认。
+Devices 与 DefaultInput 是独立属性；连续读取不是原子事务。current 读取失败、枚举失败、partial、current 不属于设备表时，都不做不可逆 Auto 学习。Manual 和已经处于保护窗口内的 Auto 可以使用最后一份完整 topology 继续请求恢复，Provider 每次重新解析 UID；不完整采样不能新建保护窗口、判定设备离线或学习首选。已有写入只要被 fresh current 证明已到目标，就可以独立确认。`trustedDevices` 也支撑在线/离线 UI，因此必须保持可观测。离线错误绑定具体失败的目标 UID，后续 fresh current 到达该目标时清除。
 
 同一 `sample()` 被初始化、启动、callback 和 recovery 共用。原先独立的 startup refresh / runtime reconcile / startup recovery 初始化分支被合并。
 

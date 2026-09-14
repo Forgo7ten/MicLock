@@ -21,7 +21,7 @@ struct DefaultInputWriter {
     enum Failure {
         case selectionRejected
         case selectionUnconfirmed(uid: String)
-        case targetOffline
+        case targetOffline(uid: String)
         case protectionRejected
         case protectionUnconfirmed
 
@@ -81,14 +81,17 @@ struct DefaultInputWriter {
     mutating func clearFailure() { failure = nil }
 
     mutating func targetDisappeared() {
+        guard let targetUID = pending?.target.uid else { return }
         pending = nil
-        failure = .targetOffline
+        failure = .targetOffline(uid: targetUID)
     }
 
     /// Call ONLY after a successful fresh current read (including an explicit nil).
     mutating func observe(_ current: AudioInputDevice?) -> Request? {
-        if case .selectionUnconfirmed(let uid) = failure, current?.uid == uid {
-            failure = nil
+        switch failure {
+        case .selectionUnconfirmed(let uid), .targetOffline(let uid):
+            if current?.uid == uid { failure = nil }
+        default: break
         }
         guard let request = pending, current?.uid == request.target.uid else { return nil }
         pending = nil

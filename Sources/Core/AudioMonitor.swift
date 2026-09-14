@@ -84,7 +84,7 @@ final class AudioMonitor {
     private var writer = DefaultInputWriter()
     @ObservationIgnored private var policy = AutoPolicy()
     // nil is an unknown baseline, [] is a successfully sampled empty topology.
-    @ObservationIgnored private var trustedDevices: [AudioInputDevice]?
+    private var trustedDevices: [AudioInputDevice]?
     @ObservationIgnored private var currentRevision: UInt64 = 0
     @ObservationIgnored private var alignmentRequested = false
     @ObservationIgnored private var listenersInstalled = false
@@ -327,14 +327,16 @@ final class AudioMonitor {
         }
 
         let protecting = policy.isProtecting(at: scheduler.now, interval: settleInterval)
-        if state.valid {
-            if protecting {
-                restore(preferred, reason: .automaticHijack)
-                return
-            }
+        // An established window is already a protection decision. As in Manual,
+        // a fresh current mismatch may restore the last trusted target even if
+        // THIS topology sample is incomplete. The provider resolves the target
+        // afresh; only a complete sample can establish removal or new topology.
+        if protecting {
+            restore(preferred, reason: .automaticHijack)
+            return
         }
-        // Unknown topology: retain evidence, but neither classify a hijack nor
-        // irreversibly learn. A real current change still breaks old continuity.
+        // Unknown topology cannot establish a new protection window or learn a
+        // preference. A real current change still breaks old continuity.
         if !protecting, mayLearnChange, observation.changed, let current = observation.device {
             policy.beginCandidate(
                 target: current, preferred: preferred, revision: currentRevision,

@@ -31,6 +31,7 @@ print()
 await runAllTests()
 await runStateMachineRegressionTests()
 await runStateMachineAcceptanceTests()
+await runPostRefactorRegressionTests()
 
 print()
 print("== \(passCount) passed, \(failCount) failed ==")
