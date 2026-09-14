@@ -82,7 +82,7 @@ make install    # 安装到 /Applications 并启动
 
 首次启动约 0.5 秒后请求通知权限，允许即可；被拒绝时设置窗口（通用 → 通知）会显示提示行并可一键跳转系统设置。
 
-更多调试手段（`MICLOCK_TRACE_PATH` 决策流文件、OSLog）见 [docs/architecture.md](docs/architecture.md#调试)。
+更多调试手段（`MICLOCK_TRACE_PATH` 决策流文件、OSLog）见 [docs/architecture.md](docs/architecture.md)。
 
 ## 数据存储
 

@@ -1,6 +1,6 @@
 # MicLock 架构与实现
 
-MicLock 只管理系统默认输入设备（`kAudioHardwarePropertyDefaultInputDevice`）。不录音、不控制输出、不申请辅助功能权限。Auto 的产品规则、时间启发式和已知限制见 [auto-mode.md](auto-mode.md)；重构决策和迁移范围见 [state-machine-migration.md](state-machine-migration.md)。
+MicLock 只管理系统默认输入设备（`kAudioHardwarePropertyDefaultInputDevice`）。不录音、不控制输出、不申请辅助功能权限。Auto 的产品规则、时间启发式和已知限制见 [auto-mode.md](auto-mode.md)。
 
 ## 模块与责任
 
@@ -41,7 +41,7 @@ HAL callback / candidate timer / recovery timer / watchdog
   -> 只有合格的新变化才能建立外部候选
 ```
 
-Devices 与 DefaultInput 是独立属性；连续读取不是原子事务。current 读取失败、枚举失败、partial、current 不属于设备表时，都不做不可逆 Auto 学习。Manual 和已经处于保护窗口内的 Auto 可以使用最后一份完整 topology 继续请求恢复，Provider 每次重新解析 UID；不完整采样不能新建保护窗口、判定设备离线或学习首选。已有写入只要被 fresh current 证明已到目标，就可以独立确认。`trustedDevices` 也支撑在线/离线 UI，因此必须保持可观测。离线错误绑定具体失败的目标 UID，后续 fresh current 到达该目标时清除。
+Devices 与 DefaultInput 是独立属性；连续读取不是原子事务。current 读取失败、枚举失败、partial、current 不属于设备表时，都不做不可逆 Auto 学习。Manual 和已经处于保护窗口内的 Auto 可以使用最后一份完整 topology 继续请求恢复，Provider 每次重新解析 UID；不完整采样不能新建保护窗口、判定设备离线或学习首选。已有写入只要被 fresh current 证明已到目标，就可以独立确认。`trustedDevices` 也支撑在线/离线 UI，因此必须保持可观测。离线错误绑定具体失败的目标 UID；后续 fresh current 到达该目标，或完整可信 topology 再次证明该 UID 已在线时，都会清除这条已经过期的 target-offline 错误。
 
 同一 `sample()` 被初始化、启动、callback 和 recovery 共用。原先独立的 startup refresh / runtime reconcile / startup recovery 初始化分支被合并。
 
@@ -82,7 +82,7 @@ make test
 make build
 ```
 
-`Tests/main.swift` 依次调用原有测试、新增危险时序回归和重构验收。新测试全部注入 `ManualAudioMonitorScheduler`；原有真实等待用例仍保留。第一份补丁刻意只加入回归，在旧实现上失败；必须继续应用实现补丁后再验收最终结果。
+`Tests/main.swift` 依次调用原有测试、新增危险时序回归和重构验收。新测试全部注入 `ManualAudioMonitorScheduler`；原有真实等待用例仍保留。回归测试覆盖本次重构前已确认存在的危险时序，并与最终实现一起作为持续回归门禁。
 
 需要检查默认回调与设备回调先后变化、重复回调、部分拓扑、当前读取失败、A→B→C 快速选择、旧确认迟到、首选离线/重连、通知开关、模式切换、配置变更与 startup fresh read。对第三方 HAL 的真实行为仍须用 macOS 设备验证，Fake Provider 不等于硬件驱动。
 

@@ -60,7 +60,7 @@ Writer 是 AudioMonitor 内的可观测值类型，`lastError` 与 `protectionRe
 
 不完整采样不能建立新的拓扑事实或学习首选。但已经由可信拓扑建立的保护窗口仍然有效：只要 fresh current 明确偏离首选，就和 Manual 一样尝试恢复最后可信的目标，实际是否可写由 Provider 重新解析 UID 决定；失败进入已有退避，只有完整快照才能判定目标离线并取消。没有成功 current read 时，绝不使用缓存冒充新的恢复或确认依据。
 
-仍保留保守的全局可信边界，不增加逐设备置信度、隔离表等状态机。长期异常设备仍可能暂停新的拓扑分类及 Auto 学习；这不等于撤销已建立的保护。`trustedDevices` 同时支撑首选在线/离线 UI，必须参与 Observation；设备恢复且 fresh current 到达之前失败的目标后，清除对应离线错误，而不是把旧错误一直留在菜单里。
+仍保留保守的全局可信边界，不增加逐设备置信度、隔离表等状态机。长期异常设备仍可能暂停新的拓扑分类及 Auto 学习；这不等于撤销已建立的保护。`trustedDevices` 同时支撑首选在线/离线 UI，必须参与 Observation；离线错误绑定具体失败的目标 UID，后续 fresh current 到达该目标，或完整可信 topology 再次证明该 UID 已在线时，都会清除这条已经过期的 target-offline 错误。
 
 ## 写入确认与重试
 
@@ -92,4 +92,4 @@ Auto 仍是启发式：窗口内真正的用户外部切换可能被恢复，窗
 
 取消 pending 不会撤销 HAL 已接受的写入。最新目标确认以后，旧 setter 极晚生效，仍可能被当作新外部变化；这次瘦身没有声称解决 HAL 完成乱序。无 callback、无待处理任务的静默变化也不能立即感知。
 
-测试分为原有 `AudioMonitorTests.swift`、补丁第一步新增的 `StateMachineRegressionTests.swift` 和重构验收 `StateMachineAcceptanceTests.swift`。新测试使用 Manual Scheduler，不增加真实 sleep。原有睡眠用例保留，另行迁移，避免把性能优化混进这次行为重构。
+测试分为原有 `AudioMonitorTests.swift`、危险时序回归 `StateMachineRegressionTests.swift` 和重构验收 `StateMachineAcceptanceTests.swift`。新测试使用 Manual Scheduler，不增加真实 sleep。原有睡眠用例保留，另行迁移，避免把性能优化混进这次行为重构。
