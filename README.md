@@ -75,8 +75,10 @@ make install    # 安装到 /Applications 并启动
 | `make icon` | 从 `Resources/AppIcon.svg` 重新生成 icns |
 | `make run` | 构建并启动 |
 | `make debug` | `MICLOCK_DEBUG=1` 前台运行，决策日志到终端 |
-| `make install` | 停止旧实例 → 安装到 /Applications → 启动 |
+| `make install` | 构建 → 覆盖安装到 `/Applications` → 启动（不要使用 sudo） |
 | `make clean` | 清理构建产物 |
+
+若 `/Applications` 不可写，可使用 `make install INSTALL_DIR="$HOME/Applications"` 安装到用户应用目录。`make install` 会先把新 `.app` 完整复制到安装目录内的临时位置，再替换旧 bundle；不要使用 `sudo make install`。
 
 首次启动约 0.5 秒后请求通知权限，允许即可；被拒绝时设置窗口（通用 → 通知）会显示提示行并可一键跳转系统设置。
 
