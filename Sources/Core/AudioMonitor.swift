@@ -177,7 +177,6 @@ final class AudioMonitor {
     private struct Sample {
         let observation: CurrentObservation?
         let valid: Bool
-        let firstBaseline: Bool
         let added: Set<String>
     }
 
@@ -234,7 +233,7 @@ final class AudioMonitor {
             candidateTask?.cancel()
             candidateTask = nil
             if scheduleRecovery { scheduleRecoverySample() }
-            return Sample(observation: observation, valid: false, firstBaseline: false, added: [])
+            return Sample(observation: observation, valid: false, added: [])
         }
 
         deviceEnumerationError = nil
@@ -257,14 +256,14 @@ final class AudioMonitor {
         if allowPreferredInitialization, preferredMicrophoneUID == nil {
             preferredMicrophoneUID = devices.first(where: \.isBuiltIn)?.uid ?? observation.device?.uid
         }
-        return Sample(observation: observation, valid: true, firstBaseline: firstBaseline, added: added)
+        return Sample(observation: observation, valid: true, added: added)
     }
 
     private func reconcile(watchdog: Bool = false) {
         let entryRequest = writer.pending
         let state = sample()
         AudioMonitorDiagnostics.trace("RECONCILE revision=\(currentRevision) changed=\(state.observation?.changed ?? false) valid=\(state.valid) current=\(currentDevice?.uid ?? "nil") preferred=\(preferredMicrophoneUID ?? "nil") pending=\(writer.pending?.target.uid ?? "nil") watchdog=\(watchdog)")
-        let needsAlignment = state.valid && (alignmentRequested || state.firstBaseline)
+        let needsAlignment = state.valid && alignmentRequested
         if state.valid { alignmentRequested = false }
 
         guard let observation = state.observation else {
@@ -284,7 +283,7 @@ final class AudioMonitor {
             cancelWatchdog()
         }
 
-        var mayLearnChange = entryRequest == nil
+        var hasEligibleChangeEvidence = entryRequest == nil && observation.changed
         if let pending = writer.pending {
             // Preserve the existing protection third-state escape: a genuinely
             // different current can supersede the old source-based restore.
@@ -293,7 +292,10 @@ final class AudioMonitor {
                let current = observation.device,
                (pending.sourceUID == nil || current.uid != pending.sourceUID) {
                 cancelWrite()
-                mayLearnChange = observation.changed
+                // The request began at sourceUID. Reaching a non-target current
+                // proves a change during its lifetime even if submitWrite()'s
+                // confirmation read was the first observer of that change.
+                hasEligibleChangeEvidence = true
             } else {
                 if watchdog {
                     // A retry performs its own fresh current read. If it actually
@@ -307,7 +309,7 @@ final class AudioMonitor {
                 if writer.pending != nil { return }
                 // The only fallthrough is a Trusted selection expiring without
                 // another write. That expiry is NOT external-switch evidence.
-                mayLearnChange = false
+                hasEligibleChangeEvidence = false
             }
         }
 
@@ -344,7 +346,7 @@ final class AudioMonitor {
         }
         // Unknown topology cannot establish a new protection window or learn a
         // preference. A real current change still breaks old continuity.
-        if !protecting, mayLearnChange, observation.changed, let current = observation.device {
+        if !protecting, hasEligibleChangeEvidence, let current = observation.device {
             policy.beginCandidate(
                 target: current, preferred: preferred, revision: currentRevision,
                 validAt: state.valid ? scheduler.now : nil

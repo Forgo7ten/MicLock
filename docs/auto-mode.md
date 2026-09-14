@@ -44,7 +44,7 @@ Writer 是 AudioMonitor 内的可观测值类型，`lastError` 与 `protectionRe
 
 首次成功读取只建立基线。之后只有 UID 真正改变才推进 `currentRevision`；重复回调、相同值、错误读取都不凭空产生一次变化。成功读到 nil 与读取失败分开处理；前者是一次明确的“没有默认输入”，后者保留 UI 缓存。
 
-候选只能由合格的 `observation.changed` 开始。回调类型不是用户意图证明：timer 确实读到 A→B 时可以发现新变化，但 timer 读到 A→A 不能仅因为 `A != preferred` 而启动学习。MicLock 正在处理的写入观察优先由 Writer 消费，不能同时作为外部切换证据。
+候选必须有合格的真实 UID 变化证据。通常由 `observation.changed` 提供：timer 确实读到 A→B 时可以发现新变化，但 timer 读到 A→A 不能仅因为 `A != preferred` 而启动学习。MicLock 正在处理的 target 写入观察优先由 Writer 消费；Protection 的非 target 第三状态是例外，它可以用 Request 的 source 与当前设备不同来保留已发生变化的候选资格，详见下文。
 
 因此 Trusted 超时后，即使收到无变化的 Devices/DefaultInput callback，或者 recovery timer 再次读到旧 A，也不会覆盖用户选择的 B。不需要专门的 `trustedSelectionExpired` 策略返回值或 timeout 后的屏蔽 flag。
 
@@ -70,7 +70,7 @@ Trusted 选择保留原有 latest-wins：新点击立即取代旧逻辑请求，
 
 Protection 继续按 0.5、1、2、4、8、16、32、64 秒退避，之后保持最长 64 秒。setter 拒绝与“接受但尚未确认”分别显示。重试请求无论被接受或拒绝，都不延长 Auto 保护窗口；只有真实确认恢复成功时，才从确认时刻重新开启一次窗口，以保护紧接着的再次抢麦。
 
-保留既有的 Protection 第三状态规则：当前还是起始 source 时，等待/重试；真实 current 到达另一个非 target 设备时，可以结束旧 restore 并重新运行策略。只有本轮确实观察到新的 UID 变化，才有资格成为 Auto 候选。`sourceUID` 因这一兼容规则保留，不伪装成可靠的外部写入来源证明。拓扑不可信时也不能提交学习。
+保留既有的 Protection 第三状态规则：当前还是起始 source 时，等待/重试；真实 current 到达另一个非 target 设备时，可以结束旧 restore 并重新运行策略。Request 的 source 与当前非 target 设备不同，本身可以保留“本次请求生命周期内发生过变化”的候选资格，即使 setter 后的 confirmation read 已经先消费了 revision 变化；这仍是产品启发式，不是可靠的写入来源证明。拓扑不可信时也不能提交学习。
 
 关闭保护、切换模式、MicLock 的更新选择会取消逻辑请求、尚未完成的显式对齐及其 watchdog。目标离线只有在完整可信快照中才能确认。成功的 fresh current 等于目标可以独立确认写入，即使同次枚举失败；缓存碰巧等于目标不能确认。
 
@@ -91,6 +91,8 @@ Auto 只记录 `lastAutoNotificationAt`，两次提交通知至少间隔当前 `
 ## 尚存边界
 
 Auto 仍是启发式：窗口内真正的用户外部切换可能被恢复，窗口外迟到的系统变化可能被接受；窗口内明确选择请使用 MicLock 菜单。可信联合采样也不提供 HAL 原子性保证。
+
+Auto stable 中成功观察到 `current == nil` 时，会保留 Preferred 且不把 nil 当作读取失败或学习目标，但当前不会为持续 nil 建立候选、恢复或 timer；如果之后没有新的 callback、拓扑变化或显式对齐，系统默认输入可能保持为空。这是既有的保守边界，用于避免对瞬时 nil 立即恢复；若未来要在 `settleSeconds` 后恢复，需要先明确对应的产品规则。
 
 取消 pending 不会撤销 HAL 已接受的写入。最新目标确认以后，旧 setter 极晚生效，仍可能被当作新外部变化；这次瘦身没有声称解决 HAL 完成乱序。无 callback、无待处理任务的静默变化也不能立即感知。
 

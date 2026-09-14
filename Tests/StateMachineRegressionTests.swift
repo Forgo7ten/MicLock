@@ -13,6 +13,9 @@ func runStateMachineRegressionTests() async {
     await regressionModeSwitchCancelsDeferredAlignment()
     await regressionSelectionCancelsDeferredAlignment()
     await regressionNilProtectionSourceCanBeSuperseded()
+    await regressionFirstBaselineCannotReviveAlignment()
+    await regressionPostSetterThirdCurrentRemainsEvidence()
+    await characterizationAutoStableNilCurrent()
     regressionStartupUsesFreshObservation()
     regressionPreferredInitializationWaitsForStartup()
     regressionPartialTopologyDelaysPreferredInitialization()
@@ -111,6 +114,90 @@ private func regressionNilProtectionSourceCanBeSuperseded() async {
 
     expect(provider.setCalls == [builtInMic.uid], "the superseded restore does not retry against the new current")
     expect(monitor.preferredMicrophoneUID == usbMic.uid, "the real non-target change remains eligible for Auto learning")
+}
+
+@MainActor
+private func regressionFirstBaselineCannotReviveAlignment() async {
+    test("regression: first valid topology cannot revive superseded alignment")
+    let suite = "MicLockTests.first-baseline-alignment.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.removePersistentDomain(forName: suite)
+    defaults.set(builtInMic.uid, forKey: Preferences.preferredMicrophoneUIDKey)
+    defaults.set(true, forKey: Preferences.protectionEnabledKey)
+    defaults.set(ProtectionMode.auto.rawValue, forKey: Preferences.protectionModeKey)
+    defaults.set(1.0, forKey: Preferences.settleSecondsKey)
+
+    let clock = ManualAudioMonitorScheduler()
+    let provider = FakeAudioDeviceProvider()
+    provider.currentInputDeviceError = AudioDeviceProviderError.coreAudio(
+        operation: .queryDefaultInputDevice, objectID: nil, status: -1
+    )
+    provider.listInputDevicesError = AudioDeviceProviderError.coreAudio(
+        operation: .enumerateDeviceListData, objectID: nil, status: -2
+    )
+    let monitor = AudioMonitor(
+        provider: provider,
+        preferences: Preferences(defaults: defaults),
+        notifier: RecordingNotifier(),
+        scheduler: clock
+    )
+
+    monitor.evaluateStartupPolicy()
+    monitor.protectionMode = .manual
+    monitor.protectionMode = .auto
+
+    provider.currentInputDeviceError = nil
+    provider.listInputDevicesError = nil
+    provider.devices = [builtInMic, usbMic]
+    provider.current = usbMic
+    await clock.advance(by: .milliseconds(250))
+
+    expect(provider.setCalls.isEmpty, "the first trusted topology cannot restore a superseded alignment")
+    expect(monitor.currentDevice?.uid == usbMic.uid, "Auto waits after the superseding mode choice")
+}
+
+@MainActor
+private func regressionPostSetterThirdCurrentRemainsEvidence() async {
+    test("regression: post-setter third current remains external-change evidence")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, airpodsMic, usbMic], current: airpodsMic,
+        preferred: builtInMic.uid, mode: .auto, settle: 1.0,
+        scheduler: clock
+    )
+    provider.currentAfterSetOverride = usbMic
+    monitor.evaluateStartupPolicy()
+
+    expect(provider.setCalls == [builtInMic.uid], "startup alignment submits one restore")
+    expect(monitor.currentDevice?.uid == usbMic.uid, "confirmation read first observes the third current")
+    provider.incompleteDeviceIDs = [99]
+    monitor.handleDefaultInputChanged()
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "partial topology cannot immediately commit third-state learning")
+    provider.incompleteDeviceIDs = []
+    monitor.handleDeviceListChanged()
+    await clock.advance(by: .seconds(1))
+
+    expect(provider.setCalls == [builtInMic.uid], "third-state supersession cancels the old restore watchdog")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "the preserved change evidence can settle as the new preferred")
+}
+
+@MainActor
+private func characterizationAutoStableNilCurrent() async {
+    test("known limitation: Auto stable nil current waits for another event")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic], current: builtInMic,
+        preferred: builtInMic.uid, mode: .auto, settle: 1.0,
+        scheduler: clock
+    )
+
+    provider.current = nil
+    monitor.handleDefaultInputChanged()
+    await clock.advance(by: .seconds(5))
+
+    expect(monitor.currentDevice == nil, "a valid nil observation remains the current fact")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "nil current never replaces the preferred UID")
+    expect(provider.setCalls.isEmpty, "Auto stable does not yet restore a sustained nil current")
 }
 
 @MainActor

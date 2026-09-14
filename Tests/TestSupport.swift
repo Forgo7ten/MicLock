@@ -19,6 +19,9 @@ final class FakeAudioDeviceProvider: AudioDeviceProviding {
     /// 关闭后由测试手动模拟稍后的 CoreAudio 状态传播。
     var applySetImmediately = true
 
+    /// 模拟 setter 返回后，fresh confirmation read 已先观察到另一个设备。
+    var currentAfterSetOverride: AudioInputDevice?
+
     /// 模拟设备枚举失败；nil 表示枚举成功（即使 devices == [] 也属于成功空列表）。
     var listInputDevicesError: Error?
 
@@ -61,7 +64,9 @@ final class FakeAudioDeviceProvider: AudioDeviceProviding {
             throw AudioDeviceProviderError.targetDeviceNotFound(uid: uid)
         }
 
-        if applySetImmediately {
+        if let currentAfterSetOverride {
+            current = currentAfterSetOverride
+        } else if applySetImmediately {
             current = device
         }
     }
