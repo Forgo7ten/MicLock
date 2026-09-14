@@ -76,6 +76,8 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, Not
             content.title = "已恢复锁定麦克风"
         case .automaticHijack:
             content.title = "已阻止麦克风自动切换"
+        case .missingDefaultInput:
+            content.title = "已恢复默认麦克风"
         case .preferredReconnected:
             content.title = "首选麦克风已重新连接"
         case .startup:

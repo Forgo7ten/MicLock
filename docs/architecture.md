@@ -32,13 +32,13 @@ UI 仍是 `MicLockApp.swift` 中的菜单栏面板，以及 `SettingsView.swift`
 ## 一次统一收敛
 
 ```text
-HAL callback / candidate timer / recovery timer / watchdog
+HAL callback / candidate timer / missing-default timer / recovery timer / watchdog
   -> sample: fresh current + devices
   -> current revision、候选连续性、可信 topology
   -> fresh current 确认 Writer，或完整 topology 证明目标离线
   -> pending Writer 优先处理；必要时重试、结束或 supersede
   -> 启动/重连对齐、Manual enforce 或 Auto phase
-  -> 只有合格的新变化才能建立外部候选
+  -> 合格的新变化建立外部候选；可信持续 nil 延迟恢复在线首选
 ```
 
 Devices 与 DefaultInput 是独立属性；连续读取不是原子事务。current 读取失败、枚举失败、partial、current 不属于设备表时，都不做不可逆 Auto 学习。Manual 和已经处于保护窗口内的 Auto 可以使用最后一份完整 topology 继续请求恢复，Provider 每次重新解析 UID；不完整采样不能新建保护窗口、判定设备离线或学习首选。已有写入只要被 fresh current 证明已到目标，就可以独立确认。`trustedDevices` 也支撑在线/离线 UI，因此必须保持可观测。离线错误绑定具体失败的目标 UID；后续 fresh current 到达该目标，或完整可信 topology 再次证明该 UID 已在线时，都会清除这条已经过期的 target-offline 错误。
@@ -49,15 +49,15 @@ Devices 与 DefaultInput 是独立属性；连续读取不是原子事务。curr
 
 初始化读取配置，并采一份用于 UI、current 与 topology 基线的初始快照；这次采样明确禁止初始化 `preferredMicrophoneUID` 或执行恢复。AppDelegate 完成启动后调用 `start()`，先安装监听，再重新采样并请求启动对齐；首选的首次初始化与启动恢复只依据 listener 安装后的 fresh sample，不再用监听安装前的旧 current 直接判断。`alignmentRequested` 仅保存“一个尚未完成的显式对齐请求”，用于对齐时采样失败后的恢复，不是第二套 topology 可信状态。
 
-打开保护或切到 Manual 会执行同样的 fresh 对齐；切到 Auto 保留首选，等待后续事件。模式切换、保护开关变化和新的明确选择会取消旧逻辑写入、候选与尚未完成的显式对齐。保护窗口在模式改变时重置，不能携带旧模式下的判定进度；Auto 在保护关闭时仍记录可信 topology 变化，保护开关本身不会清掉尚未过期的窗口。
+打开保护或切到 Manual 会执行同样的 fresh 对齐；切到 Auto 保留首选，等待后续事件。模式切换、保护开关变化和新的明确选择会取消旧逻辑写入、候选、缺失默认输入防抖与尚未完成的显式对齐。保护窗口在模式改变时重置，不能携带旧模式下的判定进度；Auto 在保护关闭时仍记录可信 topology 变化，保护开关本身不会清掉尚未过期的窗口。
 
 选择设备先 fresh-read current，已经使用该设备时直接更新首选、不重复 setter。否则进入统一 `submitWrite()`；首次 setter 拒绝时选择失败，接受后保存新首选，真实确认前不伪造 current 或成功事件。
 
 ## 计时、错误和通知
 
-Auto 保护窗口保存一个起点，以单调时钟按需判断到期，没有独立 settle timer。Candidate 保存变化 revision 和有效计时起点；任意采样盲区中断计时，恢复后从头确认。writer watchdog 与候选 timer 分别核对请求 ID、revision/截止时间，过期任务不能提交新状态。
+Auto 保护窗口保存一个起点，以单调时钟按需判断到期，没有独立 settle timer。Candidate 保存变化 revision 和有效计时起点；缺失默认输入的防抖在 AudioMonitor 保存独立有效起点，不进入 Candidate 或 AutoPolicy phase。任意采样盲区都会中断相应计时，恢复后从头确认。writer watchdog、候选 timer 与缺失默认输入 timer 分别核对请求 ID、revision/截止时间与有效起点/截止时间，过期任务不能提交新状态。
 
-音频核心的延迟任务是：候选确认、写入 watchdog、异常采样恢复。Protection 使用最长 64 秒的持续退避；Trusted 仅一次 500ms 快速重试与随后 500ms 确认。采样恢复也退避到最长 64 秒，成功后重置。正常稳定状态没有周期性 enforce 或轮询。其他模块仍有通知授权、窗口诊断、登录项状态复核等异步任务。
+音频核心的延迟任务是：候选确认、缺失默认输入确认、写入 watchdog、异常采样恢复。Protection 使用最长 64 秒的持续退避；Trusted 仅一次 500ms 快速重试与随后 500ms 确认。缺失默认输入只在 Auto stable、保护开启且首选可信在线时等待一个 `settleSeconds`，到期 fresh sample 后才恢复；任何非 nil current 或采样盲区都会取消。采样恢复也退避到最长 64 秒，成功后重置。正常稳定状态没有周期性 enforce 或轮询。其他模块仍有通知授权、窗口诊断、登录项状态复核等异步任务。
 
 Writer 错误用 `Failure` 枚举表达，UI 文案由枚举投影，业务不比较英文字符串。`deviceEnumerationError` 暂保留旧 API 名称以兼容 UI，但覆盖整个联合采样失败；名称扩展可留到 UI/诊断专项修改。
 

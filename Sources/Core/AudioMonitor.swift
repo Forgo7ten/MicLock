@@ -23,6 +23,7 @@ final class AudioMonitor {
             guard preferredMicrophoneUID != oldValue else { return }
             preferences.preferredMicrophoneUID = preferredMicrophoneUID
             cancelCandidate()
+            cancelMissingDefaultInputRecovery()
             AudioMonitorDiagnostics.trace("PREFERRED_CHANGED uid=\(preferredMicrophoneUID ?? "nil")")
         }
     }
@@ -68,6 +69,7 @@ final class AudioMonitor {
             configuredSettleSeconds = Preferences.clamp(newValue)
             preferences.settleSeconds = configuredSettleSeconds
             scheduleCandidate()
+            scheduleMissingDefaultInputRecovery()
         }
     }
 
@@ -89,6 +91,8 @@ final class AudioMonitor {
     // Notification submission is independently throttled, not rebound to Auto.
     @ObservationIgnored private var lastAutoNotificationAt: ContinuousClock.Instant?
     @ObservationIgnored private var candidateTask: AudioMonitorScheduledTask?
+    @ObservationIgnored private var missingDefaultInputSince: ContinuousClock.Instant?
+    @ObservationIgnored private var missingDefaultInputTask: AudioMonitorScheduledTask?
     @ObservationIgnored private var watchdogTask: AudioMonitorScheduledTask?
     @ObservationIgnored private var recoveryTask: AudioMonitorScheduledTask?
     @ObservationIgnored private var recoveryAttempt = 0
@@ -233,6 +237,7 @@ final class AudioMonitor {
             policy.interruptSampling()
             candidateTask?.cancel()
             candidateTask = nil
+            cancelMissingDefaultInputRecovery()
             if scheduleRecovery { scheduleRecoverySample() }
             return Sample(observation: observation, valid: false, added: [])
         }
@@ -262,6 +267,7 @@ final class AudioMonitor {
 
     private func reconcile(watchdog: Bool = false) {
         let entryRequest = writer.pending
+        if entryRequest != nil { cancelMissingDefaultInputRecovery() }
         let state = sample()
         AudioMonitorDiagnostics.trace("RECONCILE revision=\(currentRevision) changed=\(state.observation?.changed ?? false) valid=\(state.valid) current=\(currentDevice?.uid ?? "nil") preferred=\(preferredMicrophoneUID ?? "nil") pending=\(writer.pending?.target.uid ?? "nil") watchdog=\(watchdog)")
         let needsAlignment = state.valid && alignmentRequested
@@ -316,10 +322,12 @@ final class AudioMonitor {
 
         guard protectionEnabled, let preferred = preferredDevice else {
             cancelCandidate()
+            cancelMissingDefaultInputRecovery()
             return
         }
         if observation.device?.uid == preferred.uid {
             cancelCandidate()
+            cancelMissingDefaultInputRecovery()
             return
         }
 
@@ -345,22 +353,30 @@ final class AudioMonitor {
             restore(preferred, reason: .automaticHijack)
             return
         }
-        // Unknown topology cannot establish a new protection window or learn a
-        // preference. A real current change still breaks old continuity.
-        if !protecting, hasEligibleChangeEvidence, let current = observation.device {
-            policy.beginCandidate(
-                target: current, preferred: preferred, revision: currentRevision,
-                validAt: state.valid ? scheduler.now : nil
-            )
+        if let current = observation.device {
+            cancelMissingDefaultInputRecovery()
+            // Unknown topology cannot establish a new protection window or learn a
+            // preference. Preserve genuine change evidence across the blind interval.
+            if hasEligibleChangeEvidence {
+                policy.beginCandidate(
+                    target: current, preferred: preferred, revision: currentRevision,
+                    validAt: state.valid ? scheduler.now : nil
+                )
+            }
+            guard state.valid else { return }
+            confirmOrScheduleCandidate(current: current, preferred: preferred)
+            return
         }
         guard state.valid else { return }
-        confirmOrScheduleCandidate(current: observation.device, preferred: preferred)
+        cancelCandidate()
+        confirmOrScheduleMissingDefaultInput(preferred: preferred)
     }
 
-    // MARK: - Auto phase (no dedicated settle timer)
+    // MARK: - Auto policy phase
 
     private func beginProtectionWindow() {
         cancelCandidate()
+        cancelMissingDefaultInputRecovery()
         policy.protect(at: scheduler.now)
     }
 
@@ -371,10 +387,12 @@ final class AudioMonitor {
     }
 
     /// New user intent supersedes deferred alignment, candidate classification,
-    /// and logical writes, but not sampling recovery or an Auto protection window.
+    /// missing-default debounce and logical writes, but not sampling recovery or
+    /// an Auto protection window.
     private func cancelSupersededWork() {
         alignmentRequested = false
         cancelCandidate()
+        cancelMissingDefaultInputRecovery()
         cancelWrite()
     }
 
@@ -411,6 +429,42 @@ final class AudioMonitor {
         }
     }
 
+    // MARK: - Missing default-input debounce
+
+    private func confirmOrScheduleMissingDefaultInput(preferred: AudioInputDevice) {
+        if missingDefaultInputSince == nil {
+            missingDefaultInputSince = scheduler.now
+        }
+        guard let since = missingDefaultInputSince else { return }
+        let deadline = since.advanced(by: settleInterval)
+        if scheduler.now >= deadline {
+            cancelMissingDefaultInputRecovery()
+            restore(preferred, reason: .missingDefaultInput)
+        } else {
+            scheduleMissingDefaultInputRecovery()
+        }
+    }
+
+    private func scheduleMissingDefaultInputRecovery() {
+        missingDefaultInputTask?.cancel()
+        missingDefaultInputTask = nil
+        guard let since = missingDefaultInputSince else { return }
+        let deadline = since.advanced(by: settleInterval)
+        missingDefaultInputTask = scheduler.schedule(after: scheduler.now.duration(to: deadline)) { [weak self] in
+            guard let self, let activeSince = self.missingDefaultInputSince,
+                  activeSince == since,
+                  activeSince.advanced(by: self.settleInterval) == deadline else { return }
+            self.missingDefaultInputTask = nil
+            self.reconcile()
+        }
+    }
+
+    private func cancelMissingDefaultInputRecovery() {
+        missingDefaultInputTask?.cancel()
+        missingDefaultInputTask = nil
+        missingDefaultInputSince = nil
+    }
+
     // MARK: - One write path, two bounded/persistent retry policies
 
     func selectDevice(_ device: AudioInputDevice) {
@@ -439,6 +493,7 @@ final class AudioMonitor {
 
     private func restore(_ preferred: AudioInputDevice, reason: RestoreReason) {
         cancelCandidate()
+        cancelMissingDefaultInputRecovery()
         cancelWrite()
         writer.begin(
             target: preferred, source: currentDevice, origin: .protection(reason),

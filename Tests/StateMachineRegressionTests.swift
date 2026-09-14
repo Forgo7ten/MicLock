@@ -15,7 +15,11 @@ func runStateMachineRegressionTests() async {
     await regressionNilProtectionSourceCanBeSuperseded()
     await regressionFirstBaselineCannotReviveAlignment()
     await regressionPostSetterThirdCurrentRemainsEvidence()
-    await characterizationAutoStableNilCurrent()
+    await regressionAutoStableNilCurrentSelfHeals()
+    await regressionTransientNilCurrentDoesNotRestore()
+    await regressionNilCurrentYieldsToExternalDevice()
+    await regressionNilRecoveryRestartsAfterPartialTopology()
+    await regressionNilRecoveryUsesUpdatedSettleDuration()
     regressionStartupUsesFreshObservation()
     regressionPreferredInitializationWaitsForStartup()
     regressionPartialTopologyDelaysPreferredInitialization()
@@ -182,8 +186,34 @@ private func regressionPostSetterThirdCurrentRemainsEvidence() async {
 }
 
 @MainActor
-private func characterizationAutoStableNilCurrent() async {
-    test("known limitation: Auto stable nil current waits for another event")
+private func regressionAutoStableNilCurrentSelfHeals() async {
+    test("regression: Auto stable sustained nil current restores preferred")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, notifier) = makeMonitor(
+        devices: [builtInMic], current: builtInMic,
+        preferred: builtInMic.uid, mode: .auto, settle: 1.0,
+        scheduler: clock
+    )
+
+    provider.current = nil
+    monitor.handleDefaultInputChanged()
+    await clock.advance(by: .milliseconds(999))
+
+    expect(monitor.currentDevice == nil, "a valid nil observation remains the current fact")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "nil current never replaces the preferred UID")
+    expect(provider.setCalls.isEmpty, "transient nil is tolerated until the settle deadline")
+
+    await clock.advance(by: .milliseconds(1))
+
+    expect(provider.setCalls == [builtInMic.uid], "sustained nil restores the available preferred device")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "the restore is confirmed by a fresh current read")
+    expect(monitor.recentAudioEvents.first?.kind == .restored(.missingDefaultInput), "the restore records missing-default semantics")
+    expect(notifier.messages.first?.hasPrefix("missing-default-input:") == true, "the restore notification preserves its reason")
+}
+
+@MainActor
+private func regressionTransientNilCurrentDoesNotRestore() async {
+    test("regression: Auto stable transient nil current does not restore")
     let clock = ManualAudioMonitorScheduler()
     let (monitor, provider, _) = makeMonitor(
         devices: [builtInMic], current: builtInMic,
@@ -193,11 +223,86 @@ private func characterizationAutoStableNilCurrent() async {
 
     provider.current = nil
     monitor.handleDefaultInputChanged()
-    await clock.advance(by: .seconds(5))
+    await clock.advance(by: .milliseconds(500))
+    provider.current = builtInMic
+    monitor.handleDefaultInputChanged()
+    await clock.advance(by: .seconds(1))
 
-    expect(monitor.currentDevice == nil, "a valid nil observation remains the current fact")
-    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "nil current never replaces the preferred UID")
-    expect(provider.setCalls.isEmpty, "Auto stable does not yet restore a sustained nil current")
+    expect(provider.setCalls.isEmpty, "a normal current returning before the deadline cancels nil recovery")
+}
+
+@MainActor
+private func regressionNilCurrentYieldsToExternalDevice() async {
+    test("regression: nil recovery yields to an external non-nil current")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic], current: builtInMic,
+        preferred: builtInMic.uid, mode: .auto, settle: 1.0,
+        scheduler: clock
+    )
+
+    provider.current = nil
+    monitor.handleDefaultInputChanged()
+    await clock.advance(by: .milliseconds(500))
+    provider.current = usbMic
+    monitor.handleDefaultInputChanged()
+    await clock.advance(by: .milliseconds(500))
+
+    expect(provider.setCalls.isEmpty, "the old nil deadline cannot restore over a new external current")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "the external candidate gets its own full interval")
+
+    await clock.advance(by: .milliseconds(500))
+
+    expect(provider.setCalls.isEmpty, "nil is never submitted or learned as a device")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "the non-nil external current settles through normal Auto learning")
+}
+
+@MainActor
+private func regressionNilRecoveryRestartsAfterPartialTopology() async {
+    test("regression: missing-default recovery does not trust partial topology")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic], current: builtInMic,
+        preferred: builtInMic.uid, mode: .auto, settle: 1.0,
+        scheduler: clock
+    )
+
+    provider.current = nil
+    monitor.handleDefaultInputChanged()
+    provider.incompleteDeviceIDs = [99]
+    await clock.advance(by: .seconds(1))
+
+    expect(provider.setCalls.isEmpty, "the nil deadline cannot restore from an incomplete snapshot")
+
+    provider.incompleteDeviceIDs = []
+    await clock.advance(by: .milliseconds(250))
+    await clock.advance(by: .milliseconds(999))
+    expect(provider.setCalls.isEmpty, "unknown time does not count toward nil confirmation")
+
+    await clock.advance(by: .milliseconds(1))
+    expect(provider.setCalls == [builtInMic.uid], "a new complete interval restores the still-available preferred")
+}
+
+@MainActor
+private func regressionNilRecoveryUsesUpdatedSettleDuration() async {
+    test("regression: missing-default recovery recomputes an updated settle deadline")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic], current: builtInMic,
+        preferred: builtInMic.uid, mode: .auto, settle: 2.0,
+        scheduler: clock
+    )
+
+    provider.current = nil
+    monitor.handleDefaultInputChanged()
+    await clock.advance(by: .milliseconds(800))
+    monitor.settleSeconds = 1.0
+    await clock.advance(by: .milliseconds(199))
+
+    expect(provider.setCalls.isEmpty, "the shortened interval still waits until the original evidence reaches its new deadline")
+
+    await clock.advance(by: .milliseconds(1))
+    expect(provider.setCalls == [builtInMic.uid], "the new duration is measured from the first valid nil observation")
 }
 
 @MainActor
