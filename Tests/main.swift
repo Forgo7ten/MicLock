@@ -29,6 +29,7 @@ print("MicLock v2 unit tests")
 print()
 
 await runAllTests()
+await runStateMachineRegressionTests()
 
 print()
 print("== \(passCount) passed, \(failCount) failed ==")
