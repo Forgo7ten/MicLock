@@ -30,6 +30,7 @@ print()
 
 await runAllTests()
 await runStateMachineRegressionTests()
+await runStateMachineAcceptanceTests()
 
 print()
 print("== \(passCount) passed, \(failCount) failed ==")
