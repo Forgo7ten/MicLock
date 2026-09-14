@@ -58,7 +58,7 @@ plutil -lint Info.plist            ← 校验 plist 语法
 
 与 App 相同的 Core/Services 源 + Tests/ 一起编译（不含 App 的 `@main`），产出独立可执行文件直跑。Fake 注入模拟 CoreAudio 与通知，不依赖真实音频设备；断言失败以非零退出码结束。
 
-`make test` 同时是 Core/Services 的 Swift 6 编译门禁：包括 OSLog 结构化消息构造在内的编译错误会在测试运行前直接失败。相关写法约束见[架构文档的 OSLog 日志构造约束](architecture.md#oslog-日志构造约束)。
+`make test` 同时是 Core/Services 的 Swift 6 编译门禁：包括 OSLog 结构化消息构造在内的编译错误会在测试运行前直接失败。相关写法约束见[架构文档的“构建、测试和调试”章节](architecture.md#构建测试和调试)。
 
 ## App 图标
 

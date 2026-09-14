@@ -56,7 +56,7 @@ Writer 是 AudioMonitor 内的可观测值类型，`lastError` 与 `protectionRe
 
 当前 UID 在异常期间出现 B→C→B 时，每次成功读取都推进 revision，旧 B 候选不会复活。保留的是最近一次真实变化的证据，不是旧截止时间。没有新变化、也没有既存合格候选时，恢复采样不会凭空开始学习。
 
-设备健康展示与可信策略快照分开：`devices` 可以展示 partial 中的健康设备；`trustedDevices` 保留最后完整快照。`nil` 表示尚无基线，空数组表示已成功采到空列表。首选尚未初始化时，每次可信采样都可以按“内置优先、否则当前”的规则补全，因此初次空列表不再结束初始化机会。
+设备健康展示与可信策略快照分开：`devices` 可以展示 partial 中的健康设备；`trustedDevices` 保留最后完整快照。`nil` 表示尚无基线，空数组表示已成功采到空列表。构造阶段的初始 UI 快照即使可信，也不会初始化首选；从 listener 安装后的 startup fresh sample 开始，后续可信采样在首选仍未初始化时，都可以按“内置优先、否则当前”的规则补全，因此初次空列表不再结束初始化机会。
 
 不完整采样不能建立新的拓扑事实或学习首选。但已经由可信拓扑建立的保护窗口仍然有效：只要 fresh current 明确偏离首选，就和 Manual 一样尝试恢复最后可信的目标，实际是否可写由 Provider 重新解析 UID 决定；失败进入已有退避，只有完整快照才能判定目标离线并取消。没有成功 current read 时，绝不使用缓存冒充新的恢复或确认依据。
 
@@ -92,4 +92,4 @@ Auto 仍是启发式：窗口内真正的用户外部切换可能被恢复，窗
 
 取消 pending 不会撤销 HAL 已接受的写入。最新目标确认以后，旧 setter 极晚生效，仍可能被当作新外部变化；这次瘦身没有声称解决 HAL 完成乱序。无 callback、无待处理任务的静默变化也不能立即感知。
 
-测试分为原有 `AudioMonitorTests.swift`、危险时序回归 `StateMachineRegressionTests.swift` 和重构验收 `StateMachineAcceptanceTests.swift`。新测试使用 Manual Scheduler，不增加真实 sleep。原有睡眠用例保留，另行迁移，避免把性能优化混进这次行为重构。
+测试覆盖原有 `AudioMonitorTests.swift`、危险时序回归 `StateMachineRegressionTests.swift`、重构验收 `StateMachineAcceptanceTests.swift`、`PostRefactorRegressionTests.swift`、`LiveAudioDeviceProviderTests.swift` 和 `SettingsBoundaryTests.swift`。时间敏感的 AudioMonitor/状态机测试使用 Manual Scheduler；Provider 与设置/通知边界测试使用各自的可控 fixture / continuation，不把新的 wall-clock sleep 引入这些回归。原有睡眠用例保留，另行迁移，避免把性能优化混进这次行为重构。

@@ -47,7 +47,7 @@ Devices 与 DefaultInput 是独立属性；连续读取不是原子事务。curr
 
 ## 启动与用户操作
 
-初始化只读取配置和初始 UI 快照。AppDelegate 完成启动后调用 `start()`，先安装监听，再重新采样并请求启动对齐；不再用监听安装前的旧 current 直接判断。`alignmentRequested` 仅保存“一个尚未完成的显式对齐请求”，用于对齐时采样失败后的恢复，不是第二套 topology 可信状态。
+初始化读取配置，并采一份用于 UI、current 与 topology 基线的初始快照；这次采样明确禁止初始化 `preferredMicrophoneUID` 或执行恢复。AppDelegate 完成启动后调用 `start()`，先安装监听，再重新采样并请求启动对齐；首选的首次初始化与启动恢复只依据 listener 安装后的 fresh sample，不再用监听安装前的旧 current 直接判断。`alignmentRequested` 仅保存“一个尚未完成的显式对齐请求”，用于对齐时采样失败后的恢复，不是第二套 topology 可信状态。
 
 打开保护或切到 Manual 会执行同样的 fresh 对齐；切到 Auto 保留首选，等待后续事件。模式切换、关闭保护和新的明确选择会取消旧逻辑写入与候选。保护窗口在模式改变时重置，不能携带旧模式下的判定进度。
 
@@ -82,7 +82,7 @@ make test
 make build
 ```
 
-`Tests/main.swift` 依次调用原有测试、新增危险时序回归和重构验收。新测试全部注入 `ManualAudioMonitorScheduler`；原有真实等待用例仍保留。回归测试覆盖本次重构前已确认存在的危险时序，并与最终实现一起作为持续回归门禁。
+`Tests/main.swift` 依次运行原有 `AudioMonitorTests`、危险时序回归、状态机验收、post-refactor 回归、真实 Provider 边界测试与设置/通知边界测试。时间敏感的 AudioMonitor/状态机测试通过 `ManualAudioMonitorScheduler` 确定性推进；Provider 与设置/通知边界测试使用各自的可控 fixture / continuation。原有真实等待用例仍保留。回归测试覆盖本次重构前已确认存在的危险时序，并与最终实现一起作为持续回归门禁。
 
 需要检查默认回调与设备回调先后变化、重复回调、部分拓扑、当前读取失败、A→B→C 快速选择、旧确认迟到、首选离线/重连、通知开关、模式切换、配置变更与 startup fresh read。对第三方 HAL 的真实行为仍须用 macOS 设备验证，Fake Provider 不等于硬件驱动。
 
@@ -93,6 +93,8 @@ OSLog 的带 privacy 插值仍必须是一个完整的消息字面量，不能�
 ## HAL 边界校验
 
 `CoreAudioPropertyAccess` 只封装 Provider 使用的三种 C 函数，生产实现直接调用系统，测试注入属性缓冲区；不增加业务状态或缓存。设备列表先检查分配长度，再按 `AudioObjectGetPropertyData` 返回的实际字节数截取，设备在两次调用间减少时不把未填充的尾部 0 当成设备。长度不对齐、结果超出原容量、成功却返回 nil/空 UID 等属于 `invalidPropertyData`，不能伪装为 OSStatus=0 的 API 失败。
+
+拓扑枚举中，Device UID 与 TransportType 都属于策略关键属性：任一读取失败或返回异常长度时，该设备不进入健康 `devices` 集合，并将本轮 snapshot 标记为 partial。设备名称只用于展示，读取失败可回退为 `Unknown`。`currentInputDevice()` 的身份判断只依赖 UID，因此其中的 TransportType 仍为 best-effort；内置设备分类始终以完整 topology 中的 TransportType 为准。
 
 UID 与名称属性按 SDK 的 caller-owned CF 对象契约使用 `takeRetainedValue()` 接管返回引用；实际错误仍保留真实 OSStatus。写入前使用 `kAudioHardwarePropertyTranslateUIDToDevice` 每次重新解析 UID，返回 unknown 才表示未找到，不再遍历所有无关设备。解析后到 setter 之间仍可能发生拔出，因此 setter 错误必须照常处理；这不是 HAL 原子事务。
 

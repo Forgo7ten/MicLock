@@ -1,7 +1,6 @@
 import Foundation
 
 // Black-box contract tests: no private state, no wall-clock sleeps.
-// This first commit intentionally fails on 9b076a5. Apply the refactor next.
 @MainActor
 func runStateMachineRegressionTests() async {
     await regressionUnchangedWakeAfterTrustedTimeout()
