@@ -105,7 +105,8 @@ final class AudioMonitor {
     var currentDeviceName: String { currentDevice?.name ?? "Unknown" }
     var isPreferredMicrophoneAvailable: Bool { preferredDevice != nil }
     var offlinePreferredName: String? {
-        guard let trustedDevices,
+        guard deviceEnumerationError == nil,
+              let trustedDevices,
               let uid = preferredMicrophoneUID,
               !trustedDevices.contains(where: { $0.uid == uid }) else { return nil }
         return lastKnownDeviceNames[uid] ?? "Unknown device"

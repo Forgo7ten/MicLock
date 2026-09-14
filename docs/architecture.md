@@ -25,7 +25,7 @@ UI 仍是 `MicLockApp.swift` 中的菜单栏面板，以及 `SettingsView.swift`
 
 `preferredMicrophoneUID` 是持久化目标；`currentDevice` 是成功读取的实际当前设备，读取失败时只保留为 UI 缓存，不作成功确认。`currentRevision` 记录成功读取中实际发生的 UID 变化，不记录 callback 数量。
 
-`devices` 服务 UI，允许来自 partial snapshot；`trustedDevices` 服务策略，只有完整且与 current 一致的快照才能替换。后者用 nil 区分“尚无基线”，用空数组表示“成功读到空列表”，不再同时维护一份长期 `connectedUIDs` 集合。差集仅在采样时临时计算。
+`devices` 服务 UI，允许来自 partial snapshot；`trustedDevices` 服务策略，只有完整且与 current 一致的快照才能替换。后者用 nil 区分“尚无基线”，用空数组表示“成功读到空列表”，不再同时维护一份长期 `connectedUIDs` 集合。差集仅在采样时临时计算。离线标签属于强断言：只有最新联合采样有效时才能使用 `trustedDevices` 判定；partial 或失败期间即使保留旧可信快照，也不显示“未连接”。
 
 内置设备由 `TransportType == kAudioDeviceTransportTypeBuiltIn` 判断，不猜设备名。首选离线时保留 UID，最近已知名称继续跨启动保存。只有尚未选过首选时才执行内置优先初始化；保护关闭也允许完成这个初始化，但不会因此切换设备。
 

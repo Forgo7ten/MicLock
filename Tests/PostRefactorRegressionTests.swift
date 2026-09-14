@@ -8,6 +8,7 @@ func runPostRefactorRegressionTests() async {
     await testProtectingAutoDoesNotTrustPartialRemoval()
     testAvailabilityProjectionIsObservable()
     testUnknownTopologyDoesNotClaimPreferredOffline()
+    testOfflineProjectionRequiresLatestValidSample()
     testOfflineFailureClearsOnlyWhenItsTargetReturns()
     testOfflineFailureClearsWhenTargetReconnectsWithoutBecomingCurrent()
 }
@@ -42,6 +43,44 @@ private func testUnknownTopologyDoesNotClaimPreferredOffline() {
     monitor.handleDeviceListChanged()
 
     expect(monitor.offlinePreferredName == usbMic.name, "a trusted empty topology confirms the preferred device is offline")
+}
+
+@MainActor
+private func testOfflineProjectionRequiresLatestValidSample() {
+    test("review: stale trusted topology cannot claim preferred is offline")
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic], current: builtInMic,
+        preferred: usbMic.uid, protection: false,
+        scheduler: ManualAudioMonitorScheduler()
+    )
+    provider.devices = [builtInMic]
+    monitor.handleDeviceListChanged()
+    expect(monitor.offlinePreferredName == usbMic.name, "a complete topology confirms USB is offline")
+
+    provider.devices = [builtInMic, usbMic]
+    provider.current = usbMic
+    provider.incompleteDeviceIDs = [99]
+    monitor.handleDeviceListChanged()
+
+    expect(monitor.devices.contains(where: { $0.uid == usbMic.uid }), "partial UI devices can already include USB")
+    expect(monitor.currentDevice?.uid == usbMic.uid, "fresh current can already be USB during a partial sample")
+    expect(monitor.deviceEnumerationError != nil, "partial sampling exposes unknown availability")
+    expect(monitor.offlinePreferredName == nil, "partial sampling cannot reuse stale topology to claim USB is offline")
+
+    provider.incompleteDeviceIDs = []
+    provider.devices = [builtInMic]
+    provider.current = builtInMic
+    monitor.handleDeviceListChanged()
+    expect(monitor.offlinePreferredName == usbMic.name, "a new complete topology may confirm USB is offline again")
+
+    provider.listInputDevicesError = AudioDeviceProviderError.coreAudio(
+        operation: .enumerateDeviceListData, objectID: nil, status: -1
+    )
+    provider.current = usbMic
+    monitor.handleDefaultInputChanged()
+
+    expect(monitor.currentDevice?.uid == usbMic.uid, "current can recover USB while enumeration fails")
+    expect(monitor.offlinePreferredName == nil, "enumeration failure cannot reuse stale topology to claim USB is offline")
 }
 
 @MainActor
