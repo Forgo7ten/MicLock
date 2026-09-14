@@ -69,7 +69,7 @@ Writer 是 AudioMonitor 内的可观测值类型，`lastError` 与 `protectionRe
 
 ## 写入确认与重试
 
-Trusted 选择保留原有 latest-wins：新点击立即取代旧逻辑请求，并发出新 setter。500ms 后对最新目标重试一次，再给 500ms 确认窗口；仍未确认则结束，保存新首选并显示确认失败。之后真实 current 到达该首选时清除超时错误。Manual 会在 Trusted 结束后恢复其严格保护策略。
+Trusted 选择保留原有 latest-wins：新点击立即取代旧逻辑请求，并发出新 setter。500ms 后对最新目标重试一次，再给 500ms 确认窗口；仍未确认则结束，保存新首选并显示确认失败。首次 setter 直接被 HAL 拒绝时，该 Trusted command 当场结束、旧 Preferred 不变；AudioMonitor 随后执行一次普通 policy reconcile，使 Manual 或仍成立的 Auto protection 重新建立自己的 Protection writer，但不会复活已被用户意图取消的旧 alignment。之后真实 current 到达该首选时清除超时错误。Manual 会在 Trusted 结束后恢复其严格保护策略。
 
 Protection 继续按 0.5、1、2、4、8、16、32、64 秒退避，之后保持最长 64 秒。setter 拒绝与“接受但尚未确认”分别显示。重试请求无论被接受或拒绝，都不延长 Auto 保护窗口；只有真实确认恢复成功时，才从确认时刻重新开启一次窗口，以保护紧接着的再次抢麦。
 

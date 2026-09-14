@@ -49,7 +49,7 @@ Devices 与 DefaultInput 是独立属性；连续读取不是原子事务。curr
 
 初始化读取配置，并采一份用于 UI、current 与 topology 基线的初始快照；这次采样明确禁止初始化 `preferredMicrophoneUID` 或执行恢复。AppDelegate 完成启动后调用 `start()`，先安装监听，再重新采样并请求启动对齐；首选的首次初始化与启动恢复只依据 listener 安装后的 fresh sample，不再用监听安装前的旧 current 直接判断。`alignmentRequested` 仅保存“一个尚未完成的显式对齐请求”，用于对齐时采样失败后的恢复，不是第二套 topology 可信状态。
 
-打开保护或切到 Manual 会执行同样的 fresh 对齐；切到 Auto 保留首选，等待后续事件。模式切换、保护开关变化和新的明确选择会取消旧逻辑写入、候选、缺失默认输入防抖与尚未完成的显式对齐。保护窗口在模式改变时重置，不能携带旧模式下的判定进度；Auto 在保护关闭时仍记录可信 topology 变化，保护开关本身不会清掉尚未过期的窗口。
+打开保护或切到 Manual 会执行同样的 fresh 对齐；切到 Auto 保留首选，等待后续事件。模式切换、保护开关变化和新的明确选择会取消旧逻辑写入、候选、缺失默认输入防抖与尚未完成的显式对齐。显式选择的 Trusted setter 若首次即被 CoreAudio 拒绝，该用户命令立即结束并保留原 Preferred，随后只执行一次普通 reconcile：不会恢复已经被新用户意图 supersede 的旧 alignment，也不会让 Auto stable 仅凭 current != preferred 强制恢复；但 Manual 或仍有效的 Auto protection window 可以基于当前 fresh state 建立新的 Protection writer，避免失败的用户选择让既有保护永久失去执行者。保护窗口在模式改变时重置，不能携带旧模式下的判定进度；Auto 在保护关闭时仍记录可信 topology 变化，保护开关本身不会清掉尚未过期的窗口。
 
 选择设备先 fresh-read current，已经使用该设备时直接更新首选、不重复 setter。否则进入统一 `submitWrite()`；首次 setter 拒绝时选择失败，接受后保存新首选，真实确认前不伪造 current 或成功事件。
 

@@ -12,6 +12,9 @@ func runStateMachineRegressionTests() async {
     await regressionProtectionEnabledAfterTopologyChange()
     await regressionModeSwitchCancelsDeferredAlignment()
     await regressionSelectionCancelsDeferredAlignment()
+    await regressionRejectedTrustedSelectionResumesManualProtection()
+    await regressionRejectedTrustedSelectionResumesActiveAutoProtection()
+    regressionRejectedTrustedSelectionDoesNotForceStableAutoAlignment()
     await regressionNilProtectionSourceCanBeSuperseded()
     await regressionFirstBaselineCannotReviveAlignment()
     await regressionPostSetterThirdCurrentRemainsEvidence()
@@ -97,6 +100,94 @@ private func regressionSelectionCancelsDeferredAlignment() async {
 
     expect(provider.setCalls == [airpodsMic.uid], "recovery cannot execute the superseded alignment")
     expect(monitor.lastError == "Unable to set default input device", "recovery preserves the explicit selection failure")
+}
+
+@MainActor
+private func regressionRejectedTrustedSelectionResumesManualProtection() async {
+    test("regression: rejected trusted selection resumes Manual protection")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic, airpodsMic], current: builtInMic,
+        preferred: builtInMic.uid, mode: .manual, scheduler: clock
+    )
+
+    provider.forceSetFailure = true
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls == [builtInMic.uid], "Manual starts the original protection restore")
+    expect(monitor.protectionRetryState == .setterRejected, "the original protection transaction is retryable")
+
+    monitor.selectDevice(usbMic)
+
+    expect(
+        provider.setCalls == [builtInMic.uid, usbMic.uid, builtInMic.uid],
+        "rejected trusted selection immediately re-enters Manual protection"
+    )
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "rejected explicit selection keeps the previous preferred")
+    expect(monitor.currentDevice?.uid == airpodsMic.uid, "failed writes do not fabricate a current-device change")
+    expect(monitor.protectionRetryState == .setterRejected, "Manual protection owns a new retryable writer after the trusted rejection")
+
+    provider.forceSetFailure = false
+    await clock.advance(by: .milliseconds(500))
+
+    expect(
+        provider.setCalls == [builtInMic.uid, usbMic.uid, builtInMic.uid, builtInMic.uid],
+        "the replacement Manual protection writer retries normally"
+    )
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "Manual eventually restores the old preferred after HAL recovers")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "the failed trusted selection never changes preferred")
+}
+
+@MainActor
+private func regressionRejectedTrustedSelectionResumesActiveAutoProtection() async {
+    test("regression: rejected trusted selection resumes active Auto protection")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic], current: builtInMic,
+        preferred: builtInMic.uid, mode: .auto, settle: 2.0, scheduler: clock
+    )
+
+    provider.forceSetFailure = true
+    provider.devices.append(airpodsMic)
+    provider.current = airpodsMic
+    monitor.handleDeviceListChanged()
+
+    expect(provider.setCalls == [builtInMic.uid], "Auto protection starts the original restore")
+    expect(monitor.protectionRetryState == .setterRejected, "the original Auto protection restore remains retryable")
+
+    monitor.selectDevice(usbMic)
+
+    expect(
+        provider.setCalls == [builtInMic.uid, usbMic.uid, builtInMic.uid],
+        "rejected trusted selection re-enters the still-active Auto protection window"
+    )
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "rejected trusted selection keeps the old preferred")
+    expect(monitor.protectionRetryState == .setterRejected, "Auto protection establishes a replacement retryable writer")
+
+    provider.forceSetFailure = false
+    await clock.advance(by: .milliseconds(500))
+
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "replacement Auto protection eventually restores preferred")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "failed USB selection never becomes preferred")
+}
+
+@MainActor
+private func regressionRejectedTrustedSelectionDoesNotForceStableAutoAlignment() {
+    test("regression: rejected trusted selection does not force stable Auto alignment")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic, airpodsMic], current: usbMic,
+        preferred: builtInMic.uid, mode: .auto, settle: 2.0, scheduler: clock
+    )
+
+    provider.forceSetFailure = true
+    monitor.selectDevice(airpodsMic)
+
+    expect(provider.setCalls == [airpodsMic.uid], "rejected selection does not manufacture an Auto restore")
+    expect(monitor.currentDevice?.uid == usbMic.uid, "stable Auto keeps the actually observed current device")
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "rejected selection keeps the previous preferred")
+    expect(monitor.protectionRetryState == nil, "stable Auto does not create a protection writer without a protection decision")
 }
 
 @MainActor

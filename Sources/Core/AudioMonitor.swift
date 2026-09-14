@@ -467,6 +467,11 @@ final class AudioMonitor {
 
     // MARK: - One write path, two bounded/persistent retry policies
 
+    private enum WriteSubmissionResult {
+        case continueNormally
+        case trustedSelectionRejected
+    }
+
     func selectDevice(_ device: AudioInputDevice) {
         cancelSupersededWork()
         let fresh: CurrentObservation?
@@ -488,7 +493,11 @@ final class AudioMonitor {
             return
         }
         writer.begin(target: device, source: fresh?.device, origin: .trustedSelection, shouldNotify: false)
-        submitWrite(initial: true)
+        if case .trustedSelectionRejected = submitWrite(initial: true) {
+            // The failed Trusted command no longer owns the current state.
+            // Re-run ordinary policy without reviving superseded alignment.
+            reconcile()
+        }
     }
 
     private func restore(_ preferred: AudioInputDevice, reason: RestoreReason) {
@@ -502,8 +511,9 @@ final class AudioMonitor {
         submitWrite(initial: true)
     }
 
-    private func submitWrite(initial: Bool) {
-        guard let request = writer.pending else { return }
+    @discardableResult
+    private func submitWrite(initial: Bool) -> WriteSubmissionResult {
+        guard let request = writer.pending else { return .continueNormally }
         let accepted: Bool
         do {
             try provider.setInputDevice(uid: request.target.uid)
@@ -514,17 +524,22 @@ final class AudioMonitor {
         }
         writer.submitted(accepted: accepted, initial: initial)
         AudioMonitorDiagnostics.trace("WRITE_SUBMIT id=\(request.id) target=\(request.target.uid) attempt=\(request.retryAttempt) accepted=\(accepted)")
+
+        if !accepted, initial, request.origin == .trustedSelection {
+            return .trustedSelectionRejected
+        }
+
         // Retain existing UX: only an accepted explicit selection changes the
         // stored preference; real current and success events still need a read.
         if accepted && initial && request.origin == .trustedSelection {
             preferredMicrophoneUID = request.target.uid
         }
-        guard writer.pending != nil else { return }
+        guard writer.pending != nil else { return .continueNormally }
         do {
             let observation = try readCurrent()
             if let completed = writer.observe(observation.device) {
                 finishWrite(completed)
-                return
+                return .continueNormally
             }
         } catch {
             deviceEnumerationError = "Unable to read current input device"
@@ -534,6 +549,7 @@ final class AudioMonitor {
         }
         // Crucially, accepted writes/retries do NOT extend the Auto window.
         scheduleWatchdog()
+        return .continueNormally
     }
 
     /// Returns true only when this watchdog actually submitted another HAL write.
