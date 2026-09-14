@@ -93,6 +93,7 @@ final class AudioMonitor {
     // nil is an unknown baseline, [] is a successfully sampled empty topology.
     private var trustedDevices: [AudioInputDevice]?
     @ObservationIgnored private var currentRevision: UInt64 = 0
+    private var hasSuccessfulCurrentObservation = false
     @ObservationIgnored private var alignmentRequested = false
     @ObservationIgnored private var listenersInstalled = false
     @ObservationIgnored private var lastKnownDeviceNames: [String: String]
@@ -114,7 +115,12 @@ final class AudioMonitor {
     private var preferredDevice: AudioInputDevice? {
         trustedDevices?.first { $0.uid == preferredMicrophoneUID }
     }
-    var currentDeviceName: String { currentDevice?.name ?? "Unknown" }
+    var currentDeviceName: String {
+        if let currentDevice {
+            return currentDevice.name
+        }
+        return hasSuccessfulCurrentObservation ? "无默认输入" : "Unknown"
+    }
     var isPreferredMicrophoneAvailable: Bool { preferredDevice != nil }
     var offlinePreferredName: String? {
         guard deviceEnumerationError == nil,
@@ -197,6 +203,7 @@ final class AudioMonitor {
     /// made by a setter/watchdog. Those reads do not automatically start learning.
     private func readCurrent() throws -> CurrentObservation {
         let device = try provider.currentInputDevice()
+        hasSuccessfulCurrentObservation = true
         let changed = currentRevision != 0 && device?.uid != currentDevice?.uid
         if changed || currentRevision == 0 { currentRevision &+= 1 }
         currentDevice = device

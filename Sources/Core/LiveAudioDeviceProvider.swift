@@ -257,8 +257,15 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
         guard status == noErr else { return nil }
 
         let object = value?.takeRetainedValue()
-        guard size == UInt32(MemoryLayout<CFTypeRef?>.size) else { return nil }
-        return object as String?
+        guard size == UInt32(MemoryLayout<CFTypeRef?>.size),
+              let object
+        else {
+            return nil
+        }
+
+        let name = object as String
+        guard !name.isEmpty else { return nil }
+        return name
     }
 
     private func requiredTransportType(_ deviceID: AudioDeviceID) throws -> UInt32 {

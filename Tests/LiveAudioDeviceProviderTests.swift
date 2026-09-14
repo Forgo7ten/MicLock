@@ -10,6 +10,7 @@ private final class PropertyFixture {
     var uid: String? = "test-device-10"
     var uidStatus: OSStatus = noErr
     var uidSize = UInt32(MemoryLayout<CFTypeRef?>.size)
+    var name: String? = "Test Microphone"
     var nameStatus: OSStatus = noErr
     var translatedID: AudioDeviceID = 10
     var translationStatus: OSStatus = noErr
@@ -55,7 +56,7 @@ private final class PropertyFixture {
             case kAudioObjectPropertyName:
                 guard nameStatus == noErr else { return nameStatus }
                 data.assumingMemoryBound(to: Unmanaged<CFString>?.self).pointee =
-                    .passRetained("Test Microphone" as CFString)
+                    name.map { .passRetained($0 as CFString) }
                 size.pointee = UInt32(MemoryLayout<CFTypeRef?>.size)
             case kAudioDevicePropertyTransportType:
                 guard transportStatus == noErr else { return transportStatus }
@@ -163,6 +164,30 @@ func runLiveAudioDeviceProviderTests() {
         }
     } catch {
         expect(false, "display-only name failure must remain non-fatal: \(error)")
+    }
+
+    test("provider: empty name uses unresolved fallback")
+    let emptyName = PropertyFixture()
+    emptyName.name = ""
+    do {
+        let instance = LiveAudioDeviceProvider(access: emptyName.access)
+        let snapshot = try instance.listInputDevices()
+        expect(snapshot.isComplete, "empty display name must not make topology partial")
+        if let device = snapshot.devices.first {
+            expect(device.name == "Unknown (10)", "empty topology name uses fallback text")
+            expect(!device.nameIsResolved, "empty topology name is not treated as resolved")
+        } else {
+            expect(false, "empty name must not remove an otherwise healthy input device")
+        }
+
+        if let current = try instance.currentInputDevice() {
+            expect(current.name == "Unknown", "empty current name uses fallback text")
+            expect(!current.nameIsResolved, "empty current name is not treated as resolved")
+        } else {
+            expect(false, "empty name must not hide the current input device")
+        }
+    } catch {
+        expect(false, "empty display name must remain non-fatal: \(error)")
     }
 
     test("provider: transport failure makes topology partial")

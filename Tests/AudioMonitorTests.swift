@@ -70,6 +70,8 @@ func runAllTests() async {
     await testFreshInstallEnumerationFailureWithNilCurrentPrefersBuiltIn()
     testIdempotentCallbacks()
     testFirstRunDefaultSelection()
+    testCurrentDeviceNameShowsNoDefaultInputAfterSuccessfulNilRead()
+    await testCurrentDeviceNameDistinguishesUnknownFromSuccessfulNil()
     testDeviceNamePersistence()
     testPreferencesFreshInstall()
     testPreferencesSettleClamp()
@@ -2106,6 +2108,68 @@ private func testFirstRunDefaultSelection() {
     monitor.evaluateStartupPolicy()
 
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "first run prefers built-in mic")
+}
+
+@MainActor
+private func testCurrentDeviceNameShowsNoDefaultInputAfterSuccessfulNilRead() {
+    test("current presentation: successful nil read means no default input")
+
+    let (monitor, _, _) = makeMonitor(
+        devices: [builtInMic],
+        current: nil,
+        preferred: builtInMic.uid,
+        mode: .auto,
+        protection: false
+    )
+
+    expect(monitor.currentDevice == nil, "provider successfully reports no default input")
+    expect(
+        monitor.currentDeviceName == "无默认输入",
+        "successful nil current is presented as no default input instead of Unknown"
+    )
+}
+
+@MainActor
+private func testCurrentDeviceNameDistinguishesUnknownFromSuccessfulNil() async {
+    test("current presentation: unreadable current is distinct from successful nil")
+
+    let suite = "MicLockTests.current-presentation.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.removePersistentDomain(forName: suite)
+    defaults.set(builtInMic.uid, forKey: Preferences.preferredMicrophoneUIDKey)
+    defaults.set(false, forKey: Preferences.protectionEnabledKey)
+    defaults.set(ProtectionMode.auto.rawValue, forKey: Preferences.protectionModeKey)
+    defaults.set(1.0, forKey: Preferences.settleSecondsKey)
+
+    let clock = ManualAudioMonitorScheduler()
+    let provider = FakeAudioDeviceProvider()
+    provider.devices = [builtInMic]
+    provider.current = nil
+    provider.currentInputDeviceError = AudioDeviceProviderError.coreAudio(
+        operation: .queryDefaultInputDevice,
+        objectID: nil,
+        status: -1
+    )
+
+    let monitor = AudioMonitor(
+        provider: provider,
+        preferences: Preferences(defaults: defaults),
+        notifier: RecordingNotifier(),
+        scheduler: clock
+    )
+
+    expect(monitor.currentDevice == nil, "failed initial read has no current cache")
+    expect(monitor.currentDeviceName == "Unknown", "failed read remains unknown")
+
+    monitor.evaluateStartupPolicy()
+    provider.currentInputDeviceError = nil
+    await clock.advance(by: .milliseconds(250))
+
+    expect(monitor.currentDevice == nil, "recovery successfully observes explicit nil current")
+    expect(
+        monitor.currentDeviceName == "无默认输入",
+        "fresh successful nil observation updates presentation"
+    )
 }
 
 // MARK: - Preferences (§39-§40)

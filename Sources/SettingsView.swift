@@ -228,7 +228,7 @@ private struct AdvancedSettingsView: View {
                         .frame(minWidth: 52, alignment: .trailing)
                 }
 
-                Text("该时间同时用于设备接入或移除后的保护窗口，以及 Auto Mode 对稳定状态外部切换的确认窗口。保护窗口内的拓扑相关切换会被恢复；稳定状态下的外部切换持续保持该时长后，才会被接受为新的首选。")
+                Text("该时间同时用于设备接入或移除后的保护窗口、Auto Mode 对稳定状态外部切换的确认窗口，以及默认输入持续缺失时的恢复等待。保护窗口内的拓扑相关切换会被恢复；稳定状态下的外部切换持续保持该时长后，才会被接受为新的首选；默认输入持续为空达到该时长后，才会尝试恢复首选麦克风。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
