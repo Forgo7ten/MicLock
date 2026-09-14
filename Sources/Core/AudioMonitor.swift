@@ -46,8 +46,16 @@ final class AudioMonitor {
             preferences.protectionMode = protectionMode
             cancelSupersededWork()
             policy.reset()
-            // Auto waits for subsequent observations; Manual immediately aligns.
-            if protectionMode == .manual { evaluateStartupPolicy() }
+            if protectionMode == .manual {
+                // Manual mode is an explicit alignment request.
+                evaluateStartupPolicy()
+            } else if protectionEnabled {
+                // Auto only re-enters ordinary policy after superseding old
+                // Manual work. This is NOT an alignment request: a stable
+                // non-nil mismatch still needs real change evidence, while a
+                // trusted nil current may start missing-default debounce.
+                reconcile()
+            }
         }
     }
 

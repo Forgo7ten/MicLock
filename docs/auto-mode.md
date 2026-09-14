@@ -75,7 +75,7 @@ Protection 继续按 0.5、1、2、4、8、16、32、64 秒退避，之后保持
 
 保留既有的 Protection 第三状态规则：当前还是起始 source 时，等待/重试；真实 current 到达另一个非 target 设备时，可以结束旧 restore 并重新运行策略。Request 的 source 与当前非 target 设备不同，本身可以保留“本次请求生命周期内发生过变化”的候选资格，即使 setter 后的 confirmation read 已经先消费了 revision 变化；这仍是产品启发式，不是可靠的写入来源证明。拓扑不可信时也不能提交学习。
 
-关闭保护、切换模式、MicLock 的更新选择会取消逻辑请求、尚未完成的显式对齐、缺失默认输入防抖及其 timer/watchdog。目标离线只有在完整可信快照中才能确认。成功的 fresh current 等于目标可以独立确认写入，即使同次枚举失败；缓存碰巧等于目标不能确认。
+关闭保护、切换模式、MicLock 的更新选择会先取消逻辑请求、尚未完成的显式对齐、缺失默认输入防抖及其 timer/watchdog。切到 Auto 且保护开启时，取消旧工作后立即执行一次普通 fresh reconcile；这不是 alignment，不会仅凭 `current != preferred` 强制恢复，但可信的 `current == nil` 可以据此重新开始 missing-default debounce。目标离线只有在完整可信快照中才能确认。成功的 fresh current 等于目标可以独立确认写入，即使同次枚举失败；缓存碰巧等于目标不能确认。
 
 ## 通知：独立冷却，不再绑定 episode
 

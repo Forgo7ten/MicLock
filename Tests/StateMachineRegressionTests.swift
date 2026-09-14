@@ -11,6 +11,7 @@ func runStateMachineRegressionTests() async {
     await regressionChangedCurrentDiscoveredByRecovery()
     await regressionProtectionEnabledAfterTopologyChange()
     await regressionModeSwitchCancelsDeferredAlignment()
+    await regressionSwitchingToAutoResumesMissingDefaultRecovery()
     await regressionSelectionCancelsDeferredAlignment()
     await regressionRejectedTrustedSelectionResumesManualProtection()
     await regressionRejectedTrustedSelectionResumesActiveAutoProtection()
@@ -75,6 +76,61 @@ private func regressionModeSwitchCancelsDeferredAlignment() async {
 
     expect(provider.setCalls.isEmpty, "recovered sampling cannot execute alignment from the superseded Manual mode")
     expect(monitor.currentDevice?.uid == usbMic.uid, "Auto keeps the observed current input without new change evidence")
+}
+
+@MainActor
+private func regressionSwitchingToAutoResumesMissingDefaultRecovery() async {
+    test("regression: switching to Auto resumes missing-default recovery after cancelling Manual restore")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic], current: builtInMic,
+        preferred: builtInMic.uid, mode: .manual, settle: 1.0,
+        scheduler: clock
+    )
+
+    // Manual observes a real missing default input and starts a Protection
+    // restore. Keep the first setter accepted-but-unconfirmed so there is an
+    // active writer/watchdog for the mode switch to supersede.
+    provider.applySetImmediately = false
+    provider.current = nil
+    monitor.handleDefaultInputChanged()
+
+    expect(
+        provider.setCalls == [builtInMic.uid],
+        "Manual starts a restore when the default input disappears"
+    )
+    expect(
+        monitor.currentDevice == nil,
+        "the fresh Manual observation records the missing default input"
+    )
+
+    // Switching mode intentionally cancels the old Manual writer/watchdog.
+    // Auto must then re-sample ordinary policy and start its own nil debounce,
+    // rather than leaving the system with no future work.
+    monitor.protectionMode = .auto
+    provider.applySetImmediately = true
+
+    await clock.advance(by: .milliseconds(999))
+
+    expect(
+        provider.setCalls == [builtInMic.uid],
+        "Auto does not bypass the missing-default settle window"
+    )
+
+    await clock.advance(by: .milliseconds(1))
+
+    expect(
+        provider.setCalls == [builtInMic.uid, builtInMic.uid],
+        "sustained nil starts one fresh Auto restore after the settle deadline"
+    )
+    expect(
+        monitor.currentDevice?.uid == builtInMic.uid,
+        "the fresh Auto restore is confirmed by the actual current input"
+    )
+    expect(
+        monitor.preferredMicrophoneUID == builtInMic.uid,
+        "switching modes never changes Preferred"
+    )
 }
 
 @MainActor
