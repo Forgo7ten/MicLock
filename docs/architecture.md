@@ -97,3 +97,9 @@ OSLog 的带 privacy 插值仍必须是一个完整的消息字面量，不能�
 UID 与名称属性按 SDK 的 caller-owned CF 对象契约使用 `takeRetainedValue()` 接管返回引用；实际错误仍保留真实 OSStatus。写入前使用 `kAudioHardwarePropertyTranslateUIDToDevice` 每次重新解析 UID，返回 unknown 才表示未找到，不再遍历所有无关设备。解析后到 setter 之间仍可能发生拔出，因此 setter 错误必须照常处理；这不是 HAL 原子事务。
 
 `LiveAudioDeviceProviderTests.swift` 直接运行真实 Provider 的解析、长度与错误处理，用可控 C 函数替代真实硬件。它不能代替 macOS ABI、驱动及 Instruments 内存验收。
+
+## 配置与通知授权生命周期
+
+空字符串 UID 视为未设置，不把它显示成一个永久离线的设备；非空 UID 保持原样，不 trim、不改写。非有限的 settle 数值统一回退到默认 2 秒，普通数值仍钳制在 1–30 秒，UI 与持久化共用同一校验。
+
+启动延迟授权和通知开关使用同一个可取消任务。关闭通知或发出新请求时取消旧任务；读取系统授权状态后的取消检查阻止过时请求继续弹出授权框，返回结果后的检查阻止旧结果覆盖 UI。已经向系统发出的授权弹窗无法撤回，此修复不承诺关闭开关就关闭系统弹窗。测试使用可控 continuation 验证取消及过时结果，不引入额外真实 sleep。

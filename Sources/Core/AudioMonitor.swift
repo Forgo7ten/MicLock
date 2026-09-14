@@ -54,9 +54,7 @@ final class AudioMonitor {
         didSet {
             guard notificationsEnabled != oldValue else { return }
             preferences.notificationsEnabled = notificationsEnabled
-            if notificationsEnabled {
-                Task { [weak self] in await self?.refreshNotificationAuthorization() }
-            }
+            scheduleNotificationAuthorization()
         }
     }
 
@@ -67,8 +65,7 @@ final class AudioMonitor {
             // Expire using the OLD duration before extending configuration, so
             // an already expired protection window cannot be resurrected.
             _ = policy.isProtecting(at: scheduler.now, interval: settleInterval)
-            let value = newValue.isFinite ? newValue : 2
-            configuredSettleSeconds = min(max(value, Preferences.settleRange.lowerBound), Preferences.settleRange.upperBound)
+            configuredSettleSeconds = Preferences.clamp(newValue)
             preferences.settleSeconds = configuredSettleSeconds
             scheduleCandidate()
         }
@@ -95,6 +92,7 @@ final class AudioMonitor {
     @ObservationIgnored private var watchdogTask: AudioMonitorScheduledTask?
     @ObservationIgnored private var recoveryTask: AudioMonitorScheduledTask?
     @ObservationIgnored private var recoveryAttempt = 0
+    @ObservationIgnored private var authorizationTask: Task<Void, Never>?
 
     private static let recoveryDelays: [Duration] = [
         .milliseconds(250), .milliseconds(500), .seconds(1), .seconds(2),
@@ -125,14 +123,16 @@ final class AudioMonitor {
         protectionEnabled = preferences.protectionEnabled
         protectionMode = preferences.protectionMode
         notificationsEnabled = preferences.notificationsEnabled
-        let duration = preferences.settleSeconds
-        configuredSettleSeconds = duration.isFinite ? duration : 2
+        configuredSettleSeconds = preferences.settleSeconds
         lastKnownDeviceNames = preferences.lastKnownDeviceNames
         // Initial UI snapshot only. start() always samples AGAIN after listeners.
         _ = sample(scheduleRecovery: false)
     }
 
-    deinit { listeners.remove() }
+    deinit {
+        listeners.remove()
+        authorizationTask?.cancel()
+    }
 
     static func live() -> AudioMonitor {
         AudioMonitor(provider: LiveAudioDeviceProvider(), preferences: Preferences(), notifier: NotificationManager.shared)
@@ -150,11 +150,7 @@ final class AudioMonitor {
             }
             listenersInstalled = true
             listenerError = nil
-            Task { [weak self] in
-                try? await Task.sleep(for: .milliseconds(500))
-                guard !Task.isCancelled else { return }
-                await self?.refreshNotificationAuthorization()
-            }
+            scheduleNotificationAuthorization(after: .milliseconds(500))
         }
         evaluateStartupPolicy()
     }
@@ -531,10 +527,22 @@ final class AudioMonitor {
 
     // MARK: - Presentation and diagnostics
 
+    private func scheduleNotificationAuthorization(after delay: Duration = .zero) {
+        authorizationTask?.cancel()
+        authorizationTask = nil
+        guard notificationsEnabled else { return }
+        authorizationTask = Task { [weak self] in
+            if delay > .zero {
+                do { try await Task.sleep(for: delay) } catch { return }
+            }
+            await self?.refreshNotificationAuthorization()
+        }
+    }
+
     func refreshNotificationAuthorization() async {
-        guard notificationsEnabled else { return }
+        guard notificationsEnabled, !Task.isCancelled else { return }
         let state = await notifier.ensureAuthorization()
-        guard notificationsEnabled else { return }
+        guard notificationsEnabled, !Task.isCancelled else { return }
         notificationDenied = state == .denied
     }
 
