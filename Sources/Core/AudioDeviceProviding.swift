@@ -6,6 +6,7 @@ enum AudioDeviceProviderOperation: String {
     case enumerateDeviceListData
     case queryInputStreams
     case queryDeviceUID
+    case translateDeviceUID
     case queryDefaultInputDevice
     case setDefaultInputDevice
 }
@@ -17,7 +18,7 @@ enum AudioDeviceProviderError: Error, CustomStringConvertible {
         status: OSStatus
     )
     case targetDeviceNotFound(uid: String)
-    case targetDeviceLookupIncomplete(uid: String, incompleteDeviceIDs: [AudioDeviceID])
+    case invalidPropertyData(operation: AudioDeviceProviderOperation, objectID: AudioObjectID, detail: String)
 
     var description: String {
         switch self {
@@ -26,8 +27,8 @@ enum AudioDeviceProviderError: Error, CustomStringConvertible {
             return "\(operation.rawValue) failed (object=\(object), OSStatus=\(status))"
         case .targetDeviceNotFound(let uid):
             return "target device not found (uid=\(uid))"
-        case .targetDeviceLookupIncomplete(let uid, let incompleteDeviceIDs):
-            return "target lookup incomplete (uid=\(uid), unreadableDeviceIDs=\(incompleteDeviceIDs))"
+        case .invalidPropertyData(let operation, let objectID, let detail):
+            return "\(operation.rawValue) returned invalid data (object=\(objectID), \(detail))"
         }
     }
 }

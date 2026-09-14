@@ -89,3 +89,11 @@ make build
 `MICLOCK_DEBUG=1` 将关键日志写 stderr；`MICLOCK_TRACE_PATH` 写 trace 文件。日志包括采样 revision、changed/valid、当前/首选/待确认目标、写入尝试和确认、事件与 provider 错误。trace 仅在主 actor 调用，因此删除旧的 NSLock；文件写入失败不会影响保护策略。
 
 OSLog 的带 privacy 插值仍必须是一个完整的消息字面量，不能用字符串 `+` 拼接。统一日志的 subsystem 仍为 `lee.miclock.app`；不要把调试输出当成设备变化事实来源。
+
+## HAL 边界校验
+
+`CoreAudioPropertyAccess` 只封装 Provider 使用的三种 C 函数，生产实现直接调用系统，测试注入属性缓冲区；不增加业务状态或缓存。设备列表先检查分配长度，再按 `AudioObjectGetPropertyData` 返回的实际字节数截取，设备在两次调用间减少时不把未填充的尾部 0 当成设备。长度不对齐、结果超出原容量、成功却返回 nil/空 UID 等属于 `invalidPropertyData`，不能伪装为 OSStatus=0 的 API 失败。
+
+UID 与名称属性按 SDK 的 caller-owned CF 对象契约使用 `takeRetainedValue()` 接管返回引用；实际错误仍保留真实 OSStatus。写入前使用 `kAudioHardwarePropertyTranslateUIDToDevice` 每次重新解析 UID，返回 unknown 才表示未找到，不再遍历所有无关设备。解析后到 setter 之间仍可能发生拔出，因此 setter 错误必须照常处理；这不是 HAL 原子事务。
+
+`LiveAudioDeviceProviderTests.swift` 直接运行真实 Provider 的解析、长度与错误处理，用可控 C 函数替代真实硬件。它不能代替 macOS ABI、驱动及 Instruments 内存验收。

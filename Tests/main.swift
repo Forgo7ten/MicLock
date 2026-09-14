@@ -32,6 +32,7 @@ await runAllTests()
 await runStateMachineRegressionTests()
 await runStateMachineAcceptanceTests()
 await runPostRefactorRegressionTests()
+runLiveAudioDeviceProviderTests()
 
 print()
 print("== \(passCount) passed, \(failCount) failed ==")
