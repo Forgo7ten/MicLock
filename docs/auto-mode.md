@@ -28,6 +28,8 @@ considering(Candidate)
 
 `protecting` 表示最近一次可信拓扑变化或已经确认的恢复之后的保护窗口。截止时间由 `since + settleSeconds` 推导；不再存两份时间，也不需要专门的 settle timer、episode ID 或 revision。下一次实际决策按单调时钟判断是否到期。修改配置前先按旧时长结算，避免延长配置把已经结束的窗口重新激活。
 
+Auto 在保护关闭时仍记录可信 topology 变化建立的窗口，但不执行恢复或学习；重新开启保护不会清掉尚未过期的窗口，因此设备接入后的延迟系统切换仍会受到保护。
+
 `considering` 表示已有一次合格的新变化，正在确认能否学习。Candidate 只保存 current 的 `revision`、旧首选 UID/名称、新设备以及 `validSince`。保护窗口与候选不能同时存在。
 
 ### DefaultInputWriter：一笔逻辑写入
@@ -70,7 +72,7 @@ Protection 继续按 0.5、1、2、4、8、16、32、64 秒退避，之后保持
 
 保留既有的 Protection 第三状态规则：当前还是起始 source 时，等待/重试；真实 current 到达另一个非 target 设备时，可以结束旧 restore 并重新运行策略。只有本轮确实观察到新的 UID 变化，才有资格成为 Auto 候选。`sourceUID` 因这一兼容规则保留，不伪装成可靠的外部写入来源证明。拓扑不可信时也不能提交学习。
 
-关闭保护、切换模式、MicLock 的更新选择会取消逻辑请求及其 watchdog。目标离线只有在完整可信快照中才能确认。成功的 fresh current 等于目标可以独立确认写入，即使同次枚举失败；缓存碰巧等于目标不能确认。
+关闭保护、切换模式、MicLock 的更新选择会取消逻辑请求、尚未完成的显式对齐及其 watchdog。目标离线只有在完整可信快照中才能确认。成功的 fresh current 等于目标可以独立确认写入，即使同次枚举失败；缓存碰巧等于目标不能确认。
 
 ## 通知：独立冷却，不再绑定 episode
 

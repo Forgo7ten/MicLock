@@ -9,12 +9,108 @@ func runStateMachineRegressionTests() async {
     await regressionCandidateRestartsAfterBlindInterval()
     await regressionRealChangeAfterTrustedTimeout()
     await regressionChangedCurrentDiscoveredByRecovery()
+    await regressionProtectionEnabledAfterTopologyChange()
+    await regressionModeSwitchCancelsDeferredAlignment()
+    await regressionSelectionCancelsDeferredAlignment()
+    await regressionNilProtectionSourceCanBeSuperseded()
     regressionStartupUsesFreshObservation()
     regressionPreferredInitializationWaitsForStartup()
     regressionPartialTopologyDelaysPreferredInitialization()
     regressionFirstUsableTopologyAfterEmptyStartup()
     await regressionPartialTopologyCannotConfirmFromCache()
     await regressionCancelledWatchdogCannotWrite()
+}
+
+@MainActor
+private func regressionProtectionEnabledAfterTopologyChange() async {
+    test("regression: enabling protection preserves a recent topology window")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic], current: builtInMic,
+        preferred: builtInMic.uid, protection: false, settle: 1.0,
+        scheduler: clock
+    )
+
+    provider.devices = [builtInMic, airpodsMic]
+    monitor.handleDeviceListChanged()
+    monitor.protectionEnabled = true
+
+    await clock.advance(by: .milliseconds(500))
+    provider.current = airpodsMic
+    monitor.handleDefaultInputChanged()
+
+    expect(provider.setCalls == [builtInMic.uid], "delayed post-topology switch is restored after protection is enabled")
+    expect(monitor.currentDevice?.uid == builtInMic.uid, "restoration keeps the preferred input current")
+    await clock.advance(by: .seconds(1))
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "delayed system switch is never learned as preferred")
+}
+
+@MainActor
+private func regressionModeSwitchCancelsDeferredAlignment() async {
+    test("regression: switching back to Auto cancels failed Manual alignment")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic], current: usbMic,
+        preferred: builtInMic.uid, mode: .auto, scheduler: clock
+    )
+
+    provider.currentInputDeviceError = AudioDeviceProviderError.coreAudio(
+        operation: .queryDefaultInputDevice, objectID: nil, status: -1
+    )
+    monitor.protectionMode = .manual
+    monitor.protectionMode = .auto
+    provider.currentInputDeviceError = nil
+
+    await clock.advance(by: .milliseconds(250))
+
+    expect(provider.setCalls.isEmpty, "recovered sampling cannot execute alignment from the superseded Manual mode")
+    expect(monitor.currentDevice?.uid == usbMic.uid, "Auto keeps the observed current input without new change evidence")
+}
+
+@MainActor
+private func regressionSelectionCancelsDeferredAlignment() async {
+    test("regression: explicit selection cancels an older deferred alignment")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic, airpodsMic], current: usbMic,
+        preferred: builtInMic.uid, mode: .auto, scheduler: clock
+    )
+
+    provider.currentInputDeviceError = AudioDeviceProviderError.coreAudio(
+        operation: .queryDefaultInputDevice, objectID: nil, status: -1
+    )
+    monitor.evaluateStartupPolicy()
+    provider.currentInputDeviceError = nil
+    provider.forceSetFailure = true
+    monitor.selectDevice(airpodsMic)
+
+    expect(provider.setCalls == [airpodsMic.uid], "the explicit selection is attempted once")
+    expect(monitor.lastError == "Unable to set default input device", "the selection failure is initially visible")
+    await clock.advance(by: .milliseconds(250))
+
+    expect(provider.setCalls == [airpodsMic.uid], "recovery cannot execute the superseded alignment")
+    expect(monitor.lastError == "Unable to set default input device", "recovery preserves the explicit selection failure")
+}
+
+@MainActor
+private func regressionNilProtectionSourceCanBeSuperseded() async {
+    test("regression: non-target current supersedes a restore with nil source")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [builtInMic, usbMic], current: nil,
+        preferred: builtInMic.uid, mode: .auto, settle: 1.0,
+        scheduler: clock
+    )
+    provider.applySetImmediately = false
+    monitor.evaluateStartupPolicy()
+
+    expect(provider.setCalls == [builtInMic.uid], "startup alignment begins from an explicit nil current")
+    provider.current = usbMic
+    monitor.handleDefaultInputChanged()
+    await clock.advance(by: .seconds(1))
+
+    expect(provider.setCalls == [builtInMic.uid], "the superseded restore does not retry against the new current")
+    expect(monitor.preferredMicrophoneUID == usbMic.uid, "the real non-target change remains eligible for Auto learning")
 }
 
 @MainActor

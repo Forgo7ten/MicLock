@@ -31,9 +31,10 @@ final class AudioMonitor {
         didSet {
             guard protectionEnabled != oldValue else { return }
             preferences.protectionEnabled = protectionEnabled
-            cancelWrite()
-            cancelCandidate()
-            policy.reset()
+            cancelSupersededWork()
+            // Auto topology windows remain meaningful while enforcement is off:
+            // enabling protection during a recent window must still catch a
+            // delayed system default-input switch.
             if protectionEnabled { evaluateStartupPolicy() }
         }
     }
@@ -42,8 +43,7 @@ final class AudioMonitor {
         didSet {
             guard protectionMode != oldValue else { return }
             preferences.protectionMode = protectionMode
-            cancelWrite()
-            cancelCandidate()
+            cancelSupersededWork()
             policy.reset()
             // Auto waits for subsequent observations; Manual immediately aligns.
             if protectionMode == .manual { evaluateStartupPolicy() }
@@ -125,7 +125,9 @@ final class AudioMonitor {
         notificationsEnabled = preferences.notificationsEnabled
         configuredSettleSeconds = preferences.settleSeconds
         lastKnownDeviceNames = preferences.lastKnownDeviceNames
-        // Initial UI snapshot only. start() always samples AGAIN after listeners.
+        // Initial observation seeds UI/current/topology baseline and refreshes
+        // resolved device names, but must not initialize Preferred or recover.
+        // start() resamples after listeners are installed.
         _ = sample(scheduleRecovery: false, allowPreferredInitialization: false)
     }
 
@@ -245,7 +247,7 @@ final class AudioMonitor {
         let added = firstBaseline ? [] : newUIDs.subtracting(oldUIDs)
         let topologyChanged = !firstBaseline && newUIDs != oldUIDs
         trustedDevices = devices
-        if topologyChanged && protectionEnabled { beginProtectionWindow() }
+        if topologyChanged && protectionMode == .auto { beginProtectionWindow() }
 
         // Revisit an initially empty (but valid) baseline too; no special
         // startup-recovery initialization branch is needed.
@@ -286,7 +288,7 @@ final class AudioMonitor {
             // This is a product heuristic, NOT proof of who wrote the property.
             if case .protection = pending.origin,
                let current = observation.device,
-               let source = pending.sourceUID, current.uid != source {
+               (pending.sourceUID == nil || current.uid != pending.sourceUID) {
                 cancelWrite()
                 mayLearnChange = observation.changed
             } else {
@@ -362,6 +364,14 @@ final class AudioMonitor {
         candidateTask = nil
     }
 
+    /// New user intent supersedes deferred alignment, candidate classification,
+    /// and logical writes, but not sampling recovery or an Auto protection window.
+    private func cancelSupersededWork() {
+        alignmentRequested = false
+        cancelCandidate()
+        cancelWrite()
+    }
+
     private func confirmOrScheduleCandidate(current: AudioInputDevice?, preferred: AudioInputDevice) {
         guard let candidate = policy.candidate else { return }
         guard candidate.revision == currentRevision,
@@ -398,8 +408,7 @@ final class AudioMonitor {
     // MARK: - One write path, two bounded/persistent retry policies
 
     func selectDevice(_ device: AudioInputDevice) {
-        cancelCandidate()
-        cancelWrite()
+        cancelSupersededWork()
         let fresh: CurrentObservation?
         do { fresh = try readCurrent() }
         catch {
