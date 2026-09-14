@@ -105,7 +105,9 @@ final class AudioMonitor {
     var currentDeviceName: String { currentDevice?.name ?? "Unknown" }
     var isPreferredMicrophoneAvailable: Bool { preferredDevice != nil }
     var offlinePreferredName: String? {
-        guard let uid = preferredMicrophoneUID, preferredDevice == nil else { return nil }
+        guard let trustedDevices,
+              let uid = preferredMicrophoneUID,
+              !trustedDevices.contains(where: { $0.uid == uid }) else { return nil }
         return lastKnownDeviceNames[uid] ?? "Unknown device"
     }
 
@@ -211,6 +213,7 @@ final class AudioMonitor {
                 devices = Self.sortedDevices(snapshot.devices)
                 recordDeviceNames(devices)
                 if !snapshot.isComplete {
+                    for issue in snapshot.issues { logProviderError(issue) }
                     errorMessage = errorMessage ?? "Some input device properties are temporarily unreadable"
                 }
             }

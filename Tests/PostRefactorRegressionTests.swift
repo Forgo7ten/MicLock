@@ -7,8 +7,41 @@ func runPostRefactorRegressionTests() async {
     testProtectingAutoRestoresDuringEnumerationFailure()
     await testProtectingAutoDoesNotTrustPartialRemoval()
     testAvailabilityProjectionIsObservable()
+    testUnknownTopologyDoesNotClaimPreferredOffline()
     testOfflineFailureClearsOnlyWhenItsTargetReturns()
     testOfflineFailureClearsWhenTargetReconnectsWithoutBecomingCurrent()
+}
+
+@MainActor
+private func testUnknownTopologyDoesNotClaimPreferredOffline() {
+    test("review: unknown topology does not claim preferred is offline")
+    let suite = "MicLockTests.unknown-topology.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.removePersistentDomain(forName: suite)
+    defaults.set(usbMic.uid, forKey: Preferences.preferredMicrophoneUIDKey)
+    defaults.set([usbMic.uid: usbMic.name], forKey: Preferences.deviceNamesKey)
+    defaults.set(false, forKey: Preferences.protectionEnabledKey)
+
+    let provider = FakeAudioDeviceProvider()
+    provider.current = builtInMic
+    provider.listInputDevicesError = AudioDeviceProviderError.coreAudio(
+        operation: .enumerateDeviceListData, objectID: nil, status: -1
+    )
+    let monitor = AudioMonitor(
+        provider: provider,
+        preferences: Preferences(defaults: defaults),
+        notifier: RecordingNotifier(),
+        scheduler: ManualAudioMonitorScheduler()
+    )
+
+    expect(monitor.offlinePreferredName == nil, "unknown topology cannot prove the preferred device is offline")
+
+    provider.listInputDevicesError = nil
+    provider.current = nil
+    provider.devices = []
+    monitor.handleDeviceListChanged()
+
+    expect(monitor.offlinePreferredName == usbMic.name, "a trusted empty topology confirms the preferred device is offline")
 }
 
 @MainActor
