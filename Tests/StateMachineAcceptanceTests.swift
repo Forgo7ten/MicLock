@@ -51,6 +51,40 @@ private func acceptancePolicyWindow() async {
 
 @MainActor
 private func acceptancePendingAndConfirmation() async {
+    test("acceptance: synchronous watchdog confirmation cannot reuse stale observation")
+    let staleClock = ManualAudioMonitorScheduler()
+    let (staleMonitor, staleProvider, staleNotifier) = makeMonitor(
+        devices: [builtInMic, airpodsMic], current: builtInMic,
+        preferred: builtInMic.uid, mode: .manual, scheduler: staleClock
+    )
+    staleProvider.forceSetFailure = true
+    staleProvider.current = airpodsMic
+    staleMonitor.handleDefaultInputChanged()
+    expect(staleProvider.setCalls.count == 1, "initial rejected restore is submitted once")
+    staleProvider.forceSetFailure = false
+    await staleClock.advance(by: .milliseconds(500))
+    expect(staleProvider.setCalls.count == 2, "successful watchdog retry is not followed by a stale duplicate restore")
+    expect(staleNotifier.presentCount == 1, "one confirmed watchdog retry emits one notification")
+
+    test("acceptance: Auto re-hijack after watchdog confirmation gets exactly one restore")
+    let reHijackClock = ManualAudioMonitorScheduler()
+    let (reHijackMonitor, reHijackProvider, _) = makeMonitor(
+        devices: [builtInMic], current: builtInMic,
+        preferred: builtInMic.uid, mode: .auto, settle: 1.0, scheduler: reHijackClock
+    )
+    reHijackProvider.applySetImmediately = false
+    reHijackProvider.devices = [builtInMic, airpodsMic]
+    reHijackProvider.current = airpodsMic
+    reHijackMonitor.handleDeviceListChanged()
+    await reHijackClock.advance(by: .seconds(1.5))
+    expect(reHijackProvider.setCalls.count == 3, "unconfirmed restore retries at 0.5s and 1.5s")
+    reHijackProvider.applySetImmediately = true
+    await reHijackClock.advance(by: .seconds(2))
+    expect(reHijackProvider.setCalls.count == 4, "confirming retry does not issue a duplicate restore from stale state")
+    reHijackProvider.current = airpodsMic
+    reHijackMonitor.handleDefaultInputChanged()
+    expect(reHijackProvider.setCalls.count == 5, "immediate re-hijack is corrected exactly once")
+    expect(reHijackMonitor.currentDevice?.uid == builtInMic.uid, "re-hijack returns to preferred")
     for mode in [ProtectionMode.manual, .auto] {
         test("acceptance: delayed \(mode) restoration, rejection, backoff, confirmation")
         let c = ManualAudioMonitorScheduler()

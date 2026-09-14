@@ -288,9 +288,18 @@ final class AudioMonitor {
                 cancelWrite()
                 mayLearnChange = observation.changed
             } else {
-                if watchdog { retryWrite() } else { scheduleWatchdog() }
+                if watchdog {
+                    // A retry performs its own fresh current read. If it actually
+                    // submitted a write (and may have synchronously confirmed it),
+                    // this outer reconciliation must not continue with the stale
+                    // pre-retry observation and issue a duplicate restore.
+                    if retryWrite() { return }
+                } else {
+                    scheduleWatchdog()
+                }
                 if writer.pending != nil { return }
-                // A trusted expiry is NOT new evidence, in any wake-up path.
+                // The only fallthrough is a Trusted selection expiring without
+                // another write. That expiry is NOT external-switch evidence.
                 mayLearnChange = false
             }
         }
@@ -453,12 +462,17 @@ final class AudioMonitor {
         scheduleWatchdog()
     }
 
-    private func retryWrite() {
+    /// Returns true only when this watchdog actually submitted another HAL write.
+    /// A Trusted selection may instead expire here without submitting anything;
+    /// callers may then continue policy evaluation using the fresh pre-expiry sample.
+    @discardableResult
+    private func retryWrite() -> Bool {
         guard writer.prepareRetry() != nil else {
             cancelWatchdog()
-            return
+            return false
         }
         submitWrite(initial: false)
+        return true
     }
 
     private func finishWrite(_ request: DefaultInputWriter.Request) {
