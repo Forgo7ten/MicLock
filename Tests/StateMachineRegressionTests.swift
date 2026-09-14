@@ -11,6 +11,7 @@ func runStateMachineRegressionTests() async {
     await regressionRealChangeAfterTrustedTimeout()
     await regressionChangedCurrentDiscoveredByRecovery()
     regressionStartupUsesFreshObservation()
+    regressionPreferredInitializationWaitsForStartup()
     regressionFirstUsableTopologyAfterEmptyStartup()
     await regressionPartialTopologyCannotConfirmFromCache()
     await regressionCancelledWatchdogCannotWrite()
@@ -150,6 +151,24 @@ private func regressionStartupUsesFreshObservation() {
     monitor.evaluateStartupPolicy()
     expect(provider.setCalls == [builtInMic.uid], "startup must not use stale cached current")
     expect(monitor.currentDevice?.uid == builtInMic.uid, "startup restores persisted preferred")
+}
+
+@MainActor
+private func regressionPreferredInitializationWaitsForStartup() {
+    test("regression: preferred initialization waits for fresh startup topology")
+    let clock = ManualAudioMonitorScheduler()
+    let (monitor, provider, _) = makeMonitor(
+        devices: [usbMic], current: usbMic,
+        preferred: nil, scheduler: clock
+    )
+    expect(monitor.preferredMicrophoneUID == nil, "pre-listener UI snapshot must not persist a preferred device")
+
+    provider.devices = [builtInMic, usbMic]
+    provider.current = usbMic
+    monitor.evaluateStartupPolicy()
+
+    expect(monitor.preferredMicrophoneUID == builtInMic.uid, "fresh startup topology must still apply built-in-first initialization")
+    expect(provider.setCalls == [builtInMic.uid], "startup alignment uses the newly initialized built-in preferred")
 }
 
 @MainActor

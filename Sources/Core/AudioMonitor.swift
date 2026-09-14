@@ -126,7 +126,7 @@ final class AudioMonitor {
         configuredSettleSeconds = preferences.settleSeconds
         lastKnownDeviceNames = preferences.lastKnownDeviceNames
         // Initial UI snapshot only. start() always samples AGAIN after listeners.
-        _ = sample(scheduleRecovery: false)
+        _ = sample(scheduleRecovery: false, allowPreferredInitialization: false)
     }
 
     deinit {
@@ -188,7 +188,10 @@ final class AudioMonitor {
         return CurrentObservation(device: device, changed: changed)
     }
 
-    private func sample(scheduleRecovery: Bool = true) -> Sample {
+    private func sample(
+        scheduleRecovery: Bool = true,
+        allowPreferredInitialization: Bool = true
+    ) -> Sample {
         let observation: CurrentObservation?
         var errorMessage: String?
         do {
@@ -246,7 +249,7 @@ final class AudioMonitor {
 
         // Revisit an initially empty (but valid) baseline too; no special
         // startup-recovery initialization branch is needed.
-        if preferredMicrophoneUID == nil {
+        if allowPreferredInitialization, preferredMicrophoneUID == nil {
             preferredMicrophoneUID = devices.first(where: \.isBuiltIn)?.uid ?? observation.device?.uid
         }
         return Sample(observation: observation, valid: true, firstBaseline: firstBaseline, added: added)

@@ -2102,6 +2102,9 @@ private func testFirstRunDefaultSelection() {
         preferred: nil
     )
 
+    expect(monitor.preferredMicrophoneUID == nil, "pre-listener snapshot does not initialize preferred")
+    monitor.evaluateStartupPolicy()
+
     expect(monitor.preferredMicrophoneUID == builtInMic.uid, "first run prefers built-in mic")
 }
 
