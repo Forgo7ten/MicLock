@@ -10,6 +10,7 @@ private final class PropertyFixture {
     var uid: String? = "test-device-10"
     var uidStatus: OSStatus = noErr
     var uidSize = UInt32(MemoryLayout<CFTypeRef?>.size)
+    var nameStatus: OSStatus = noErr
     var translatedID: AudioDeviceID = 10
     var translationStatus: OSStatus = noErr
     var setterStatus: OSStatus = noErr
@@ -52,6 +53,7 @@ private final class PropertyFixture {
                 destination.pointee = uid.map { Unmanaged.passRetained($0 as CFString) }
                 size.pointee = uidSize
             case kAudioObjectPropertyName:
+                guard nameStatus == noErr else { return nameStatus }
                 data.assumingMemoryBound(to: Unmanaged<CFString>?.self).pointee =
                     .passRetained("Test Microphone" as CFString)
                 size.pointee = UInt32(MemoryLayout<CFTypeRef?>.size)
@@ -138,6 +140,29 @@ func runLiveAudioDeviceProviderTests() {
             _ = try LiveAudioDeviceProvider(access: fixture.access).currentInputDevice()
             expect(false, "wrong scalar/string result size must fail")
         } catch { expect(true, "malformed result rejected") }
+    }
+
+    test("provider: name failure keeps topology complete and marks fallback unresolved")
+    let nameFailure = PropertyFixture(); nameFailure.nameStatus = -79
+    do {
+        let instance = LiveAudioDeviceProvider(access: nameFailure.access)
+        let snapshot = try instance.listInputDevices()
+        expect(snapshot.isComplete, "display-only name failure must not make topology partial")
+        if let device = snapshot.devices.first {
+            expect(device.name == "Unknown (10)", "topology UI receives a fallback name")
+            expect(!device.nameIsResolved, "fallback topology name is marked unresolved")
+        } else {
+            expect(false, "name failure must not remove an otherwise healthy device")
+        }
+
+        if let current = try instance.currentInputDevice() {
+            expect(current.name == "Unknown", "current UI receives a fallback name")
+            expect(!current.nameIsResolved, "fallback current name is marked unresolved")
+        } else {
+            expect(false, "name failure must not hide the current device")
+        }
+    } catch {
+        expect(false, "display-only name failure must remain non-fatal: \(error)")
     }
 
     test("provider: transport failure makes topology partial")

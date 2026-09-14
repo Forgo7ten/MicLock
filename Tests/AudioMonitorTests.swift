@@ -2137,12 +2137,43 @@ private func testDeviceNamePersistence() {
 
     expect(monitor.offlinePreferredName == "USB Microphone", "offline preferred shows persisted name")
 
-    // USB 重新在线：名字刷新并写回 defaults。
-    provider.devices = [builtInMic, usbMic]
+    // USB 重新在线，但这一轮 HAL Name property 瞬时失败：UI 可以使用 fallback，
+    // 但 fallback 不能覆盖上一轮已经持久化的真实设备名称。
+    let unresolvedUSB = AudioInputDevice(
+        uid: usbMic.uid,
+        deviceID: usbMic.deviceID,
+        name: "Unknown (\(usbMic.deviceID))",
+        transportType: usbMic.transportType,
+        nameIsResolved: false
+    )
+    provider.devices = [builtInMic, unresolvedUSB]
     monitor.handleDeviceListChanged()
 
-    let stored = defaults.dictionary(forKey: Preferences.deviceNamesKey)?["USB"] as? String
-    expect(stored == "USB Microphone", "name persisted to defaults")
+    expect(
+        monitor.devices.first(where: { $0.uid == usbMic.uid })?.name == unresolvedUSB.name,
+        "UI may display the unresolved fallback name"
+    )
+    var stored = defaults.dictionary(forKey: Preferences.deviceNamesKey)?["USB"] as? String
+    expect(stored == "USB Microphone", "unresolved fallback does not overwrite persisted name")
+
+    // 再次离线时仍应显示上一次真正解析到的名字，而不是 Unknown fallback。
+    provider.current = builtInMic
+    provider.devices = [builtInMic]
+    monitor.handleDeviceListChanged()
+    expect(monitor.offlinePreferredName == "USB Microphone", "offline name survives transient name-read failure")
+
+    // Name property 恢复后，新的真实名称仍然可以正常刷新缓存。
+    let renamedUSB = AudioInputDevice(
+        uid: usbMic.uid,
+        deviceID: usbMic.deviceID,
+        name: "RØDE NT-USB",
+        transportType: usbMic.transportType
+    )
+    provider.devices = [builtInMic, renamedUSB]
+    monitor.handleDeviceListChanged()
+
+    stored = defaults.dictionary(forKey: Preferences.deviceNamesKey)?["USB"] as? String
+    expect(stored == "RØDE NT-USB", "resolved HAL name still refreshes persisted name")
 }
 
 /// 全新安装 → auto。

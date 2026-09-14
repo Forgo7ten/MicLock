@@ -28,11 +28,13 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
                 guard try hasInputStreams(deviceID) else { continue }
                 let uid = try requiredDeviceUID(deviceID)
                 let transportType = try requiredTransportType(deviceID)
+                let name = deviceName(deviceID)
                 inputDevices.append(AudioInputDevice(
                     uid: uid,
                     deviceID: deviceID,
-                    name: deviceName(deviceID) ?? "Unknown (\(deviceID))",
-                    transportType: transportType
+                    name: name ?? "Unknown (\(deviceID))",
+                    transportType: transportType,
+                    nameIsResolved: name != nil
                 ))
             } catch let error as AudioDeviceProviderError {
                 // 单个 HAL object 读失败时保留其余健康设备给 UI/诊断；
@@ -52,14 +54,16 @@ final class LiveAudioDeviceProvider: AudioDeviceProviding {
     func currentInputDevice() throws -> AudioInputDevice? {
         guard let deviceID = try defaultInputDeviceID() else { return nil }
         let uid = try requiredDeviceUID(deviceID)
+        let name = deviceName(deviceID)
 
         return AudioInputDevice(
             uid: uid,
             deviceID: deviceID,
-            name: deviceName(deviceID) ?? "Unknown",
+            name: name ?? "Unknown",
             // Current identity is UID-based. Transport remains best-effort here;
             // topology enumeration is the authority for built-in classification.
-            transportType: (try? requiredTransportType(deviceID)) ?? 0
+            transportType: (try? requiredTransportType(deviceID)) ?? 0,
+            nameIsResolved: name != nil
         )
     }
 

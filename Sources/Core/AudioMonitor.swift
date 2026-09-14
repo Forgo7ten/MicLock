@@ -560,7 +560,10 @@ final class AudioMonitor {
 
     private func recordDeviceNames(_ devices: [AudioInputDevice]) {
         var changed = false
-        for device in devices where lastKnownDeviceNames[device.uid] != device.name {
+        for device in devices
+            where device.nameIsResolved
+                && lastKnownDeviceNames[device.uid] != device.name
+        {
             lastKnownDeviceNames[device.uid] = device.name
             changed = true
         }

@@ -94,7 +94,7 @@ OSLog 的带 privacy 插值仍必须是一个完整的消息字面量，不能�
 
 `CoreAudioPropertyAccess` 只封装 Provider 使用的三种 C 函数，生产实现直接调用系统，测试注入属性缓冲区；不增加业务状态或缓存。设备列表先检查分配长度，再按 `AudioObjectGetPropertyData` 返回的实际字节数截取，设备在两次调用间减少时不把未填充的尾部 0 当成设备。长度不对齐、结果超出原容量、成功却返回 nil/空 UID 等属于 `invalidPropertyData`，不能伪装为 OSStatus=0 的 API 失败。
 
-拓扑枚举中，Device UID 与 TransportType 都属于策略关键属性：任一读取失败或返回异常长度时，该设备不进入健康 `devices` 集合，并将本轮 snapshot 标记为 partial。设备名称只用于展示，读取失败可回退为 `Unknown`。`currentInputDevice()` 的身份判断只依赖 UID，因此其中的 TransportType 仍为 best-effort；内置设备分类始终以完整 topology 中的 TransportType 为准。
+拓扑枚举中，Device UID 与 TransportType 都属于策略关键属性：任一读取失败或返回异常长度时，该设备不进入健康 `devices` 集合，并将本轮 snapshot 标记为 partial。设备名称只用于展示，读取失败可回退为 `Unknown`，但 fallback 会标记为 unresolved，不能覆盖持久化的 `lastKnownDeviceNames`；后续真正读到 HAL 名称时才刷新该缓存。`currentInputDevice()` 的身份判断只依赖 UID，因此其中的 TransportType 仍为 best-effort；内置设备分类始终以完整 topology 中的 TransportType 为准。
 
 UID 与名称属性按 SDK 的 caller-owned CF 对象契约使用 `takeRetainedValue()` 接管返回引用；实际错误仍保留真实 OSStatus。写入前使用 `kAudioHardwarePropertyTranslateUIDToDevice` 每次重新解析 UID，返回 unknown 才表示未找到，不再遍历所有无关设备。解析后到 setter 之间仍可能发生拔出，因此 setter 错误必须照常处理；这不是 HAL 原子事务。
 
