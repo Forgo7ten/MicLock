@@ -62,6 +62,14 @@ private final class MicLockAppDelegate:
         activationPolicyManager.start()
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard let monitor else { return }
+
+        Task { @MainActor in
+            await monitor.syncNotificationAuthorizationState()
+        }
+    }
+
     /// MenuBarExtra 没有公开的 secondary-click 回调。
     /// 在本 App 的事件队列中捕获右键；若命中 MenuBarExtra 底层的
     /// NSStatusBarButton，则模拟 primary click，复用系统的窗口开关行为。
@@ -270,6 +278,21 @@ struct MenuBarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            if let listenerStatus = monitor.listenerStatusSummary {
+                VStack(alignment: .leading, spacing: 3) {
+                    Label(listenerStatus, systemImage: "exclamationmark.triangle.fill")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.orange)
+
+                    Text("麦克风保护可能暂时失效，详细状态请前往设置查看。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Divider()
+            }
+
             Group {
                 Toggle("麦克风保护", isOn: $monitor.protectionEnabled)
 
@@ -350,7 +373,7 @@ struct MenuBarView: View {
 
             Group {
                 // CoreAudio 基础能力 / 枚举错误优先于一次性设备操作错误。
-                if let error = monitor.listenerError ?? monitor.deviceEnumerationError ?? monitor.lastError {
+                if let error = monitor.deviceEnumerationError ?? monitor.lastError {
                     Text(error)
                         .font(.caption)
                         .foregroundStyle(.red)

@@ -72,11 +72,141 @@ final class FakeAudioDeviceProvider: AudioDeviceProviding {
     }
 }
 
+final class FakeCoreAudioListeners: CoreAudioListening, @unchecked Sendable {
+    var installResults: [CoreAudioListenerInstallResult] = [.installed]
+    var retainCallbacksOnFailure = false
+    var retainCallbacksOnRemove = false
+
+    private(set) var installCallCount = 0
+    private(set) var removeCallCount = 0
+
+    private var onDefaultInputChange: (@MainActor () -> Void)?
+    private var onDevicesChange: (@MainActor () -> Void)?
+
+    func install(
+        onDefaultInputChange: @escaping @MainActor () -> Void,
+        onDevicesChange: @escaping @MainActor () -> Void
+    ) -> CoreAudioListenerInstallResult {
+        installCallCount += 1
+        precondition(!installResults.isEmpty)
+        let index = min(installCallCount - 1, installResults.count - 1)
+        let result = installResults[index]
+
+        if result == .installed || retainCallbacksOnFailure {
+            self.onDefaultInputChange = onDefaultInputChange
+            self.onDevicesChange = onDevicesChange
+        }
+
+        return result
+    }
+
+    func remove() {
+        removeCallCount += 1
+        guard !retainCallbacksOnRemove else { return }
+        onDefaultInputChange = nil
+        onDevicesChange = nil
+    }
+
+    @MainActor
+    func fireDefaultInputChange() {
+        onDefaultInputChange?()
+    }
+
+    @MainActor
+    func fireDevicesChange() {
+        onDevicesChange?()
+    }
+}
+
+final class FakeCoreAudioListenerBackend: CoreAudioListenerBackend {
+    var defaultAddResults: [OSStatus] = [noErr]
+    var devicesAddResults: [OSStatus] = [noErr]
+    var defaultRemoveResults: [OSStatus] = [noErr]
+    var devicesRemoveResults: [OSStatus] = [noErr]
+
+    private(set) var defaultAddCount = 0
+    private(set) var devicesAddCount = 0
+    private(set) var defaultRemoveCount = 0
+    private(set) var devicesRemoveCount = 0
+
+    private var defaultListener: AudioObjectPropertyListenerBlock?
+    private var devicesListener: AudioObjectPropertyListenerBlock?
+
+    var hasRetainedDefaultListener: Bool { defaultListener != nil }
+    var hasRetainedDevicesListener: Bool { devicesListener != nil }
+
+    private func result(_ values: [OSStatus], _ index: Int) -> OSStatus {
+        values[min(index, values.count - 1)]
+    }
+
+    func addDefaultInputListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus {
+        let status = result(defaultAddResults, defaultAddCount)
+        defaultAddCount += 1
+        if status == noErr { defaultListener = listener }
+        return status
+    }
+
+    func addDevicesListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus {
+        let status = result(devicesAddResults, devicesAddCount)
+        devicesAddCount += 1
+        if status == noErr { devicesListener = listener }
+        return status
+    }
+
+    func removeDefaultInputListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus {
+        let status = result(defaultRemoveResults, defaultRemoveCount)
+        defaultRemoveCount += 1
+        if status == noErr { defaultListener = nil }
+        return status
+    }
+
+    func removeDevicesListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus {
+        let status = result(devicesRemoveResults, devicesRemoveCount)
+        devicesRemoveCount += 1
+        if status == noErr { devicesListener = nil }
+        return status
+    }
+
+    @MainActor
+    func fireDefaultInputChange() {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        withUnsafePointer(to: &address) { pointer in
+            defaultListener?(1, pointer)
+        }
+    }
+
+    @MainActor
+    func fireDevicesChange() {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        withUnsafePointer(to: &address) { pointer in
+            devicesListener?(1, pointer)
+        }
+    }
+}
+
 /// 测试用通知器：记录投递次数。
 /// @unchecked Sendable：仅在测试的主 actor 上使用。
 final class RecordingNotifier: NotificationPresenting, @unchecked Sendable {
 
     private(set) var presentCount = 0
+    private(set) var listenerFailureCount = 0
+    private(set) var passiveAuthorizationReadCount = 0
     private(set) var messages: [String] = []
 
     var authorizationState: NotificationAuthorizationState = .authorized
@@ -86,8 +216,17 @@ final class RecordingNotifier: NotificationPresenting, @unchecked Sendable {
         messages.append("\(reason): \(from) → \(to)")
     }
 
+    func presentListenerFailure() {
+        listenerFailureCount += 1
+    }
+
     func ensureAuthorization() async -> NotificationAuthorizationState {
         authorizationState
+    }
+
+    func currentAuthorizationState() async -> NotificationAuthorizationState {
+        passiveAuthorizationReadCount += 1
+        return authorizationState
     }
 }
 
@@ -204,7 +343,8 @@ func makeMonitor(
     settle: Double = 1.0,
     notifications: Bool = true,
     authorization: NotificationAuthorizationState = .authorized,
-    scheduler: AudioMonitorScheduling? = nil
+    scheduler: AudioMonitorScheduling? = nil,
+    listeners: CoreAudioListening? = nil
 ) -> (monitor: AudioMonitor, provider: FakeAudioDeviceProvider, notifier: RecordingNotifier) {
     let suite = "MicLockTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
@@ -227,10 +367,27 @@ func makeMonitor(
         provider: provider,
         preferences: Preferences(defaults: defaults),
         notifier: notifier,
-        scheduler: scheduler
+        scheduler: scheduler,
+        listeners: listeners ?? CoreAudioListeners()
     )
 
     return (monitor, provider, notifier)
+}
+
+@MainActor
+func waitUntil(
+    timeout: Duration = .seconds(1),
+    pollInterval: Duration = .milliseconds(5),
+    condition: @escaping @MainActor () -> Bool
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+
+    while !condition() {
+        if Task.isCancelled || clock.now >= deadline { return false }
+        try? await Task.sleep(for: pollInterval)
+    }
+    return true
 }
 
 /// 等待 settle window 到期（settleSeconds 最小 1.0，等待 1.4s 保证 task 完成）。
