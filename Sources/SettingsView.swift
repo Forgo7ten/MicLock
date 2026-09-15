@@ -105,6 +105,10 @@ private struct GeneralSettingsView: View {
             Section("通知") {
                 Toggle("显示通知", isOn: $monitor.notificationsEnabled)
 
+                Text("该开关仅控制麦克风恢复通知；CoreAudio 监听终态故障等可靠性告警不受此开关影响。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 if monitor.notificationDenied {
                     notificationDeniedRow
                 }
@@ -115,6 +119,9 @@ private struct GeneralSettingsView: View {
         .onAppear {
             launchAtLoginOn = LaunchAtLoginManager.isEnabled
             launchAtLoginError = nil
+        }
+        .task {
+            await monitor.syncNotificationAuthorizationState()
         }
         .onDisappear {
             loginItemSyncTask?.cancel()
@@ -218,6 +225,25 @@ private struct AdvancedSettingsView: View {
 
     var body: some View {
         Form {
+            if let status = monitor.listenerStatusSummary {
+                Section("CoreAudio 状态") {
+                    Label(status, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+
+                    if let error = monitor.listenerError {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+
+                    Text("MicLock 未能建立完整的 CoreAudio 事件监听，保护功能可能无法及时响应系统默认输入变化。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
             Section("设备切换") {
                 HStack {
                     Text("设备稳定窗口")

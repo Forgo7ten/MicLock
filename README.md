@@ -14,10 +14,10 @@ MicLock 监听 macOS 的 CoreAudio 设备变化，在不录音、不联网的前
 - 两种保护模式：
   - **自动**：保护窗口内阻止系统抢麦；窗口外观察到新的默认输入变化时，持续稳定一段时间后接受为新的首选；默认输入持续为空且首选仍在线时恢复首选
   - **手动**：严格锁定首选麦克风，任何来源的外部切换都会被立即恢复
-- CoreAudio 正常路径由事件驱动；仅在采样失败或程序化切换未确认时使用退避重试，不进行常驻轮询
+- CoreAudio 正常路径由事件驱动；仅在监听安装失败、采样失败或程序化切换未确认时使用有限/退避恢复，不进行常驻轮询
 - 设备 Device UID 持久化，跨插拔稳定；首选设备离线时保留等待重连
 - 最近事件：展示已经确认生效的用户选择、Auto 接受与恢复动作，并说明每次自动决策的原因
-- 恢复时发送本地通知（首次启动自动请求授权，被拒时在设置中引导开启）
+- 恢复通知开启时，已经确认的麦克风恢复动作可发送本地通知；Manual 模式恢复通知最多 10 秒一条（恢复动作本身不降频）。CoreAudio 监听连续安装失败进入终态时，会独立进行系统通知授权检查，并在系统允许时最多提交一条故障通知；该可靠性告警不受「显示通知」开关控制。系统授权被拒时在设置中引导开启
 - 登录时启动（SMAppService，设置 → 通用）
 - 无第三方依赖、无网络、不录音、无 root
 
@@ -80,7 +80,7 @@ make install    # 安装到 /Applications 并启动
 
 若 `/Applications` 不可写，可使用 `make install INSTALL_DIR="$HOME/Applications"` 安装到用户应用目录。`make install` 会先把新 `.app` 完整复制到安装目录内的临时位置，再替换旧 bundle；不要使用 `sudo make install`。
 
-首次启动约 0.5 秒后请求通知权限，允许即可；被拒绝时设置窗口（通用 → 通知）会显示提示行并可一键跳转系统设置。
+通知开关开启时，正常启动并成功建立 CoreAudio 监听后约 0.5 秒请求通知权限；若监听连续安装失败进入终态，则会为故障通知立即做一次 fresh authorization check。被拒绝时设置窗口（通用 → 通知）会显示提示行并可一键跳转系统设置。
 
 更多调试手段（`MICLOCK_TRACE_PATH` 决策流文件、OSLog）见 [docs/architecture.md](docs/architecture.md)。
 
@@ -95,7 +95,7 @@ UserDefaults（`lee.miclock.app` 域）：
 | `preferredMicrophoneUID` | 首选麦克风 Device UID |
 | `protectionEnabled` | 是否启用保护 |
 | `protectionMode` | `auto` / `manual` |
-| `notificationsEnabled` | 恢复时是否显示通知 |
+| `notificationsEnabled` | 是否显示普通麦克风恢复通知；不影响 CoreAudio 监听终态故障可靠性告警 |
 | `settleSeconds` | 设备稳定窗口（1–30s，默认 2） |
 | `lastKnownDeviceNames` | 设备 UID → 最近已知名称（离线设备仍显示可读名） |
 

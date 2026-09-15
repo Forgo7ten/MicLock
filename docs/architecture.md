@@ -10,7 +10,7 @@ MicLock 只管理系统默认输入设备（`kAudioHardwarePropertyDefaultInputD
 | `AutoPolicy.swift` | 互斥的 stable / protecting / considering 阶段，候选连续性 | 不写设备，不管理通知或重试 |
 | `DefaultInputWriter.swift` | 一笔待确认请求、来源、有限/持续重试阶段和结构化错误 | 不修改 Auto 的窗口，不假定 HAL 请求可取消 |
 | `AudioMonitorScheduler.swift` | 统一单调时钟与可取消任务；支持确定性测试 | 不承载业务状态 |
-| `CoreAudioListeners.swift` | 安装和移除默认输入、设备列表监听；失败时整体回滚 | 不做分类和恢复 |
+| `CoreAudioListeners.swift` | 用结构化结果安装和移除默认输入、设备列表监听；保留 block identity 并安全清理部分注册 | 不做分类和恢复 |
 | `AudioMonitorDiagnostics.swift` | OSLog 和可选 trace 输出 | 不影响状态决策 |
 | `LiveAudioDeviceProvider.swift` / `AudioDeviceProviding.swift` | HAL 枚举、默认输入读写、partial snapshot 与底层错误 | 不学习 preferred |
 | `Preferences.swift` | UserDefaults 读写 | 不保存运行期 AudioDeviceID |
@@ -32,7 +32,7 @@ UI 仍是 `MicLockApp.swift` 中的菜单栏面板，以及 `SettingsView.swift`
 ## 一次统一收敛
 
 ```text
-HAL callback / candidate timer / missing-default timer / recovery timer / watchdog
+HAL callback / listener-recovery timer / candidate timer / missing-default timer / recovery timer / watchdog
   -> sample: fresh current + devices
   -> current revision、候选连续性、可信 topology
   -> fresh current 确认 Writer，或完整 topology 证明目标离线
@@ -47,7 +47,7 @@ Devices 与 DefaultInput 是独立属性；连续读取不是原子事务。curr
 
 ## 启动与用户操作
 
-初始化读取配置，并采一份用于 UI、current 与 topology 基线的初始快照；这次采样明确禁止初始化 `preferredMicrophoneUID` 或执行恢复。AppDelegate 完成启动后调用 `start()`，先安装监听，再重新采样并请求启动对齐；首选的首次初始化与启动恢复只依据 listener 安装后的 fresh sample，不再用监听安装前的旧 current 直接判断。`alignmentRequested` 仅保存“一个尚未完成的显式对齐请求”，用于对齐时采样失败后的恢复，不是第二套 topology 可信状态。
+初始化读取配置，并采一份用于 UI、current 与 topology 基线的初始快照；这次采样明确禁止初始化 `preferredMicrophoneUID` 或执行恢复。AppDelegate 完成启动后调用 `start()`，先安装完整监听对，再重新采样并请求启动对齐；首选的首次初始化与启动恢复只依据 listener 安装后的 fresh sample，不再用监听安装前的旧 current 直接判断。监听初次安装失败后按 250ms、500ms、1s、2s 使用最多四个 retry slot，成功后才执行 startup fresh alignment；全部失败则进入不可重启预算的终态。部分注册的 rollback/cleanup 未确认成功前不执行新的 Add，终态只做一次 best-effort Remove。`alignmentRequested` 仅保存“一个尚未完成的显式对齐请求”，用于对齐时采样失败后的恢复，不是第二套 topology 可信状态。
 
 打开保护或切到 Manual 会执行同样的 fresh 对齐；切到 Auto 保留首选，并在保护开启时执行一次普通 fresh reconcile，但不建立显式 alignment：稳定的非 nil mismatch 没有新变化证据时仍不恢复，可信的 `current == nil` 则进入 missing-default debounce。模式切换、保护开关变化和新的明确选择会先取消旧逻辑写入、候选、缺失默认输入防抖与尚未完成的显式对齐。显式选择的 Trusted setter 若首次即被 CoreAudio 拒绝，该用户命令立即结束并保留原 Preferred，随后只执行一次普通 reconcile：不会恢复已经被新用户意图 supersede 的旧 alignment，也不会让 Auto stable 仅凭 current != preferred 强制恢复；但 Manual 或仍有效的 Auto protection window 可以基于当前 fresh state 建立新的 Protection writer，避免失败的用户选择让既有保护永久失去执行者。保护窗口在模式改变时重置，不能携带旧模式下的判定进度；Auto 在保护关闭时仍记录可信 topology 变化，保护开关本身不会清掉尚未过期的窗口。
 
@@ -57,13 +57,13 @@ Devices 与 DefaultInput 是独立属性；连续读取不是原子事务。curr
 
 Auto 保护窗口保存一个起点，以单调时钟按需判断到期，没有独立 settle timer。Candidate 保存变化 revision 和有效计时起点；缺失默认输入的防抖在 AudioMonitor 保存独立有效起点，不进入 Candidate 或 AutoPolicy phase。任意采样盲区都会中断相应计时，恢复后从头确认。writer watchdog、候选 timer 与缺失默认输入 timer 分别核对请求 ID、revision/截止时间与有效起点/截止时间，过期任务不能提交新状态。
 
-音频核心的延迟任务是：候选确认、缺失默认输入确认、写入 watchdog、异常采样恢复。Protection 使用最长 64 秒的持续退避；Trusted 仅一次 500ms 快速重试与随后 500ms 确认。缺失默认输入只在 Auto stable、保护开启且首选可信在线时等待一个 `settleSeconds`，到期 fresh sample 后才恢复；任何非 nil current 或采样盲区都会取消。采样恢复也退避到最长 64 秒，成功后重置。正常稳定状态没有周期性 enforce 或轮询。其他模块仍有通知授权、窗口诊断、登录项状态复核等异步任务。
+音频核心的五类延迟任务是：候选确认、缺失默认输入确认、写入 watchdog、异常采样恢复、listener 安装恢复。listener retry 与 sampling recovery 使用独立 task/counter。Protection 使用最长 64 秒的持续退避；Trusted 仅一次 500ms 快速重试与随后 500ms 确认。缺失默认输入只在 Auto stable、保护开启且首选可信在线时等待一个 `settleSeconds`，到期 fresh sample 后才恢复；任何非 nil current 或采样盲区都会取消。采样恢复也退避到最长 64 秒，成功后重置。正常稳定状态没有周期性 enforce 或轮询。其他模块仍有通知授权、窗口诊断、登录项状态复核等异步任务。
 
-Writer 错误用 `Failure` 枚举表达，UI 文案由枚举投影，业务不比较英文字符串。`deviceEnumerationError` 暂保留旧 API 名称以兼容 UI，但覆盖整个联合采样失败；名称扩展可留到 UI/诊断专项修改。
+Writer 错误用 `Failure` 枚举表达，UI 文案由枚举投影，业务不比较英文字符串。`deviceEnumerationError` 保留兼容名称，并覆盖整个联合采样失败。
 
-通知授权从 `start()` 后的短延迟任务或用户打开通知开关发起，`refreshNotificationAuthorization()` 在调用前和返回后检查开关。系统授权请求一旦已经提交，不声称可以撤销弹窗。关闭通知不提交恢复通知。
+普通恢复通知的授权从 listener 成功后的短延迟任务或用户打开通知开关发起。CoreAudio listener 连续安装失败进入终态时，菜单显示简报、高级设置显示原始错误，并独立执行一次 fresh authorization check；系统授权允许时最多提交一条 listener failure 通知。`notificationsEnabled` 仅控制普通恢复通知，不会隐藏 listener 异常状态，也不会抑制该可靠性告警；系统权限明确 denied 时 MicLock 不能绕过 macOS。App 重新 active 或 Settings 出现时只用 passive API 同步系统权限，绝不由 passive sync 调用 `requestAuthorization()`。主动请求与 passive read 用 revision 和 deferred sync 防止旧回复覆盖新状态。系统授权请求一旦已经提交，不声称可以撤销弹窗。
 
-Auto 的通知去重独立于 AutoPolicy：`lastAutoNotificationAt` 与当前 `settleSeconds` 控制两次提交的最小间隔；Manual 保持每次确认可通知，startup 不通知。这改变了旧的 episode 精确去重契约，详见 [auto-mode.md](auto-mode.md)。通知 draft 被一个 `shouldNotify` 布尔值替代，没有 episodeID/rebind。
+恢复通知去重独立于 AutoPolicy：Auto 由 `lastAutoNotificationAt` 与当前 `settleSeconds` 控制两次提交的最小间隔；Manual 固定为 10 秒。冷却位于确认成功并记录 Recent Event 之后，只限制通知，不限制 restore、setter 或事件记录；startup 不通知。listener failure 告警使用独立 pending 状态，不占用恢复通知冷却。这改变了旧的 episode 精确去重契约，详见 [auto-mode.md](auto-mode.md)。通知 draft 被一个 `shouldNotify` 布尔值替代，没有 episodeID/rebind。
 
 Recent Events 仍只记录已经确认的 MicLock 选择、Auto 接受和恢复。内存保留最近 10 条，菜单显示最近 5 条。恢复和选择的发生时间是确认时间，不是发出请求的时间；Auto 接受事件从旧首选指向新当前设备。
 
@@ -82,7 +82,7 @@ make test
 make build
 ```
 
-`Tests/main.swift` 依次运行原有 `AudioMonitorTests`、危险时序回归、状态机验收、post-refactor 回归、真实 Provider 边界测试与设置/通知边界测试。时间敏感的 AudioMonitor/状态机测试通过 `ManualAudioMonitorScheduler` 确定性推进；Provider 与设置/通知边界测试使用各自的可控 fixture / continuation。原有真实等待用例仍保留。回归测试覆盖本次重构前已确认存在的危险时序，并与最终实现一起作为持续回归门禁。
+`Tests/main.swift` 依次运行原有 `AudioMonitorTests`、危险时序回归、状态机验收、post-refactor 回归、`ReliabilityRegressionTests.swift`、真实 Provider 边界测试与设置/通知边界测试。时间敏感的 AudioMonitor/状态机测试通过 `ManualAudioMonitorScheduler` 确定性推进；Provider 与设置/通知边界测试使用各自的可控 fixture / continuation。验证 production-owned async authorization Task 收敛时使用 1 秒 deadline、5ms polling 的有界 `waitUntil`，不以固定次数 `Task.yield()` 猜测 executor 调度。原有真实等待用例仍保留。回归测试覆盖已确认存在的危险时序，并与最终实现一起作为持续回归门禁。
 
 需要检查默认回调与设备回调先后变化、重复回调、部分拓扑、当前读取失败、A→B→C 快速选择、旧确认迟到、首选离线/重连、通知开关、模式切换、配置变更与 startup fresh read。对第三方 HAL 的真实行为仍须用 macOS 设备验证，Fake Provider 不等于硬件驱动。
 
@@ -104,4 +104,4 @@ UID 与名称属性按 SDK 的 caller-owned CF 对象契约使用 `takeRetainedV
 
 空字符串 UID 视为未设置，不把它显示成一个永久离线的设备；非空 UID 保持原样，不 trim、不改写。非有限的 settle 数值统一回退到默认 2 秒，普通数值仍钳制在 1–30 秒，UI 与持久化共用同一校验。
 
-启动延迟授权和通知开关使用同一个可取消任务。关闭通知或发出新请求时取消旧任务；读取系统授权状态后的取消检查阻止过时请求继续弹出授权框，返回结果后的检查阻止旧结果覆盖 UI。已经向系统发出的授权弹窗无法撤回，此修复不承诺关闭开关就关闭系统弹窗。测试使用可控 continuation 验证取消及过时结果，不引入额外真实 sleep。
+启动延迟授权、恢复通知开关和 listener 终态故障使用同一个主动授权 owner；同一时刻不并发发起两个 `requestAuthorization()`。关闭恢复通知且没有 pending listener fault 时取消需求并隐藏 denied UI；存在 fault pending 时仍保留权限引导。读取系统授权状态后的取消与 revision 检查阻止旧结果覆盖 UI。active owner 挂起期间到达的 App active / Settings passive sync 会登记并推进 revision，owner 结束后补读一次。已经向系统发出的授权弹窗无法撤回。测试使用可控 continuation 和有界等待验证取消、过时结果及 deferred passive 收敛。
