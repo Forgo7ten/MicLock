@@ -139,7 +139,7 @@ func runSettingsBoundaryTests() async {
     let faultListeners = FakeCoreAudioListeners()
     faultListeners.installResults = Array(
         repeating: .failed(.defaultInputAdd(OSStatus(-1))),
-        count: 5
+        count: 7
     )
     let (faultMonitor, _, faultNotifier) = makeMonitor(
         devices: [builtInMic], current: builtInMic, preferred: builtInMic.uid,
@@ -147,9 +147,9 @@ func runSettingsBoundaryTests() async {
         scheduler: faultClock, listeners: faultListeners
     )
     faultMonitor.start()
-    await faultClock.advance(by: .seconds(3.75))
+    await faultClock.advance(by: .seconds(15.75))
     let denialApplied = await waitUntil { faultMonitor.notificationDenied }
-    expect(denialApplied, "terminal listener fault exposes denied authorization guidance")
+    expect(denialApplied, "exhausted listener round exposes denied authorization guidance")
     expect(faultNotifier.listenerFailureCount == 0,
            "denied authorization cannot submit the pending fault alert")
 
@@ -167,6 +167,52 @@ func runSettingsBoundaryTests() async {
     await faultMonitor.syncNotificationAuthorizationState()
     expect(faultNotifier.listenerFailureCount == 1,
            "submitted fault alert cannot be duplicated by later passive sync")
+
+    test("settings: Retry cancels stale in-flight listener fault authorization")
+    let staleSuite = "MicLockTests.listener-fault-retry-auth.\(UUID().uuidString)"
+    let staleDefaults = UserDefaults(suiteName: staleSuite)!
+    defer { staleDefaults.removePersistentDomain(forName: staleSuite) }
+    staleDefaults.set(builtInMic.uid, forKey: Preferences.preferredMicrophoneUIDKey)
+    staleDefaults.set(false, forKey: Preferences.protectionEnabledKey)
+    staleDefaults.set(ProtectionMode.manual.rawValue, forKey: Preferences.protectionModeKey)
+    staleDefaults.set(false, forKey: Preferences.notificationsEnabledKey)
+    staleDefaults.set(1.0, forKey: Preferences.settleSecondsKey)
+
+    let staleProvider = FakeAudioDeviceProvider()
+    staleProvider.devices = [builtInMic]
+    staleProvider.current = builtInMic
+
+    let staleClock = ManualAudioMonitorScheduler()
+    let staleListeners = FakeCoreAudioListeners()
+    staleListeners.installResults =
+        Array(
+            repeating: .failed(.defaultInputAdd(OSStatus(-1))),
+            count: 7
+        )
+        + [.installed]
+    let staleNotifier = GatedAuthorizationNotifier()
+    let staleMonitor = AudioMonitor(
+        provider: staleProvider,
+        preferences: Preferences(defaults: staleDefaults),
+        notifier: staleNotifier,
+        scheduler: staleClock,
+        listeners: staleListeners
+    )
+
+    staleMonitor.start()
+    await staleClock.advance(by: .seconds(15.75))
+    await staleNotifier.waitForRequest(1)
+
+    staleMonitor.retryListenerInstallation()
+    expect(staleMonitor.listenerStatus == .installed,
+           "explicit Retry recovers while the old authorization owner is suspended")
+
+    await staleNotifier.reply(1, .denied)
+    let staleWasCancelled = await staleNotifier.cancellationAtCompletion(1)
+    expect(staleWasCancelled,
+           "fault-only authorization owner is cancelled after Retry")
+    expect(!staleMonitor.notificationDenied,
+           "stale denied reply cannot revive an obsolete listener fault warning")
 
     test("settings: active authorization owner defers and preserves passive sync")
     preferences.notificationsEnabled = true

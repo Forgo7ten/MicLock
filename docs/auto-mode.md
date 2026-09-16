@@ -83,13 +83,13 @@ Protection 继续按 0.5、1、2、4、8、16、32、64 秒退避，之后保持
 
 Auto 只记录 `lastAutoNotificationAt`，两次提交通知至少间隔当前 `settleSeconds`；未提交的恢复不消耗冷却。Manual corrective restore 始终立即执行，但本地恢复通知固定最多 10 秒一条；该冷却只限制通知提交，不限制 setter、confirmation 或 Recent Events。配置变化影响后续 Auto 冷却判断。
 
-listener initial + 4 retry 全部失败进入 terminal failure 时，MicLock 保留一条独立的 listener fault notification pending。它不占用 Auto/Manual 恢复通知冷却，也不受 `notificationsEnabled` /「显示通知」开关控制。MicLock 会执行 fresh system authorization check；系统授权为 authorized 时最多提交一次，明确 denied 时不能绕过 macOS。
+listener initial + 6 retry（250ms / 500ms / 1s / 2s / 4s / 8s）全部失败时，当前 listener install round 进入 exhausted 状态并保留一条独立 fault notification pending。它不占用 Auto/Manual 恢复通知冷却，也不受 `notificationsEnabled` /「显示通知」开关控制。MicLock 会执行 fresh system authorization check；系统授权为 authorized 时，该轮最多提交一次。用户显式 Retry 开启新 round 时，上一轮尚未提交的 fault pending 失效；新 round 若再次真正耗尽，可以提交自己的 reliability alert。
 
 这是有意的行为变化：持续时间很长的反复抢麦可能在一个连续保护过程中收到多条间隔通知；很接近的独立插拔也可能共用冷却。以前承诺的“一个 episode 恰好最多一条”不再适用。换取的是删除 `PendingNotification`、`notificationSent`、`episodeID` 和 rebind 全部跨状态耦合。冷却限制的是提交，不保证系统实际展示横幅。
 
 ## 计时器与恢复
 
-音频核心有五类任务：候选确认、缺失默认输入确认、写入 watchdog、异常采样恢复、listener installation recovery。保护窗口自己不需要 timer。listener 初次安装失败后按 250ms、500ms、1s、2s 使用最多四个 retry slot，成功即停止，全部失败进入 terminal listener failure。采样恢复从 250ms、500ms、1s、2s 逐级退避到最长 64s，成功后清零；两套恢复拥有独立 task/counter。
+音频核心有五类任务：候选确认、缺失默认输入确认、写入 watchdog、异常采样恢复、listener installation recovery。保护窗口自己不需要 timer。listener 初次安装失败后按 250ms、500ms、1s、2s、4s、8s 使用最多六个 retry slot，成功即停止；initial + 6 retry 全部失败只耗尽当前 listener install round。采样恢复从 250ms、500ms、1s、2s 逐级退避到最长 64s，成功后清零；Protection Writer 使用 0.5、1、2、4、8、16、32、64 秒并保持 64 秒上限；Trusted selection 仍只有一次 500ms fast retry 与后续确认。listener、sampling、Writer、Trusted 四套时序互不复用 task/counter。
 
 候选 timer 校验 revision 和截止时间，缺失默认输入 timer 校验有效起点和截止时间，Writer timer 校验请求 ID。任务只负责唤醒；学习或恢复前仍检查当前证据、可信 topology 和单调时间。通知授权等非音频任务独立存在，不能把“五类音频任务”误写成整个 App 只有五类异步任务。
 

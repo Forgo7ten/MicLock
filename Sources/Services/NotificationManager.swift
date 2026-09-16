@@ -104,7 +104,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, Not
     func presentListenerFailure() {
         let content = UNMutableNotificationContent()
         content.title = "MicLock 监听异常"
-        content.body = "CoreAudio 监听连续安装失败，麦克风保护可能失效。请打开 MicLock 设置查看详情。"
+        content.body = "CoreAudio 监听连续安装失败，本轮自动重试已停止。请打开 MicLock 查看状态；可点击“重新尝试”，或重启 App 后再次尝试。"
         submit(content)
     }
 

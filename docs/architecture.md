@@ -17,7 +17,7 @@ MicLock 只管理系统默认输入设备（`kAudioHardwarePropertyDefaultInputD
 | `ProtectionMode.swift` | 模式、恢复原因、近期事件和展示文案 | 不保存控制状态 |
 | `NotificationPresenting.swift` / `NotificationManager.swift` | 通知授权和提交 | 不保证系统最终展示横幅 |
 
-UI 仍是 `MicLockApp.swift` 中的菜单栏面板，以及 `SettingsView.swift` 中的通用/高级/关于设置。公开的 `AudioMonitor` 属性与选择入口保持兼容。`DefaultInputWriter` 作为可观测的值类型保存，使 `lastError` / `protectionRetryState` 的计算属性能驱动 UI；纯内部时序状态排除 Observation。
+UI 仍是 `MicLockApp.swift` 中的菜单栏面板，以及 `SettingsView.swift` 中的通用/高级/关于设置。公开的 `AudioMonitor` 属性与选择入口保持兼容。`DefaultInputWriter` 作为可观测的值类型保存，使 `lastError` / `protectionRetryState` 的计算属性能驱动 UI；纯内部时序状态排除 Observation。`protectionEnabled` 是持久化用户意图，`listenerStatus` 是进程内 CoreAudio listener 生命周期，`ProtectionDisplayState` 仅把用户意图与 listener readiness 投影给 UI；它不进入 AutoPolicy、Writer 或 Provider 决策，也不代表首选设备在线、采样成功或写入已确认。listener summary/detail 与该 display state 的辅助功能文案统一归 `ProtectionMode.swift`。
 
 `ActivationPolicyManager.swift` 仍负责设置窗口打开时临时切到 `.regular`，关闭后回到 `.accessory`。窗口弱引用 identity 与 regular demand 的区别、右键 AppKit 桥接、登录项 UI 同步不在本次音频重构范围内。
 
@@ -47,9 +47,11 @@ Devices 与 DefaultInput 是独立属性；连续读取不是原子事务。curr
 
 ## 启动与用户操作
 
-初始化读取配置，并采一份用于 UI、current 与 topology 基线的初始快照；这次采样明确禁止初始化 `preferredMicrophoneUID` 或执行恢复。AppDelegate 完成启动后调用 `start()`，先安装完整监听对，再重新采样并请求启动对齐；首选的首次初始化与启动恢复只依据 listener 安装后的 fresh sample，不再用监听安装前的旧 current 直接判断。监听初次安装失败后按 250ms、500ms、1s、2s 使用最多四个 retry slot，成功后才执行 startup fresh alignment；全部失败则进入不可重启预算的终态。部分注册的 rollback/cleanup 未确认成功前不执行新的 Add，终态只做一次 best-effort Remove。`alignmentRequested` 仅保存“一个尚未完成的显式对齐请求”，用于对齐时采样失败后的恢复，不是第二套 topology 可信状态。
+初始化读取配置，并采一份用于 UI、current 与 topology 基线的初始快照；这次采样明确禁止初始化 `preferredMicrophoneUID` 或执行恢复。AppDelegate 完成启动后调用 `start()`，先安装完整监听对，再重新采样并请求启动对齐；首选的首次初始化与启动恢复只依据 listener 安装后的 fresh sample，不再用监听安装前的旧 current 直接判断。listener 初次安装失败后使用 250ms、500ms、1s、2s、4s、8s 六个自动 retry slot，总计最多 initial + 6 retry = 7 次 `install()`；Fake/manual scheduler 的累计 retry deadline 为 15.75 秒。全部失败后 `listenerStatus = .failed`，只表示当前 install round 的自动预算耗尽：普通 lifecycle `start()` 不会重开该 round，但用户显式「重新尝试」可以重新武装完整新 round。部分注册的 rollback/cleanup 未确认成功前不执行新的 Add，round exhaustion 仍只做一次 best-effort Remove。`alignmentRequested` 仅保存“一个尚未完成的显式对齐请求”，用于对齐时采样失败后的恢复，不是第二套 topology 可信状态。
 
-打开保护或切到 Manual 会执行同样的 fresh 对齐；切到 Auto 保留首选，并在保护开启时执行一次普通 fresh reconcile，但不建立显式 alignment：稳定的非 nil mismatch 没有新变化证据时仍不恢复，可信的 `current == nil` 则进入 missing-default debounce。模式切换、保护开关变化和新的明确选择会先取消旧逻辑写入、候选、缺失默认输入防抖与尚未完成的显式对齐。显式选择的 Trusted setter 若首次即被 CoreAudio 拒绝，该用户命令立即结束并保留原 Preferred，随后只执行一次普通 reconcile：不会恢复已经被新用户意图 supersede 的旧 alignment，也不会让 Auto stable 仅凭 current != preferred 强制恢复；但 Manual 或仍有效的 Auto protection window 可以基于当前 fresh state 建立新的 Protection writer，避免失败的用户选择让既有保护永久失去执行者。保护窗口在模式改变时重置，不能携带旧模式下的判定进度；Auto 在保护关闭时仍记录可信 topology 变化，保护开关本身不会清掉尚未过期的窗口。
+Protection Toggle 不负责 `.notStarted` 的 initial listener installation；initial install 仍只属于 App lifecycle `start()`。打开保护继续保留既有 immediate fresh alignment 语义：即使 listener 正在 retrying，也不会等待 listener 成功才处理这笔明确用户动作，同时不会创建第二条 listener retry chain。若 listener 已 `.failed`，OFF→ON 先执行同样的 fresh alignment，再重开一个 listener install round。显式「重新尝试」按钮只重新武装 listener infrastructure，本身不修改 Protection 配置；listener 安装成功仍统一经过 `evaluateStartupPolicy()`，因此 Protection ON 时随后执行 fresh startup alignment，Protection OFF 时只刷新事实而不保护写入。
+
+切到 Manual 仍执行 fresh 对齐；切到 Auto 保留首选，并在保护开启时执行一次普通 fresh reconcile，但不建立显式 alignment：稳定的非 nil mismatch 没有新变化证据时仍不恢复，可信的 `current == nil` 则进入 missing-default debounce。模式切换、保护开关变化和新的明确选择会先取消旧逻辑写入、候选、缺失默认输入防抖与尚未完成的显式对齐。显式选择的 Trusted setter 若首次即被 CoreAudio 拒绝，该用户命令立即结束并保留原 Preferred，随后只执行一次普通 reconcile：不会恢复已经被新用户意图 supersede 的旧 alignment，也不会让 Auto stable 仅凭 current != preferred 强制恢复；但 Manual 或仍有效的 Auto protection window 可以基于当前 fresh state 建立新的 Protection writer，避免失败的用户选择让既有保护永久失去执行者。保护窗口在模式改变时重置，不能携带旧模式下的判定进度进新模式；Auto 在保护关闭时仍记录可信 topology 变化，保护开关本身不会清掉尚未过期的窗口。
 
 选择设备先 fresh-read current，已经使用该设备时直接更新首选、不重复 setter。否则进入统一 `submitWrite()`；首次 setter 拒绝时选择失败，接受后保存新首选，真实确认前不伪造 current 或成功事件。
 
@@ -61,7 +63,7 @@ Auto 保护窗口保存一个起点，以单调时钟按需判断到期，没有
 
 Writer 错误用 `Failure` 枚举表达，UI 文案由枚举投影，业务不比较英文字符串。`deviceEnumerationError` 保留兼容名称，并覆盖整个联合采样失败。
 
-普通恢复通知的授权从 listener 成功后的短延迟任务或用户打开通知开关发起。CoreAudio listener 连续安装失败进入终态时，菜单显示简报、高级设置显示原始错误，并独立执行一次 fresh authorization check；系统授权允许时最多提交一条 listener failure 通知。`notificationsEnabled` 仅控制普通恢复通知，不会隐藏 listener 异常状态，也不会抑制该可靠性告警；系统权限明确 denied 时 MicLock 不能绕过 macOS。App 重新 active 或 Settings 出现时只用 passive API 同步系统权限，绝不由 passive sync 调用 `requestAuthorization()`。主动请求与 passive read 用 revision 和 deferred sync 防止旧回复覆盖新状态。系统授权请求一旦已经提交，不声称可以撤销弹窗。
+普通恢复通知的授权从 listener 成功后的短延迟任务或用户打开通知开关发起。每个真正耗尽的 listener install round 最多提交一条独立 reliability alert；新 round 开始或 listener 恢复成功后，上一轮尚未提交给 notifier 的 fault pending 必须失效。`notificationsEnabled` 仅控制普通恢复通知，不会隐藏 listener 异常状态，也不会抑制该可靠性告警；系统权限明确 denied 时 MicLock 不能绕过 macOS。App 重新 active 或 Settings 出现时只用 passive API 同步系统权限，绝不由 passive sync 调用 `requestAuthorization()`。主动请求与 passive read 用 revision 和 deferred sync 防止旧回复覆盖新状态。Retry 清理 fault-only authorization 时不能伪造 `authorizationRequestCount`；真实 owner 必须由自己的 `defer` 收敛。已经提交给 `UNUserNotificationCenter` 的历史通知不在撤回范围内，系统授权请求一旦已经提交也不声称可以撤销弹窗。
 
 恢复通知去重独立于 AutoPolicy：Auto 由 `lastAutoNotificationAt` 与当前 `settleSeconds` 控制两次提交的最小间隔；Manual 固定为 10 秒。冷却位于确认成功并记录 Recent Event 之后，只限制通知，不限制 restore、setter 或事件记录；startup 不通知。listener failure 告警使用独立 pending 状态，不占用恢复通知冷却。这改变了旧的 episode 精确去重契约，详见 [auto-mode.md](auto-mode.md)。通知 draft 被一个 `shouldNotify` 布尔值替代，没有 episodeID/rebind。
 

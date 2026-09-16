@@ -19,17 +19,21 @@ final class AudioMonitor {
     var lastError: String? { writer.failure?.message }
     var protectionRetryState: ProtectionRetryState? { writer.retryState }
 
+    var protectionDisplayState: ProtectionDisplayState {
+        guard protectionEnabled else { return .disabled }
+        return listenerStatus.protectionDisplayStateWhenEnabled
+    }
+
+    var canRetryListenerInstallation: Bool {
+        listenerStatus == .failed
+    }
+
     var listenerStatusSummary: String? {
-        switch listenerStatus {
-        case .installed:
-            return nil
-        case .notStarted:
-            return "CoreAudio 监听尚未就绪"
-        case .retrying(let nextAttempt, let total):
-            return "CoreAudio 监听异常 · 正在重试 \(nextAttempt)/\(total)"
-        case .failed:
-            return "CoreAudio 监听异常 · 已停止重试"
-        }
+        listenerStatus.presentationText.summary
+    }
+
+    var listenerStatusDetail: String? {
+        listenerStatus.presentationText.detail
     }
 
     var preferredMicrophoneUID: String? {
@@ -50,7 +54,17 @@ final class AudioMonitor {
             // Auto topology windows remain meaningful while enforcement is off:
             // enabling protection during a recent window must still catch a
             // delayed system default-input switch.
-            if protectionEnabled { evaluateStartupPolicy() }
+            if protectionEnabled {
+                // 保留既有产品语义：用户明确 OFF → ON 时立即 fresh alignment。
+                // Initial listener installation 仍只属于 start()；retrying 也
+                // 已经拥有唯一 listenerRetryTask，不能创建第二条 chain。
+                evaluateStartupPolicy()
+
+                // 只有已经耗尽的 listener round 才由 Toggle 重新武装。
+                if listenerStatus == .failed {
+                    retryListenerInstallation()
+                }
+            }
         }
     }
 
@@ -139,7 +153,8 @@ final class AudioMonitor {
         .seconds(4), .seconds(8), .seconds(16), .seconds(32), .seconds(64)
     ]
     private static let listenerRetryDelays: [Duration] = [
-        .milliseconds(250), .milliseconds(500), .seconds(1), .seconds(2)
+        .milliseconds(250), .milliseconds(500), .seconds(1), .seconds(2),
+        .seconds(4), .seconds(8)
     ]
     private static let manualNotificationCooldown: Duration = .seconds(10)
     private var settleInterval: Duration { .seconds(configuredSettleSeconds) }
@@ -203,7 +218,31 @@ final class AudioMonitor {
             return
         }
 
+        // 普通 lifecycle start() 不得重开已经耗尽的 listener round。
+        // 同一进程只能由明确的用户 Retry / failed 状态下 OFF→ON 重新武装；
+        // 新进程会创建新的 AudioMonitor，自然从 .notStarted 开始。
         guard listenerStatus != .failed else { return }
+        attemptListenerInstall()
+    }
+
+    func retryListenerInstallation() {
+        guard listenerStatus == .failed else { return }
+
+        // 防御性取消；正常 exhausted 状态下该 task 已经为 nil。
+        listenerRetryTask?.cancel()
+        listenerRetryTask = nil
+        listenerRetryNumber = 0
+        listenerError = nil
+
+        // 新一轮开始后，上一轮尚未提交的 fault alert 已经过期。
+        clearPendingListenerFailureNotification()
+
+        listenerStatus = .notStarted
+
+        AudioMonitorDiagnostics.trace(
+            "LISTENER_RETRY_RESET reason=user"
+        )
+
         attemptListenerInstall()
     }
 
@@ -226,6 +265,10 @@ final class AudioMonitor {
             listenerRetryNumber = 0
             listenerStatus = .installed
             listenerError = nil
+
+            // Healthy listener 与尚未提交的上一轮 listener fault 不能共存。
+            clearPendingListenerFailureNotification()
+
             scheduleNotificationAuthorization(after: .milliseconds(500))
             evaluateStartupPolicy()
 
@@ -240,7 +283,7 @@ final class AudioMonitor {
 
         let nextRetry = listenerRetryNumber + 1
         guard nextRetry <= Self.listenerRetryDelays.count else {
-            finishPermanentListenerFailure()
+            finishListenerRetryExhaustion()
             return
         }
 
@@ -258,15 +301,15 @@ final class AudioMonitor {
         }
     }
 
-    private func finishPermanentListenerFailure() {
+    private func finishListenerRetryExhaustion() {
         guard listenerStatus != .failed else { return }
 
         listenerRetryTask?.cancel()
         listenerRetryTask = nil
         listenerStatus = .failed
 
-        // Exhaustion performs cleanup only. It must never create a fresh Add or
-        // reopen the retry budget.
+        // 当前自动 install round 已耗尽。这里只做 cleanup；
+        // 不能 fresh Add，也不能自动打开下一轮 budget。
         listeners.remove()
 
         AudioMonitorDiagnostics.trace(
@@ -859,6 +902,26 @@ final class AudioMonitor {
         notificationAuthorizationState = state
         notificationDenied = state == .denied
         submitPendingListenerFailureNotificationIfPossible()
+    }
+
+    private func clearPendingListenerFailureNotification() {
+        guard listenerFailureNotificationPending else { return }
+
+        listenerFailureNotificationPending = false
+
+        // 普通恢复通知仍开启时，当前 authorization owner/request 仍有价值。
+        // 不要为了清 listener fault 而取消普通通知授权流程。
+        guard !needsNotificationAuthorization else { return }
+
+        // listener fault 是唯一 authorization need。revision 使旧 async reply
+        // 失效；真正的 authorizationRequestCount 仍由 owner 的 defer 自行收敛。
+        authorizationStateRevision &+= 1
+        authorizationRescheduleNeeded = false
+        passiveAuthorizationSyncPending = false
+
+        authorizationTask?.cancel()
+        authorizationTask = nil
+        notificationDenied = false
     }
 
     private func queueListenerFailureNotificationIfNeeded() {

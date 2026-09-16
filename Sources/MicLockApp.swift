@@ -37,7 +37,7 @@ private final class MicLockAppDelegate:
     // 仅修改 opacity 时，状态栏图标可能无法可靠刷新。
     // 因此经此 @Published 镜像驱动 label 切换实际 Image 内容。
     @Published
-    private(set) var protectionEnabled = true
+    private(set) var protectionDisplayState: ProtectionDisplayState = .disabled
 
     private var rightClickMonitor: Any?
 
@@ -53,8 +53,8 @@ private final class MicLockAppDelegate:
 
         // App 完成启动后再交给 SwiftUI MenuBarExtra。
         self.monitor = monitor
-        protectionEnabled = monitor.protectionEnabled
-        trackProtectionState(of: monitor)
+        protectionDisplayState = monitor.protectionDisplayState
+        trackProtectionDisplayState(of: monitor)
 
         // 右键菜单栏图标与左键同效（monitor 详见下方函数注释）。
         installMenuBarRightClickMonitor()
@@ -118,14 +118,15 @@ private final class MicLockAppDelegate:
 
     /// withObservationTracking 是一次性的，onChange 后必须重新挂载；
     /// 重挂前先读一次当前值，保证镜像收敛到最新状态。
-    private func trackProtectionState(of monitor: AudioMonitor) {
+    private func trackProtectionDisplayState(of monitor: AudioMonitor) {
         withObservationTracking {
             _ = monitor.protectionEnabled
+            _ = monitor.listenerStatus
         } onChange: { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
-                self.protectionEnabled = monitor.protectionEnabled
-                self.trackProtectionState(of: monitor)
+                self.protectionDisplayState = monitor.protectionDisplayState
+                self.trackProtectionDisplayState(of: monitor)
             }
         }
     }
@@ -165,7 +166,7 @@ private struct MenuBarExtraLabel: View {
     var appDelegate: MicLockAppDelegate
 
     var body: some View {
-        MenuBarLabel(protectionEnabled: appDelegate.protectionEnabled)
+        MenuBarLabel(protectionState: appDelegate.protectionDisplayState)
     }
 }
 
@@ -195,7 +196,7 @@ private struct SettingsSceneContent: View {
 @MainActor
 private struct MenuBarLabel: View {
 
-    let protectionEnabled: Bool
+    let protectionState: ProtectionDisplayState
 
     // 部分 macOS 版本下，MenuBarExtra label 使用同一个 NSImage
     // 仅修改 opacity 时，状态栏图标可能无法可靠刷新。
@@ -235,14 +236,12 @@ private struct MenuBarLabel: View {
     }()
 
     private var accessibilityLabel: String {
-        protectionEnabled
-            ? "麦克风保护已开启"
-            : "麦克风保护已关闭"
+        protectionState.accessibilityLabelText
     }
 
     var body: some View {
         Group {
-            if protectionEnabled {
+            if protectionState == .active {
                 if let image = Self.enabledIcon {
                     Image(nsImage: image)
                 } else {
@@ -285,9 +284,19 @@ struct MenuBarView: View {
                         .fontWeight(.semibold)
                         .foregroundStyle(.orange)
 
-                    Text("麦克风保护可能暂时失效，详细状态请前往设置查看。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    if let detail = monitor.listenerStatusDetail {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if monitor.canRetryListenerInstallation {
+                        Button("重新尝试") {
+                            monitor.retryListenerInstallation()
+                        }
+                        .controlSize(.small)
+                    }
                 }
 
                 Divider()

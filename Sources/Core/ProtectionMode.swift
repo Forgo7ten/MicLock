@@ -29,6 +29,67 @@ enum ProtectionRetryState: Equatable {
     case setterRejected
 }
 
+/// 用户保护配置与 CoreAudio listener readiness 的 UI 投影。
+///
+/// 只用于菜单栏 / Settings 展示；不参与 AutoPolicy、Writer 或 provider
+/// 决策，也不代表 preferred 在线、采样成功或 writer 已确认。
+enum ProtectionDisplayState: Equatable {
+    case disabled
+    case starting
+    case active
+    case unavailable
+
+    var accessibilityLabelText: String {
+        switch self {
+        case .disabled:
+            return "麦克风保护已关闭"
+        case .starting:
+            return "麦克风保护监听正在启动"
+        case .active:
+            return "麦克风保护已开启"
+        case .unavailable:
+            return "麦克风保护监听当前不可用"
+        }
+    }
+}
+
+/// listener 相关展示文案集中在 ProtectionMode.swift；
+/// AudioMonitor 只暴露 projection，不复制展示 switch。
+extension CoreAudioListenerStatus {
+    var protectionDisplayStateWhenEnabled: ProtectionDisplayState {
+        switch self {
+        case .notStarted, .retrying:
+            return .starting
+        case .installed:
+            return .active
+        case .failed:
+            return .unavailable
+        }
+    }
+
+    var presentationText: (summary: String?, detail: String?) {
+        switch self {
+        case .installed:
+            return (nil, nil)
+        case .notStarted:
+            return (
+                "CoreAudio 监听尚未就绪",
+                "正在建立 CoreAudio 事件监听；完成前设备变化无法被持续监测。"
+            )
+        case .retrying(let nextAttempt, let total):
+            return (
+                "CoreAudio 监听异常 · 正在重试 \(nextAttempt)/\(total)",
+                "正在重新建立 CoreAudio 事件监听；完成前设备变化无法被持续监测。"
+            )
+        case .failed:
+            return (
+                "CoreAudio 监听异常 · 本轮自动重试已停止",
+                "CoreAudio 事件监听未能建立，本轮自动重试已经停止。可以立即重新尝试，或重启 MicLock 后再次尝试。"
+            )
+        }
+    }
+}
+
 /// 最近一次已经确认生效的关键麦克风事件。
 struct RecentAudioEvent: Identifiable, Equatable {
     enum Kind: Equatable {
@@ -77,7 +138,7 @@ struct RecentAudioEvent: Identifiable, Equatable {
         case .restored(.preferredReconnected):
             return "首选麦克风重新连接，因此恢复为该设备"
         case .restored(.startup):
-            return "启动、重新开启保护或切换到 Manual Mode 时对齐到首选麦克风"
+            return "启动、重新开启保护、CoreAudio 监听恢复或切换到 Manual Mode 时对齐到首选麦克风"
         }
     }
 

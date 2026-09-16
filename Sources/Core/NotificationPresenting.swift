@@ -11,7 +11,7 @@ protocol NotificationPresenting: AnyObject, Sendable {
     /// 投递一条“恢复”通知。
     func presentRestored(from: String, to: String, reason: RestoreReason)
 
-    /// 投递一条 CoreAudio listener 终态故障通知。
+    /// 投递一条 CoreAudio listener 当前安装轮次自动重试耗尽的可靠性告警。
     func presentListenerFailure()
 
     /// 检查（必要时请求）通知授权。
