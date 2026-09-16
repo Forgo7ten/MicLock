@@ -10,6 +10,7 @@ final class AudioMonitor {
     private(set) var devices: [AudioInputDevice] = []
     private(set) var currentDevice: AudioInputDevice?
     private(set) var listenerError: String?
+    private(set) var listenerStatus: CoreAudioListenerStatus = .notStarted
     // Compatibility name for existing UI; also covers invalid joint samples.
     private(set) var deviceEnumerationError: String?
     private(set) var notificationDenied = false
@@ -17,6 +18,23 @@ final class AudioMonitor {
 
     var lastError: String? { writer.failure?.message }
     var protectionRetryState: ProtectionRetryState? { writer.retryState }
+
+    var protectionDisplayState: ProtectionDisplayState {
+        guard protectionEnabled else { return .disabled }
+        return listenerStatus.protectionDisplayStateWhenEnabled
+    }
+
+    var canRetryListenerInstallation: Bool {
+        listenerStatus == .failed
+    }
+
+    var listenerStatusSummary: String? {
+        listenerStatus.presentationText.summary
+    }
+
+    var listenerStatusDetail: String? {
+        listenerStatus.presentationText.detail
+    }
 
     var preferredMicrophoneUID: String? {
         didSet {
@@ -36,7 +54,17 @@ final class AudioMonitor {
             // Auto topology windows remain meaningful while enforcement is off:
             // enabling protection during a recent window must still catch a
             // delayed system default-input switch.
-            if protectionEnabled { evaluateStartupPolicy() }
+            if protectionEnabled {
+                // 保留既有产品语义：用户明确 OFF → ON 时立即 fresh alignment。
+                // Initial listener installation 仍只属于 start()；retrying 也
+                // 已经拥有唯一 listenerRetryTask，不能创建第二条 chain。
+                evaluateStartupPolicy()
+
+                // 只有已经耗尽的 listener round 才由 Toggle 重新武装。
+                if listenerStatus == .failed {
+                    retryListenerInstallation()
+                }
+            }
         }
     }
 
@@ -63,6 +91,11 @@ final class AudioMonitor {
         didSet {
             guard notificationsEnabled != oldValue else { return }
             preferences.notificationsEnabled = notificationsEnabled
+            authorizationStateRevision &+= 1
+            if !needsNotificationAuthorization {
+                passiveAuthorizationSyncPending = false
+                notificationDenied = false
+            }
             scheduleNotificationAuthorization()
         }
     }
@@ -85,7 +118,7 @@ final class AudioMonitor {
     private let preferences: Preferences
     private let notifier: NotificationPresenting
     private let scheduler: AudioMonitorScheduling
-    private let listeners = CoreAudioListeners()
+    private let listeners: CoreAudioListening
 
     // Writer is intentionally observable: UI error/retry projections depend on it.
     private var writer = DefaultInputWriter()
@@ -95,23 +128,39 @@ final class AudioMonitor {
     @ObservationIgnored private var currentRevision: UInt64 = 0
     private var hasSuccessfulCurrentObservation = false
     @ObservationIgnored private var alignmentRequested = false
-    @ObservationIgnored private var listenersInstalled = false
     @ObservationIgnored private var lastKnownDeviceNames: [String: String]
     // Notification submission is independently throttled, not rebound to Auto.
     @ObservationIgnored private var lastAutoNotificationAt: ContinuousClock.Instant?
+    @ObservationIgnored private var lastManualNotificationAt: ContinuousClock.Instant?
     @ObservationIgnored private var candidateTask: AudioMonitorScheduledTask?
     @ObservationIgnored private var missingDefaultInputSince: ContinuousClock.Instant?
     @ObservationIgnored private var missingDefaultInputTask: AudioMonitorScheduledTask?
     @ObservationIgnored private var watchdogTask: AudioMonitorScheduledTask?
     @ObservationIgnored private var recoveryTask: AudioMonitorScheduledTask?
     @ObservationIgnored private var recoveryAttempt = 0
+    @ObservationIgnored private var listenerRetryTask: AudioMonitorScheduledTask?
+    @ObservationIgnored private var listenerRetryNumber = 0
     @ObservationIgnored private var authorizationTask: Task<Void, Never>?
+    @ObservationIgnored private var notificationAuthorizationState: NotificationAuthorizationState = .notDetermined
+    @ObservationIgnored private var listenerFailureNotificationPending = false
+    @ObservationIgnored private var authorizationRequestCount = 0
+    @ObservationIgnored private var authorizationRescheduleNeeded = false
+    @ObservationIgnored private var authorizationStateRevision: UInt64 = 0
+    @ObservationIgnored private var passiveAuthorizationSyncPending = false
 
     private static let recoveryDelays: [Duration] = [
         .milliseconds(250), .milliseconds(500), .seconds(1), .seconds(2),
         .seconds(4), .seconds(8), .seconds(16), .seconds(32), .seconds(64)
     ]
+    private static let listenerRetryDelays: [Duration] = [
+        .milliseconds(250), .milliseconds(500), .seconds(1), .seconds(2),
+        .seconds(4), .seconds(8)
+    ]
+    private static let manualNotificationCooldown: Duration = .seconds(10)
     private var settleInterval: Duration { .seconds(configuredSettleSeconds) }
+    private var needsNotificationAuthorization: Bool {
+        notificationsEnabled || listenerFailureNotificationPending
+    }
     private var preferredDevice: AudioInputDevice? {
         trustedDevices?.first { $0.uid == preferredMicrophoneUID }
     }
@@ -134,12 +183,14 @@ final class AudioMonitor {
         provider: AudioDeviceProviding,
         preferences: Preferences,
         notifier: NotificationPresenting,
-        scheduler: AudioMonitorScheduling? = nil
+        scheduler: AudioMonitorScheduling? = nil,
+        listeners: CoreAudioListening = CoreAudioListeners()
     ) {
         self.provider = provider
         self.preferences = preferences
         self.notifier = notifier
         self.scheduler = scheduler ?? ContinuousAudioMonitorScheduler()
+        self.listeners = listeners
         preferredMicrophoneUID = preferences.preferredMicrophoneUID
         protectionEnabled = preferences.protectionEnabled
         protectionMode = preferences.protectionMode
@@ -162,20 +213,119 @@ final class AudioMonitor {
     }
 
     func start() {
-        if !listenersInstalled {
-            let result = listeners.install(
-                onDefaultInputChange: { [weak self] in self?.handleDefaultInputChanged() },
-                onDevicesChange: { [weak self] in self?.handleDeviceListChanged() }
-            )
-            guard result.defaultInputStatus == noErr, result.devicesStatus == noErr else {
-                listenerError = "Unable to install CoreAudio listeners (defaultInput: \(result.defaultInputStatus), devices: \(result.devicesStatus))"
-                return
-            }
-            listenersInstalled = true
-            listenerError = nil
-            scheduleNotificationAuthorization(after: .milliseconds(500))
+        if listenerStatus.isInstalled {
+            evaluateStartupPolicy()
+            return
         }
-        evaluateStartupPolicy()
+
+        // 普通 lifecycle start() 不得重开已经耗尽的 listener round。
+        // 同一进程只能由明确的用户 Retry / failed 状态下 OFF→ON 重新武装；
+        // 新进程会创建新的 AudioMonitor，自然从 .notStarted 开始。
+        guard listenerStatus != .failed else { return }
+        attemptListenerInstall()
+    }
+
+    func retryListenerInstallation() {
+        guard listenerStatus == .failed else { return }
+
+        // 防御性取消；正常 exhausted 状态下该 task 已经为 nil。
+        listenerRetryTask?.cancel()
+        listenerRetryTask = nil
+        listenerRetryNumber = 0
+        listenerError = nil
+
+        // 新一轮开始后，上一轮尚未提交的 fault alert 已经过期。
+        clearPendingListenerFailureNotification()
+
+        listenerStatus = .notStarted
+
+        AudioMonitorDiagnostics.trace(
+            "LISTENER_RETRY_RESET reason=user"
+        )
+
+        attemptListenerInstall()
+    }
+
+    private func attemptListenerInstall() {
+        guard !listenerStatus.isInstalled,
+              listenerStatus != .failed,
+              listenerRetryTask == nil else { return }
+
+        let result = listeners.install(
+            onDefaultInputChange: { [weak self] in
+                self?.handleListenerDefaultInputChanged()
+            },
+            onDevicesChange: { [weak self] in
+                self?.handleListenerDeviceListChanged()
+            }
+        )
+
+        switch result {
+        case .installed:
+            listenerRetryNumber = 0
+            listenerStatus = .installed
+            listenerError = nil
+
+            // Healthy listener 与尚未提交的上一轮 listener fault 不能共存。
+            clearPendingListenerFailureNotification()
+
+            scheduleNotificationAuthorization(after: .milliseconds(500))
+            evaluateStartupPolicy()
+
+        case .failed(let failure):
+            listenerError = failure.message
+            scheduleListenerRetry()
+        }
+    }
+
+    private func scheduleListenerRetry() {
+        guard listenerRetryTask == nil else { return }
+
+        let nextRetry = listenerRetryNumber + 1
+        guard nextRetry <= Self.listenerRetryDelays.count else {
+            finishListenerRetryExhaustion()
+            return
+        }
+
+        listenerRetryNumber = nextRetry
+        listenerStatus = .retrying(
+            nextAttempt: nextRetry,
+            total: Self.listenerRetryDelays.count
+        )
+
+        let delay = Self.listenerRetryDelays[nextRetry - 1]
+        listenerRetryTask = scheduler.schedule(after: delay) { [weak self] in
+            guard let self else { return }
+            self.listenerRetryTask = nil
+            self.attemptListenerInstall()
+        }
+    }
+
+    private func finishListenerRetryExhaustion() {
+        guard listenerStatus != .failed else { return }
+
+        listenerRetryTask?.cancel()
+        listenerRetryTask = nil
+        listenerStatus = .failed
+
+        // 当前自动 install round 已耗尽。这里只做 cleanup；
+        // 不能 fresh Add，也不能自动打开下一轮 budget。
+        listeners.remove()
+
+        AudioMonitorDiagnostics.trace(
+            "LISTENER_INSTALL_FAILED retries=\(listenerRetryNumber)"
+        )
+        queueListenerFailureNotificationIfNeeded()
+    }
+
+    private func handleListenerDefaultInputChanged() {
+        guard listenerStatus.isInstalled else { return }
+        handleDefaultInputChanged()
+    }
+
+    private func handleListenerDeviceListChanged() {
+        guard listenerStatus.isInstalled else { return }
+        handleDeviceListChanged()
     }
 
     /// Also used by tests without installing real HAL listeners.
@@ -203,10 +353,14 @@ final class AudioMonitor {
     /// made by a setter/watchdog. Those reads do not automatically start learning.
     private func readCurrent() throws -> CurrentObservation {
         let device = try provider.currentInputDevice()
-        hasSuccessfulCurrentObservation = true
+        if !hasSuccessfulCurrentObservation {
+            hasSuccessfulCurrentObservation = true
+        }
         let changed = currentRevision != 0 && device?.uid != currentDevice?.uid
         if changed || currentRevision == 0 { currentRevision &+= 1 }
-        currentDevice = device
+        if currentDevice != device {
+            currentDevice = device
+        }
         policy.observedRevision(currentRevision)
         return CurrentObservation(device: device, changed: changed)
     }
@@ -229,8 +383,11 @@ final class AudioMonitor {
         do {
             snapshot = try provider.listInputDevices()
             if let snapshot {
-                devices = Self.sortedDevices(snapshot.devices)
-                recordDeviceNames(devices)
+                let nextDevices = Self.sortedDevices(snapshot.devices)
+                if devices != nextDevices {
+                    devices = nextDevices
+                }
+                recordDeviceNames(nextDevices)
                 if !snapshot.isComplete {
                     for issue in snapshot.issues { logProviderError(issue) }
                     errorMessage = errorMessage ?? "Some input device properties are temporarily unreadable"
@@ -247,7 +404,9 @@ final class AudioMonitor {
             errorMessage = errorMessage ?? "CoreAudio input device state is temporarily inconsistent"
         }
         guard errorMessage == nil, let observation, let snapshot else {
-            deviceEnumerationError = errorMessage
+            if deviceEnumerationError != errorMessage {
+                deviceEnumerationError = errorMessage
+            }
             // Unknown intervals never contribute to continuous confirmation.
             policy.interruptSampling()
             candidateTask?.cancel()
@@ -257,7 +416,9 @@ final class AudioMonitor {
             return Sample(observation: observation, valid: false, added: [])
         }
 
-        deviceEnumerationError = nil
+        if deviceEnumerationError != nil {
+            deviceEnumerationError = nil
+        }
         recoveryTask?.cancel()
         recoveryTask = nil
         recoveryAttempt = 0
@@ -269,7 +430,9 @@ final class AudioMonitor {
         writer.clearTargetOfflineFailureIfAvailable(in: newUIDs)
         let added = firstBaseline ? [] : newUIDs.subtracting(oldUIDs)
         let topologyChanged = !firstBaseline && newUIDs != oldUIDs
-        trustedDevices = devices
+        if trustedDevices != devices {
+            trustedDevices = devices
+        }
         if topologyChanged && protectionMode == .auto { beginProtectionWindow() }
 
         // Revisit an initially empty (but valid) baseline too; no special
@@ -596,9 +759,17 @@ final class AudioMonitor {
         recordEvent(kind: kind, from: request.fromName, to: request.target.name)
         guard request.shouldNotify, notificationsEnabled,
               case .protection(let reason) = request.origin else { return }
-        if protectionMode == .auto {
+
+        switch protectionMode {
+        case .auto:
             if let last = lastAutoNotificationAt, scheduler.now < last.advanced(by: settleInterval) { return }
             lastAutoNotificationAt = scheduler.now
+        case .manual:
+            if let last = lastManualNotificationAt,
+               scheduler.now < last.advanced(by: Self.manualNotificationCooldown) {
+                return
+            }
+            lastManualNotificationAt = scheduler.now
         }
         // Means "submitted to notifier", not "a banner was visibly displayed".
         notifier.presentRestored(from: request.fromName ?? "Unknown", to: request.target.name, reason: reason)
@@ -635,9 +806,23 @@ final class AudioMonitor {
     // MARK: - Presentation and diagnostics
 
     private func scheduleNotificationAuthorization(after delay: Duration = .zero) {
+        guard needsNotificationAuthorization else {
+            authorizationRescheduleNeeded = false
+            authorizationTask?.cancel()
+            authorizationTask = nil
+            notificationDenied = false
+            return
+        }
+
+        // One active authorization owner at a time. A later request records that
+        // the state must be refreshed again after the current owner finishes.
+        guard authorizationRequestCount == 0 else {
+            authorizationRescheduleNeeded = true
+            return
+        }
+
+        authorizationRescheduleNeeded = false
         authorizationTask?.cancel()
-        authorizationTask = nil
-        guard notificationsEnabled else { return }
         authorizationTask = Task { [weak self] in
             if delay > .zero {
                 do { try await Task.sleep(for: delay) } catch { return }
@@ -647,10 +832,109 @@ final class AudioMonitor {
     }
 
     func refreshNotificationAuthorization() async {
-        guard notificationsEnabled, !Task.isCancelled else { return }
+        guard needsNotificationAuthorization, !Task.isCancelled else { return }
+
+        authorizationRequestCount += 1
+        authorizationStateRevision &+= 1
+        let revision = authorizationStateRevision
+        var appliedState = false
+
+        defer {
+            authorizationRequestCount -= 1
+
+            if authorizationRequestCount == 0 {
+                if !needsNotificationAuthorization {
+                    authorizationRescheduleNeeded = false
+                    passiveAuthorizationSyncPending = false
+                } else {
+                    let needsActiveRefresh = authorizationRescheduleNeeded
+                        || (!appliedState && listenerFailureNotificationPending)
+
+                    if needsActiveRefresh {
+                        authorizationRescheduleNeeded = false
+                        passiveAuthorizationSyncPending = false
+                        scheduleNotificationAuthorization()
+                    } else if passiveAuthorizationSyncPending {
+                        passiveAuthorizationSyncPending = false
+                        Task { @MainActor [weak self] in
+                            await self?.syncNotificationAuthorizationState()
+                        }
+                    }
+                }
+            }
+        }
+
         let state = await notifier.ensureAuthorization()
-        guard notificationsEnabled, !Task.isCancelled else { return }
+
+        guard needsNotificationAuthorization,
+              !Task.isCancelled,
+              authorizationStateRevision == revision else { return }
+
+        notificationAuthorizationState = state
         notificationDenied = state == .denied
+        appliedState = true
+        submitPendingListenerFailureNotificationIfPossible()
+    }
+
+    func syncNotificationAuthorizationState() async {
+        guard needsNotificationAuthorization, !Task.isCancelled else {
+            passiveAuthorizationSyncPending = false
+            notificationDenied = false
+            return
+        }
+
+        if authorizationRequestCount != 0 {
+            passiveAuthorizationSyncPending = true
+            authorizationStateRevision &+= 1
+            return
+        }
+
+        passiveAuthorizationSyncPending = false
+        authorizationStateRevision &+= 1
+        let revision = authorizationStateRevision
+
+        let state = await notifier.currentAuthorizationState()
+
+        guard needsNotificationAuthorization,
+              !Task.isCancelled,
+              authorizationStateRevision == revision else { return }
+
+        notificationAuthorizationState = state
+        notificationDenied = state == .denied
+        submitPendingListenerFailureNotificationIfPossible()
+    }
+
+    private func clearPendingListenerFailureNotification() {
+        guard listenerFailureNotificationPending else { return }
+
+        listenerFailureNotificationPending = false
+
+        // 普通恢复通知仍开启时，当前 authorization owner/request 仍有价值。
+        // 不要为了清 listener fault 而取消普通通知授权流程。
+        guard !needsNotificationAuthorization else { return }
+
+        // listener fault 是唯一 authorization need。revision 使旧 async reply
+        // 失效；真正的 authorizationRequestCount 仍由 owner 的 defer 自行收敛。
+        authorizationStateRevision &+= 1
+        authorizationRescheduleNeeded = false
+        passiveAuthorizationSyncPending = false
+
+        authorizationTask?.cancel()
+        authorizationTask = nil
+        notificationDenied = false
+    }
+
+    private func queueListenerFailureNotificationIfNeeded() {
+        listenerFailureNotificationPending = true
+        scheduleNotificationAuthorization()
+    }
+
+    private func submitPendingListenerFailureNotificationIfPossible() {
+        guard listenerFailureNotificationPending,
+              notificationAuthorizationState == .authorized else { return }
+
+        listenerFailureNotificationPending = false
+        notifier.presentListenerFailure()
     }
 
     private func recordEvent(kind: RecentAudioEvent.Kind, from: String?, to: String) {

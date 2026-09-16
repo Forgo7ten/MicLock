@@ -113,7 +113,7 @@ private func acceptancePendingAndConfirmation() async {
         p.current = usbMic
         m.handleDefaultInputChanged()
         expect(m.currentDevice?.uid == builtInMic.uid, "immediate re-hijack after late confirmation is restored")
-        expect(n.presentCount == (mode == .auto ? 1 : 2), "Auto submission cooldown is independent of writer")
+        expect(n.presentCount == 1, "Auto and Manual both suppress an immediate duplicate notification")
     }
 }
 

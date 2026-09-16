@@ -31,6 +31,29 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, Not
 
     // MARK: - NotificationPresenting
 
+    private static func authorizationState(
+        from status: UNAuthorizationStatus
+    ) -> NotificationAuthorizationState {
+        switch status {
+        case .authorized, .provisional, .ephemeral:
+            return .authorized
+        case .denied:
+            return .denied
+        case .notDetermined:
+            return .notDetermined
+        @unknown default:
+            return .notDetermined
+        }
+    }
+
+    func currentAuthorizationState() async -> NotificationAuthorizationState {
+        guard !Task.isCancelled else { return .notDetermined }
+
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        guard !Task.isCancelled else { return .notDetermined }
+        return Self.authorizationState(from: settings.authorizationStatus)
+    }
+
     func ensureAuthorization() async -> NotificationAuthorizationState {
         guard !Task.isCancelled else { return .notDetermined }
         let center = UNUserNotificationCenter.current()
@@ -40,13 +63,11 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, Not
         // be withdrawn; cancellation only prevents issuing a stale request.
         guard !Task.isCancelled else { return .notDetermined }
 
-        switch settings.authorizationStatus {
-        case .authorized, .provisional, .ephemeral:
+        switch Self.authorizationState(from: settings.authorizationStatus) {
+        case .authorized:
             return .authorized
-
         case .denied:
             return .denied
-
         case .notDetermined:
             // 此时请求才会真正弹出授权框。
             Self.logger.info("requesting notification authorization")
@@ -54,17 +75,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, Not
 
             guard !Task.isCancelled else { return .notDetermined }
             let after = await center.notificationSettings()
-            switch after.authorizationStatus {
-            case .authorized, .provisional, .ephemeral:
-                return .authorized
-            case .denied:
-                return .denied
-            default:
-                return .notDetermined
-            }
-
-        @unknown default:
-            return .notDetermined
+            return Self.authorizationState(from: after.authorizationStatus)
         }
     }
 
@@ -87,6 +98,17 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate, Not
         // 不使用通知声音。
         content.body = "\(from) → \(to)"
 
+        submit(content)
+    }
+
+    func presentListenerFailure() {
+        let content = UNMutableNotificationContent()
+        content.title = "MicLock 监听异常"
+        content.body = "CoreAudio 监听连续安装失败，本轮自动重试已停止。请打开 MicLock 查看状态；可点击“重新尝试”，或重启 App 后再次尝试。"
+        submit(content)
+    }
+
+    private func submit(_ content: UNMutableNotificationContent) {
         let request = UNNotificationRequest(
             identifier: UUID().uuidString,
             content: content,

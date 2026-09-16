@@ -32,6 +32,7 @@ await runAllTests()
 await runStateMachineRegressionTests()
 await runStateMachineAcceptanceTests()
 await runPostRefactorRegressionTests()
+await runReliabilityRegressionTests()
 runLiveAudioDeviceProviderTests()
 await runSettingsBoundaryTests()
 

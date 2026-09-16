@@ -105,6 +105,10 @@ private struct GeneralSettingsView: View {
             Section("通知") {
                 Toggle("显示通知", isOn: $monitor.notificationsEnabled)
 
+                Text("该开关仅控制麦克风恢复通知；CoreAudio 监听自动重试耗尽等可靠性告警不受此开关影响。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 if monitor.notificationDenied {
                     notificationDeniedRow
                 }
@@ -115,6 +119,9 @@ private struct GeneralSettingsView: View {
         .onAppear {
             launchAtLoginOn = LaunchAtLoginManager.isEnabled
             launchAtLoginError = nil
+        }
+        .task {
+            await monitor.syncNotificationAuthorizationState()
         }
         .onDisappear {
             loginItemSyncTask?.cancel()
@@ -218,6 +225,33 @@ private struct AdvancedSettingsView: View {
 
     var body: some View {
         Form {
+            if let status = monitor.listenerStatusSummary {
+                Section("CoreAudio 状态") {
+                    Label(status, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+
+                    if let error = monitor.listenerError {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+
+                    if let detail = monitor.listenerStatusDetail {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if monitor.canRetryListenerInstallation {
+                        Button("重新尝试 CoreAudio 监听") {
+                            monitor.retryListenerInstallation()
+                        }
+                    }
+                }
+            }
+
             Section("设备切换") {
                 HStack {
                     Text("设备稳定窗口")

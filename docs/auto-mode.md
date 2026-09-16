@@ -79,17 +79,19 @@ Protection 继续按 0.5、1、2、4、8、16、32、64 秒退避，之后保持
 
 ## 通知：独立冷却，不再绑定 episode
 
-仅在恢复已经确认、请求创建时允许通知、确认时通知开关仍开启且不是启动对齐时，提交恢复通知。
+恢复通知仅在恢复已经确认、请求创建时允许通知、确认时通知开关仍开启且不是启动对齐时提交。
 
-Auto 只记录 `lastAutoNotificationAt`，两次提交通知至少间隔当前 `settleSeconds`；未提交的恢复不消耗冷却。Manual 保持每次确认恢复可通知。配置变化影响后续冷却判断。
+Auto 只记录 `lastAutoNotificationAt`，两次提交通知至少间隔当前 `settleSeconds`；未提交的恢复不消耗冷却。Manual corrective restore 始终立即执行，但本地恢复通知固定最多 10 秒一条；该冷却只限制通知提交，不限制 setter、confirmation 或 Recent Events。配置变化影响后续 Auto 冷却判断。
+
+listener initial + 6 retry（250ms / 500ms / 1s / 2s / 4s / 8s）全部失败时，当前 listener install round 进入 exhausted 状态并保留一条独立 fault notification pending。它不占用 Auto/Manual 恢复通知冷却，也不受 `notificationsEnabled` /「显示通知」开关控制。MicLock 会执行 fresh system authorization check；系统授权为 authorized 时，该轮最多提交一次。用户显式 Retry 开启新 round 时，上一轮尚未提交的 fault pending 失效；新 round 若再次真正耗尽，可以提交自己的 reliability alert。
 
 这是有意的行为变化：持续时间很长的反复抢麦可能在一个连续保护过程中收到多条间隔通知；很接近的独立插拔也可能共用冷却。以前承诺的“一个 episode 恰好最多一条”不再适用。换取的是删除 `PendingNotification`、`notificationSent`、`episodeID` 和 rebind 全部跨状态耦合。冷却限制的是提交，不保证系统实际展示横幅。
 
 ## 计时器与恢复
 
-音频核心有四类任务：候选确认、缺失默认输入确认、写入 watchdog、异常采样恢复。保护窗口自己不需要 timer。采样恢复从 250ms、500ms、1s、2s 逐级退避到最长 64s，成功后清零；比旧实现长期每 2 秒重新采样更克制，但异常刚恢复且没有 callback 时可能更晚发现。
+音频核心有五类任务：候选确认、缺失默认输入确认、写入 watchdog、异常采样恢复、listener installation recovery。保护窗口自己不需要 timer。listener 初次安装失败后按 250ms、500ms、1s、2s、4s、8s 使用最多六个 retry slot，成功即停止；initial + 6 retry 全部失败只耗尽当前 listener install round。采样恢复从 250ms、500ms、1s、2s 逐级退避到最长 64s，成功后清零；Protection Writer 使用 0.5、1、2、4、8、16、32、64 秒并保持 64 秒上限；Trusted selection 仍只有一次 500ms fast retry 与后续确认。listener、sampling、Writer、Trusted 四套时序互不复用 task/counter。
 
-候选 timer 校验 revision 和截止时间，缺失默认输入 timer 校验有效起点和截止时间，Writer timer 校验请求 ID。任务只负责唤醒；学习或恢复前仍检查当前证据、可信 topology 和单调时间。通知授权等非音频任务独立存在，不能把“四类”误写成整个 App 只有四类异步任务。
+候选 timer 校验 revision 和截止时间，缺失默认输入 timer 校验有效起点和截止时间，Writer timer 校验请求 ID。任务只负责唤醒；学习或恢复前仍检查当前证据、可信 topology 和单调时间。通知授权等非音频任务独立存在，不能把“五类音频任务”误写成整个 App 只有五类异步任务。
 
 ## 尚存边界
 
@@ -97,4 +99,4 @@ Auto 仍是启发式：窗口内真正的用户外部切换可能被恢复，窗
 
 取消 pending 不会撤销 HAL 已接受的写入。最新目标确认以后，旧 setter 极晚生效，仍可能被当作新外部变化；这次瘦身没有声称解决 HAL 完成乱序。无 callback、无待处理任务的静默变化也不能立即感知。
 
-测试覆盖原有 `AudioMonitorTests.swift`、危险时序回归 `StateMachineRegressionTests.swift`、重构验收 `StateMachineAcceptanceTests.swift`、`PostRefactorRegressionTests.swift`、`LiveAudioDeviceProviderTests.swift` 和 `SettingsBoundaryTests.swift`。时间敏感的 AudioMonitor/状态机测试使用 Manual Scheduler；Provider 与设置/通知边界测试使用各自的可控 fixture / continuation，不把新的 wall-clock sleep 引入这些回归。原有睡眠用例保留，另行迁移，避免把性能优化混进这次行为重构。
+测试覆盖原有 `AudioMonitorTests.swift`、危险时序回归 `StateMachineRegressionTests.swift`、重构验收 `StateMachineAcceptanceTests.swift`、`PostRefactorRegressionTests.swift`、`ReliabilityRegressionTests.swift`、`LiveAudioDeviceProviderTests.swift` 和 `SettingsBoundaryTests.swift`。状态机业务计时使用 Manual Scheduler；仅在验证 production-owned async authorization Task 收敛时使用 1 秒 deadline、5ms polling 的有界 wall-clock wait。Provider 与其他设置/通知边界使用可控 fixture / continuation。

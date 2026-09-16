@@ -1,8 +1,59 @@
 import Foundation
 import CoreAudio
 
-final class CoreAudioListeners: @unchecked Sendable {
+enum CoreAudioListenerInstallFailure: Equatable {
+    case defaultInputAdd(OSStatus)
+    case devicesAdd(OSStatus)
+    case cleanup(OSStatus)
+}
 
+enum CoreAudioListenerInstallResult: Equatable {
+    case installed
+    case failed(CoreAudioListenerInstallFailure)
+}
+
+enum CoreAudioListenerStatus: Equatable {
+    case notStarted
+    case retrying(nextAttempt: Int, total: Int)
+    case installed
+    case failed
+
+    var isInstalled: Bool {
+        if case .installed = self { return true }
+        return false
+    }
+}
+
+protocol CoreAudioListening: AnyObject, Sendable {
+    func install(
+        onDefaultInputChange: @escaping @MainActor () -> Void,
+        onDevicesChange: @escaping @MainActor () -> Void
+    ) -> CoreAudioListenerInstallResult
+
+    func remove()
+}
+
+/// A successful registration must deliver callbacks on a main-queue / MainActor-
+/// compatible execution context, matching `SystemCoreAudioListenerBackend`.
+protocol CoreAudioListenerBackend: AnyObject {
+    func addDefaultInputListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus
+
+    func addDevicesListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus
+
+    func removeDefaultInputListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus
+
+    func removeDevicesListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus
+}
+
+final class SystemCoreAudioListenerBackend: CoreAudioListenerBackend {
     private let systemObject = AudioObjectID(kAudioObjectSystemObject)
 
     private var defaultInputAddress = AudioObjectPropertyAddress(
@@ -17,66 +68,148 @@ final class CoreAudioListeners: @unchecked Sendable {
         mElement: kAudioObjectPropertyElementMain
     )
 
+    func addDefaultInputListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus {
+        AudioObjectAddPropertyListenerBlock(
+            systemObject,
+            &defaultInputAddress,
+            DispatchQueue.main,
+            listener
+        )
+    }
+
+    func addDevicesListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus {
+        AudioObjectAddPropertyListenerBlock(
+            systemObject,
+            &devicesAddress,
+            DispatchQueue.main,
+            listener
+        )
+    }
+
+    func removeDefaultInputListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus {
+        AudioObjectRemovePropertyListenerBlock(
+            systemObject,
+            &defaultInputAddress,
+            DispatchQueue.main,
+            listener
+        )
+    }
+
+    func removeDevicesListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus {
+        AudioObjectRemovePropertyListenerBlock(
+            systemObject,
+            &devicesAddress,
+            DispatchQueue.main,
+            listener
+        )
+    }
+}
+
+final class CoreAudioListeners: CoreAudioListening, @unchecked Sendable {
+    private let backend: CoreAudioListenerBackend
+    /// `AudioMonitor.deinit` is nonisolated under the current toolchain, while normal
+    /// install/remove calls originate on MainActor. Serialize the complete listener
+    /// lifecycle so the class's `@unchecked Sendable` contract is actually true.
+    private let lifecycleLock = NSLock()
+
     private var defaultInputListener: AudioObjectPropertyListenerBlock?
     private var devicesListener: AudioObjectPropertyListenerBlock?
+    private var fullyInstalled = false
+
+    init(backend: CoreAudioListenerBackend = SystemCoreAudioListenerBackend()) {
+        self.backend = backend
+    }
+
+    /// Caller holds `lifecycleLock`.
+    ///
+    /// Successfully removed blocks are cleared immediately. Failed removals retain
+    /// the exact block identity so a later cleanup can satisfy CoreAudio's contract.
+    private func cleanupRetainedListenersLocked() -> OSStatus? {
+        var firstError: OSStatus?
+
+        if let listener = defaultInputListener {
+            let status = backend.removeDefaultInputListener(listener)
+            if status == noErr {
+                defaultInputListener = nil
+            } else if firstError == nil {
+                firstError = status
+            }
+        }
+
+        if let listener = devicesListener {
+            let status = backend.removeDevicesListener(listener)
+            if status == noErr {
+                devicesListener = nil
+            } else if firstError == nil {
+                firstError = status
+            }
+        }
+
+        return firstError
+    }
 
     func install(
         onDefaultInputChange: @escaping @MainActor () -> Void,
         onDevicesChange: @escaping @MainActor () -> Void
-    ) -> (defaultInputStatus: OSStatus, devicesStatus: OSStatus) {
-        let defaultInputListener: AudioObjectPropertyListenerBlock = { _, _ in
-            Task { @MainActor in onDefaultInputChange() }
-        }
-        self.defaultInputListener = defaultInputListener
+    ) -> CoreAudioListenerInstallResult {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
 
-        let devicesListener: AudioObjectPropertyListenerBlock = { _, _ in
-            Task { @MainActor in onDevicesChange() }
-        }
-        self.devicesListener = devicesListener
+        if fullyInstalled { return .installed }
 
-        let defaultStatus = AudioObjectAddPropertyListenerBlock(
-            systemObject,
-            &defaultInputAddress,
-            DispatchQueue.main,
-            defaultInputListener
-        )
-
-        let devicesStatus = AudioObjectAddPropertyListenerBlock(
-            systemObject,
-            &devicesAddress,
-            DispatchQueue.main,
-            devicesListener
-        )
-
-        // Auto Mode 同时依赖默认输入和设备拓扑事件。
-        // 任一 listener 安装失败时回滚全部监听，避免进入部分可用状态。
-        if defaultStatus != noErr || devicesStatus != noErr {
-            remove()
+        // Never create a new registration until every retained partial
+        // registration has been proven removed.
+        if defaultInputListener != nil || devicesListener != nil {
+            if let status = cleanupRetainedListenersLocked() {
+                return .failed(.cleanup(status))
+            }
         }
 
-        return (defaultStatus, devicesStatus)
+        let defaultBlock: AudioObjectPropertyListenerBlock = { _, _ in
+            MainActor.assumeIsolated {
+                onDefaultInputChange()
+            }
+        }
+
+        let devicesBlock: AudioObjectPropertyListenerBlock = { _, _ in
+            MainActor.assumeIsolated {
+                onDevicesChange()
+            }
+        }
+
+        let defaultStatus = backend.addDefaultInputListener(defaultBlock)
+        guard defaultStatus == noErr else {
+            return .failed(.defaultInputAdd(defaultStatus))
+        }
+
+        defaultInputListener = defaultBlock
+
+        let devicesStatus = backend.addDevicesListener(devicesBlock)
+        guard devicesStatus == noErr else {
+            if let cleanupStatus = cleanupRetainedListenersLocked() {
+                return .failed(.cleanup(cleanupStatus))
+            }
+            return .failed(.devicesAdd(devicesStatus))
+        }
+
+        devicesListener = devicesBlock
+        fullyInstalled = true
+        return .installed
     }
 
     func remove() {
-        if let listener = defaultInputListener {
-            AudioObjectRemovePropertyListenerBlock(
-                systemObject,
-                &defaultInputAddress,
-                DispatchQueue.main,
-                listener
-            )
-        }
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
 
-        if let listener = devicesListener {
-            AudioObjectRemovePropertyListenerBlock(
-                systemObject,
-                &devicesAddress,
-                DispatchQueue.main,
-                listener
-            )
-        }
-
-        defaultInputListener = nil
-        devicesListener = nil
+        fullyInstalled = false
+        _ = cleanupRetainedListenersLocked()
     }
 }

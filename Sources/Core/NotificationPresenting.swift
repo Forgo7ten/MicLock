@@ -1,5 +1,5 @@
 /// 通知权限状态（避免 Core 层直接依赖 UserNotifications 类型）。
-enum NotificationAuthorizationState {
+enum NotificationAuthorizationState: Equatable {
     case notDetermined
     case denied
     case authorized
@@ -11,6 +11,12 @@ protocol NotificationPresenting: AnyObject, Sendable {
     /// 投递一条“恢复”通知。
     func presentRestored(from: String, to: String, reason: RestoreReason)
 
+    /// 投递一条 CoreAudio listener 当前安装轮次自动重试耗尽的可靠性告警。
+    func presentListenerFailure()
+
     /// 检查（必要时请求）通知授权。
     func ensureAuthorization() async -> NotificationAuthorizationState
+
+    /// 只读当前系统授权状态，绝不能发起授权请求。
+    func currentAuthorizationState() async -> NotificationAuthorizationState
 }
