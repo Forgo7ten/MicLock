@@ -7,6 +7,7 @@ func runPostRefactorRegressionTests() async {
     testProtectingAutoRestoresDuringEnumerationFailure()
     await testProtectingAutoDoesNotTrustPartialRemoval()
     testAvailabilityProjectionIsObservable()
+    testIdenticalDeviceSnapshotDoesNotInvalidateObservation()
     testUnknownTopologyDoesNotClaimPreferredOffline()
     testOfflineProjectionRequiresLatestValidSample()
     testOfflineFailureClearsOnlyWhenItsTargetReturns()
@@ -178,6 +179,35 @@ private func testAvailabilityProjectionIsObservable() {
     monitor.handleDeviceListChanged()
     expect(added.changed, "offline-only projection invalidates when target returns")
     expect(monitor.offlinePreferredName == nil, "online target clears the offline label")
+}
+
+@MainActor
+private func testIdenticalDeviceSnapshotDoesNotInvalidateObservation() {
+    test("review: identical device snapshot does not invalidate device projections")
+
+    let (monitor, _, _) = makeMonitor(
+        devices: [builtInMic, usbMic],
+        current: builtInMic,
+        preferred: usbMic.uid,
+        protection: false,
+        scheduler: ManualAudioMonitorScheduler()
+    )
+
+    let changed = ReviewChangeFlag()
+    withObservationTracking {
+        _ = monitor.devices
+        _ = monitor.currentDeviceName
+        _ = monitor.deviceEnumerationError
+        _ = monitor.isPreferredMicrophoneAvailable
+        _ = monitor.offlinePreferredName
+    } onChange: {
+        changed.mark()
+    }
+
+    monitor.handleDeviceListChanged()
+
+    expect(!changed.changed,
+           "identical complete topology/current does not emit redundant Observation changes")
 }
 
 @MainActor

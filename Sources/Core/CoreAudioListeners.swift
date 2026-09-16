@@ -115,6 +115,10 @@ final class SystemCoreAudioListenerBackend: CoreAudioListenerBackend {
 
 final class CoreAudioListeners: CoreAudioListening, @unchecked Sendable {
     private let backend: CoreAudioListenerBackend
+    /// `AudioMonitor.deinit` is nonisolated under the current toolchain, while normal
+    /// install/remove calls originate on MainActor. Serialize the complete listener
+    /// lifecycle so the class's `@unchecked Sendable` contract is actually true.
+    private let lifecycleLock = NSLock()
 
     private var defaultInputListener: AudioObjectPropertyListenerBlock?
     private var devicesListener: AudioObjectPropertyListenerBlock?
@@ -124,9 +128,11 @@ final class CoreAudioListeners: CoreAudioListening, @unchecked Sendable {
         self.backend = backend
     }
 
+    /// Caller holds `lifecycleLock`.
+    ///
     /// Successfully removed blocks are cleared immediately. Failed removals retain
     /// the exact block identity so a later cleanup can satisfy CoreAudio's contract.
-    private func cleanupRetainedListeners() -> OSStatus? {
+    private func cleanupRetainedListenersLocked() -> OSStatus? {
         var firstError: OSStatus?
 
         if let listener = defaultInputListener {
@@ -154,12 +160,15 @@ final class CoreAudioListeners: CoreAudioListening, @unchecked Sendable {
         onDefaultInputChange: @escaping @MainActor () -> Void,
         onDevicesChange: @escaping @MainActor () -> Void
     ) -> CoreAudioListenerInstallResult {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+
         if fullyInstalled { return .installed }
 
         // Never create a new registration until every retained partial
         // registration has been proven removed.
         if defaultInputListener != nil || devicesListener != nil {
-            if let status = cleanupRetainedListeners() {
+            if let status = cleanupRetainedListenersLocked() {
                 return .failed(.cleanup(status))
             }
         }
@@ -185,7 +194,7 @@ final class CoreAudioListeners: CoreAudioListening, @unchecked Sendable {
 
         let devicesStatus = backend.addDevicesListener(devicesBlock)
         guard devicesStatus == noErr else {
-            if let cleanupStatus = cleanupRetainedListeners() {
+            if let cleanupStatus = cleanupRetainedListenersLocked() {
                 return .failed(.cleanup(cleanupStatus))
             }
             return .failed(.devicesAdd(devicesStatus))
@@ -197,7 +206,10 @@ final class CoreAudioListeners: CoreAudioListening, @unchecked Sendable {
     }
 
     func remove() {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+
         fullyInstalled = false
-        _ = cleanupRetainedListeners()
+        _ = cleanupRetainedListenersLocked()
     }
 }

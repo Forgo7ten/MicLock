@@ -10,7 +10,7 @@ MicLock 只管理系统默认输入设备（`kAudioHardwarePropertyDefaultInputD
 | `AutoPolicy.swift` | 互斥的 stable / protecting / considering 阶段，候选连续性 | 不写设备，不管理通知或重试 |
 | `DefaultInputWriter.swift` | 一笔待确认请求、来源、有限/持续重试阶段和结构化错误 | 不修改 Auto 的窗口，不假定 HAL 请求可取消 |
 | `AudioMonitorScheduler.swift` | 统一单调时钟与可取消任务；支持确定性测试 | 不承载业务状态 |
-| `CoreAudioListeners.swift` | 用结构化结果安装和移除默认输入、设备列表监听；保留 block identity 并安全清理部分注册 | 不做分类和恢复 |
+| `CoreAudioListeners.swift` | 串行化 install/remove 生命周期，用结构化结果安装和移除默认输入、设备列表监听；保留 block identity 并安全清理部分注册 | 不做分类和恢复 |
 | `AudioMonitorDiagnostics.swift` | OSLog 和可选 trace 输出 | 不影响状态决策 |
 | `LiveAudioDeviceProvider.swift` / `AudioDeviceProviding.swift` | HAL 枚举、默认输入读写、partial snapshot 与底层错误 | 不学习 preferred |
 | `Preferences.swift` | UserDefaults 读写 | 不保存运行期 AudioDeviceID |
@@ -20,6 +20,8 @@ MicLock 只管理系统默认输入设备（`kAudioHardwarePropertyDefaultInputD
 UI 仍是 `MicLockApp.swift` 中的菜单栏面板，以及 `SettingsView.swift` 中的通用/高级/关于设置。公开的 `AudioMonitor` 属性与选择入口保持兼容。`DefaultInputWriter` 作为可观测的值类型保存，使 `lastError` / `protectionRetryState` 的计算属性能驱动 UI；纯内部时序状态排除 Observation。`protectionEnabled` 是持久化用户意图，`listenerStatus` 是进程内 CoreAudio listener 生命周期，`ProtectionDisplayState` 仅把用户意图与 listener readiness 投影给 UI；它不进入 AutoPolicy、Writer 或 Provider 决策，也不代表首选设备在线、采样成功或写入已确认。listener summary/detail 与该 display state 的辅助功能文案统一归 `ProtectionMode.swift`。
 
 `ActivationPolicyManager.swift` 仍负责设置窗口打开时临时切到 `.regular`，关闭后回到 `.accessory`。窗口弱引用 identity 与 regular demand 的区别、右键 AppKit 桥接、登录项 UI 同步不在本次音频重构范围内。
+
+`AudioMonitor` 的正常 listener 操作来自 MainActor，但当前 Swift 工具链下 `deinit` 不是 MainActor 生命周期入口；因此 `CoreAudioListeners` 自己用 lifecycle lock 串行化 install/remove/partial-cleanup，并让所有 registration identity 与 backend Add/Remove 位于同一临界区。这样保留自动 deinit cleanup，同时使该类型的 `@unchecked Sendable` 承诺有明确同步依据。CoreAudio callback 仍只投递到 main queue，不读取这组受锁保护的可变字段。
 
 ## 数据的唯一事实来源
 

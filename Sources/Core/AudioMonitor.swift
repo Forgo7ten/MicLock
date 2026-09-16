@@ -273,7 +273,7 @@ final class AudioMonitor {
             evaluateStartupPolicy()
 
         case .failed(let failure):
-            listenerError = listenerInstallError(failure)
+            listenerError = failure.message
             scheduleListenerRetry()
         }
     }
@@ -318,19 +318,6 @@ final class AudioMonitor {
         queueListenerFailureNotificationIfNeeded()
     }
 
-    private func listenerInstallError(
-        _ failure: CoreAudioListenerInstallFailure
-    ) -> String {
-        switch failure {
-        case .defaultInputAdd(let status):
-            return "Unable to install CoreAudio default-input listener (status: \(status))"
-        case .devicesAdd(let status):
-            return "Unable to install CoreAudio devices listener (status: \(status))"
-        case .cleanup(let status):
-            return "Unable to clean up a partial CoreAudio listener registration (status: \(status))"
-        }
-    }
-
     private func handleListenerDefaultInputChanged() {
         guard listenerStatus.isInstalled else { return }
         handleDefaultInputChanged()
@@ -366,10 +353,14 @@ final class AudioMonitor {
     /// made by a setter/watchdog. Those reads do not automatically start learning.
     private func readCurrent() throws -> CurrentObservation {
         let device = try provider.currentInputDevice()
-        hasSuccessfulCurrentObservation = true
+        if !hasSuccessfulCurrentObservation {
+            hasSuccessfulCurrentObservation = true
+        }
         let changed = currentRevision != 0 && device?.uid != currentDevice?.uid
         if changed || currentRevision == 0 { currentRevision &+= 1 }
-        currentDevice = device
+        if currentDevice != device {
+            currentDevice = device
+        }
         policy.observedRevision(currentRevision)
         return CurrentObservation(device: device, changed: changed)
     }
@@ -392,8 +383,11 @@ final class AudioMonitor {
         do {
             snapshot = try provider.listInputDevices()
             if let snapshot {
-                devices = Self.sortedDevices(snapshot.devices)
-                recordDeviceNames(devices)
+                let nextDevices = Self.sortedDevices(snapshot.devices)
+                if devices != nextDevices {
+                    devices = nextDevices
+                }
+                recordDeviceNames(nextDevices)
                 if !snapshot.isComplete {
                     for issue in snapshot.issues { logProviderError(issue) }
                     errorMessage = errorMessage ?? "Some input device properties are temporarily unreadable"
@@ -410,7 +404,9 @@ final class AudioMonitor {
             errorMessage = errorMessage ?? "CoreAudio input device state is temporarily inconsistent"
         }
         guard errorMessage == nil, let observation, let snapshot else {
-            deviceEnumerationError = errorMessage
+            if deviceEnumerationError != errorMessage {
+                deviceEnumerationError = errorMessage
+            }
             // Unknown intervals never contribute to continuous confirmation.
             policy.interruptSampling()
             candidateTask?.cancel()
@@ -420,7 +416,9 @@ final class AudioMonitor {
             return Sample(observation: observation, valid: false, added: [])
         }
 
-        deviceEnumerationError = nil
+        if deviceEnumerationError != nil {
+            deviceEnumerationError = nil
+        }
         recoveryTask?.cancel()
         recoveryTask = nil
         recoveryAttempt = 0
@@ -432,7 +430,9 @@ final class AudioMonitor {
         writer.clearTargetOfflineFailureIfAvailable(in: newUIDs)
         let added = firstBaseline ? [] : newUIDs.subtracting(oldUIDs)
         let topologyChanged = !firstBaseline && newUIDs != oldUIDs
-        trustedDevices = devices
+        if trustedDevices != devices {
+            trustedDevices = devices
+        }
         if topologyChanged && protectionMode == .auto { beginProtectionWindow() }
 
         // Revisit an initially empty (but valid) baseline too; no special

@@ -90,6 +90,19 @@ extension CoreAudioListenerStatus {
     }
 }
 
+extension CoreAudioListenerInstallFailure {
+    var message: String {
+        switch self {
+        case .defaultInputAdd(let status):
+            return "Unable to install CoreAudio default-input listener (status: \(status))"
+        case .devicesAdd(let status):
+            return "Unable to install CoreAudio devices listener (status: \(status))"
+        case .cleanup(let status):
+            return "Unable to clean up a partial CoreAudio listener registration (status: \(status))"
+        }
+    }
+}
+
 /// 最近一次已经确认生效的关键麦克风事件。
 struct RecentAudioEvent: Identifiable, Equatable {
     enum Kind: Equatable {

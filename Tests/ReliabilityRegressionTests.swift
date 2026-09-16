@@ -1,11 +1,13 @@
 import Foundation
 import CoreAudio
+import Dispatch
 
 @MainActor
 func runReliabilityRegressionTests() async {
     testCoreAudioListenerRollbackFailureNeverRepeatsAddBeforeCleanup()
     testAudioMonitorIgnoresCallbackFromFailedListenerInstall()
     testCoreAudioListenerRemoveIsIdempotentAndAllowsReinstall()
+    testCoreAudioListenerLifecycleSerializesConcurrentInstallAndRemove()
     await testListenerRetriesExactlySixTimesThenStopsAutomatically()
     await testListenerRetrySuccessResumesStartupPolicy()
     await testListenerCleanupFailureUsesBoundedRetryBudget()
@@ -591,6 +593,113 @@ private func testRetryClearsUnsubmittedListenerFailureAlert() async {
 
     expect(notifier.listenerFailureCount == 0,
            "the obsolete listener fault cannot be submitted after recovery")
+}
+
+private final class BlockingCoreAudioListenerBackend: CoreAudioListenerBackend {
+    let firstDefaultAddEntered = DispatchSemaphore(value: 0)
+    let releaseFirstDefaultAdd = DispatchSemaphore(value: 0)
+
+    private let stateLock = NSLock()
+    private var defaultAddStorage = 0
+    private var devicesAddStorage = 0
+    private var defaultRemoveStorage = 0
+    private var devicesRemoveStorage = 0
+
+    var defaultRemoveCount: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return defaultRemoveStorage
+    }
+
+    var devicesRemoveCount: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return devicesRemoveStorage
+    }
+
+    func addDefaultInputListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus {
+        stateLock.lock()
+        defaultAddStorage += 1
+        let isFirstAdd = defaultAddStorage == 1
+        stateLock.unlock()
+
+        if isFirstAdd {
+            firstDefaultAddEntered.signal()
+            releaseFirstDefaultAdd.wait()
+        }
+        return noErr
+    }
+
+    func addDevicesListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus {
+        stateLock.lock()
+        devicesAddStorage += 1
+        stateLock.unlock()
+        return noErr
+    }
+
+    func removeDefaultInputListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus {
+        stateLock.lock()
+        defaultRemoveStorage += 1
+        stateLock.unlock()
+        return noErr
+    }
+
+    func removeDevicesListener(
+        _ listener: @escaping AudioObjectPropertyListenerBlock
+    ) -> OSStatus {
+        stateLock.lock()
+        devicesRemoveStorage += 1
+        stateLock.unlock()
+        return noErr
+    }
+}
+
+@MainActor
+private func testCoreAudioListenerLifecycleSerializesConcurrentInstallAndRemove() {
+    test("reliability: listener lifecycle serializes concurrent install and remove")
+
+    let backend = BlockingCoreAudioListenerBackend()
+    let listeners = CoreAudioListeners(backend: backend)
+    let installFinished = DispatchSemaphore(value: 0)
+
+    DispatchQueue.global(qos: .userInitiated).async {
+        _ = listeners.install(onDefaultInputChange: {}, onDevicesChange: {})
+        installFinished.signal()
+    }
+
+    expect(
+        backend.firstDefaultAddEntered.wait(timeout: .now() + 1) == .success,
+        "background install reaches the blocking default-input Add"
+    )
+
+    let release = backend.releaseFirstDefaultAdd
+    DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(50)) {
+        release.signal()
+    }
+
+    // With serialized lifecycle state this waits for install to finish, then
+    // removes the newly installed pair. Without serialization remove returns
+    // while the Add is blocked and the later install escapes cleanup.
+    listeners.remove()
+
+    expect(
+        installFinished.wait(timeout: .now() + 1) == .success,
+        "background install completes after the blocked Add is released"
+    )
+    expect(backend.defaultRemoveCount == 1,
+           "concurrent remove cleans the installed default listener exactly once")
+    expect(backend.devicesRemoveCount == 1,
+           "concurrent remove cleans the installed devices listener exactly once")
+
+    listeners.remove()
+    expect(backend.defaultRemoveCount == 1 && backend.devicesRemoveCount == 1,
+           "a second remove remains idempotent after the serialized race")
 }
 
 @MainActor
