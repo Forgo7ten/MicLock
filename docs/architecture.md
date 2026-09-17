@@ -17,7 +17,7 @@ MicLock 只管理系统默认输入设备（`kAudioHardwarePropertyDefaultInputD
 | `ProtectionMode.swift` | 模式、恢复原因、近期事件和展示文案 | 不保存控制状态 |
 | `NotificationPresenting.swift` / `NotificationManager.swift` | 通知授权和提交 | 不保证系统最终展示横幅 |
 
-UI 仍是 `MicLockApp.swift` 中的菜单栏面板，以及 `SettingsView.swift` 中的通用/高级/关于设置。公开的 `AudioMonitor` 属性与选择入口保持兼容。`DefaultInputWriter` 作为可观测的值类型保存，使 `lastError` / `protectionRetryState` 的计算属性能驱动 UI；纯内部时序状态排除 Observation。`protectionEnabled` 是持久化用户意图，`listenerStatus` 是进程内 CoreAudio listener 生命周期，`ProtectionDisplayState` 仅把用户意图与 listener readiness 投影给 UI；它不进入 AutoPolicy、Writer 或 Provider 决策，也不代表首选设备在线、采样成功或写入已确认。listener summary/detail 与该 display state 的辅助功能文案统一归 `ProtectionMode.swift`。
+UI 仍是 `MicLockApp.swift` 中的菜单栏面板，以及 `SettingsView.swift` 中的通用/高级/事件/关于设置。公开的 `AudioMonitor` 属性与选择入口保持兼容。`DefaultInputWriter` 作为可观测的值类型保存，使 `lastError` / `protectionRetryState` 的计算属性能驱动 UI；纯内部时序状态排除 Observation。`protectionEnabled` 是持久化用户意图，`listenerStatus` 是进程内 CoreAudio listener 生命周期，`ProtectionDisplayState` 仅把用户意图与 listener readiness 投影给 UI；它不进入 AutoPolicy、Writer 或 Provider 决策，也不代表首选设备在线、采样成功或写入已确认。listener summary/detail 与该 display state 的辅助功能文案统一归 `ProtectionMode.swift`。
 
 `ActivationPolicyManager.swift` 仍负责设置窗口打开时临时切到 `.regular`，关闭后回到 `.accessory`。窗口弱引用 identity 与 regular demand 的区别、右键 AppKit 桥接、登录项 UI 同步不在本次音频重构范围内。
 
@@ -69,7 +69,7 @@ Writer 错误用 `Failure` 枚举表达，UI 文案由枚举投影，业务不�
 
 恢复通知去重独立于 AutoPolicy：Auto 由 `lastAutoNotificationAt` 与当前 `settleSeconds` 控制两次提交的最小间隔；Manual 固定为 10 秒。冷却位于确认成功并记录 Recent Event 之后，只限制通知，不限制 restore、setter 或事件记录；startup 不通知。listener failure 告警使用独立 pending 状态，不占用恢复通知冷却。这改变了旧的 episode 精确去重契约，详见 [auto-mode.md](auto-mode.md)。通知 draft 被一个 `shouldNotify` 布尔值替代，没有 episodeID/rebind。
 
-Recent Events 仍只记录已经确认的 MicLock 选择、Auto 接受和恢复。内存保留最近 10 条，菜单显示最近 5 条。恢复和选择的发生时间是确认时间，不是发出请求的时间；Auto 接受事件从旧首选指向新当前设备。
+Recent Events 仍只记录已经确认的 MicLock 选择、Auto 接受和恢复。内存保留最近 10 条；菜单只显示最新 1 条摘要，设置的「事件」页显示最近 5 条详情。恢复和选择的发生时间是确认时间，不是发出请求的时间；Auto 接受事件从旧首选指向新当前设备。
 
 ## 登录项与配置
 
