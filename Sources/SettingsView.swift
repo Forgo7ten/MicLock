@@ -21,6 +21,11 @@ struct MicLockSettingsView: View {
                     Label("高级", systemImage: "slider.horizontal.3")
                 }
 
+            RecentEventsSettingsView(monitor: monitor)
+                .tabItem {
+                    Label("事件", systemImage: "clock")
+                }
+
             AboutView()
                 .tabItem {
                     Label("关于", systemImage: "info.circle")
@@ -214,6 +219,41 @@ private struct GeneralSettingsView: View {
                     : "关闭登录启动未能在系统中生效，请稍后重试。"
             }
         }
+    }
+}
+
+@MainActor
+private struct RecentEventsSettingsView: View {
+
+    @Bindable
+    var monitor: AudioMonitor
+
+    private static let visibleEventLimit = 5
+
+    var body: some View {
+        Form {
+            Section("最近事件") {
+                if monitor.recentAudioEvents.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("暂无最近事件")
+                            .foregroundStyle(.secondary)
+
+                        Text("MicLock 会在已确认的麦克风选择、恢复或已接受切换发生后显示记录。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.vertical, 2)
+                } else {
+                    ForEach(monitor.recentAudioEvents.prefix(Self.visibleEventLimit)) { event in
+                        RecentAudioEventRow(event: event, style: .detailed)
+                            .padding(.vertical, 2)
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .padding(16)
     }
 }
 
